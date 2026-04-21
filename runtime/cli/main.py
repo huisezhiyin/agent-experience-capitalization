@@ -956,3 +956,7 @@ def main() -> int:
 
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+def entrypoint() -> None:
+    raise SystemExit(main())

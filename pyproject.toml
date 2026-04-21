@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-experience-capitalization"
+version = "0.1.0"
+description = "Skill-first, local-first runtime for agent experience capitalization."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "example-owner", email = "user@example.com" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+milvus = [
+  "setuptools<81",
+  "pymilvus[milvus-lite]>=2.6,<3",
+]
+
+[project.scripts]
+expcap = "runtime.cli.main:entrypoint"
+
+[tool.setuptools.packages.find]
+include = ["runtime*"]

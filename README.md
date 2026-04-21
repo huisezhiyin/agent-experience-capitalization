@@ -2,6 +2,59 @@
 
 面向 `Codex`、`Claude Code` 等 coding agent 的本地优先经验资本化系统。
 
+`expcap` 的入口是 `skill`，后端是本地 runtime。它让 agent 在任务开始前自动激活历史经验，在任务结束后自动沉淀经验，并用 `SQLite` / `Milvus Lite` 等后端维护可复用经验。
+
+## Quickstart
+
+克隆仓库后可以直接用仓库内 wrapper 试跑：
+
+```bash
+git clone git@github.com:example-owner/agent-experience-capitalization.git
+cd agent-experience-capitalization
+
+python3 -m venv .venv
+.venv/bin/pip install -e .
+scripts/expcap --help
+```
+
+也可以安装成命令行入口：
+
+```bash
+.venv/bin/expcap --help
+```
+
+如果希望启用 Milvus Lite 语义召回：
+
+```bash
+.venv/bin/pip install -e ".[milvus]"
+scripts/expcap sync-milvus --workspace "$PWD" --include-shared
+```
+
+## Demo Flow
+
+下面这组命令会在当前仓库生成一条本地 trace，再流转成 episode、candidate、asset，并做一次 activation：
+
+```bash
+scripts/expcap ingest --workspace "$PWD" --task "fix pytest import error" --command "python3 -m pytest tests/test_imports.py" --error "ModuleNotFoundError: no module named foo" --verification-status passed --verification-summary "1 passed" --result-status success --result-summary "修复导入路径并补充回归测试" --trace-id trace_demo_import_fix
+scripts/expcap review --input .agent-memory/traces/bundles/trace_demo_import_fix.json
+scripts/expcap extract --episode .agent-memory/episodes/ep_demo_import_fix.json
+scripts/expcap promote --candidate .agent-memory/candidates/cand_demo_import_fix.json
+scripts/expcap activate --task "fix pytest import error" --workspace "$PWD"
+scripts/expcap status --workspace "$PWD"
+```
+
+运行态会写入 `.agent-memory/`，该目录默认被 `.gitignore` 排除。
+
+## Skill Usage
+
+在目标项目中接入默认 `get/save` 行为：
+
+```bash
+scripts/expcap install-project --workspace /path/to/your/project
+```
+
+接入后，项目会获得 `AGENTS.expcap.md`，agent 可在任务开始前默认执行 `auto-start`，任务收敛后默认执行 `auto-finish`。
+
 当前阶段以研究与架构设计为主，核心方向是：
 
 - 轻 `skill`，作为默认入口

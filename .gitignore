@@ -1,0 +1,22 @@
+.DS_Store
+
+# Python caches and local virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# expcap runtime state
+.agent-memory/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Local logs and generated outputs
+logs/
+tmp/
+dist/
+build/

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/episode.schema.json",
+  "title": "Episode",
+  "type": "object",
+  "required": [
+    "episode_id",
+    "trace_id",
+    "goal",
+    "constraints",
+    "files_touched",
+    "commands",
+    "turning_points",
+    "result",
+    "verification",
+    "lesson",
+    "scope_hint"
+  ],
+  "properties": {
+    "episode_id": { "type": "string" },
+    "trace_id": { "type": "string" },
+    "goal": { "type": "string" },
+    "constraints": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "workspace": { "type": ["string", "null"] },
+    "files_touched": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "commands": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "turning_points": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "attempted_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "abandoned_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "decision_rationale": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "result": { "type": "string" },
+    "verification": { "type": "string" },
+    "user_feedback": { "type": ["string", "null"] },
+    "lesson": { "type": "string" },
+    "scope_hint": { "type": "string" },
+    "confidence_hint": { "type": "number" },
+    "created_at": { "type": "string" }
+  }
+}

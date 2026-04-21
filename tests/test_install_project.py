@@ -1,0 +1,45 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from runtime.core.project_install import install_project_agents
+
+
+class InstallProjectTests(unittest.TestCase):
+    def test_install_project_appends_block_without_replacing_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir(parents=True, exist_ok=True)
+            agents_path = workspace / "AGENTS.md"
+            agents_path.write_text("# AGENTS.md\n\n原有规则。\n", encoding="utf-8")
+
+            result = install_project_agents(workspace)
+
+            agents_text = agents_path.read_text(encoding="utf-8")
+            sidecar_text = (workspace / "AGENTS.expcap.md").read_text(encoding="utf-8")
+
+            self.assertIn("原有规则。", agents_text)
+            self.assertIn("<!-- EXPCAP START -->", agents_text)
+            self.assertIn("AGENTS.expcap.md", agents_text)
+            self.assertIn("默认先做 get", sidecar_text)
+            self.assertEqual(result["created_agents"], False)
+            self.assertEqual(result["updated_agents"], True)
+
+    def test_install_project_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir(parents=True, exist_ok=True)
+            agents_path = workspace / "AGENTS.md"
+            agents_path.write_text("# AGENTS.md\n\n原有规则。\n", encoding="utf-8")
+
+            install_project_agents(workspace)
+            once = agents_path.read_text(encoding="utf-8")
+            install_project_agents(workspace)
+            twice = agents_path.read_text(encoding="utf-8")
+
+            self.assertEqual(once, twice)
+            self.assertEqual(once.count("<!-- EXPCAP START -->"), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

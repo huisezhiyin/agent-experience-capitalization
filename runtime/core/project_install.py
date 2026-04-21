@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+EXPCAP_BLOCK_START = "<!-- EXPCAP START -->"
+EXPCAP_BLOCK_END = "<!-- EXPCAP END -->"
+
+
+def _agents_sidecar_content(workspace: Path) -> str:
+    workspace_path = str(workspace.resolve())
+    return f"""# AGENTS.expcap.md
+
+本文件由 `expcap install-project` 生成，用于把经验资本化工作流非破坏式接入当前项目。
+
+## 目标
+
+- 不替换原有 `AGENTS.md`
+- 只为当前项目补充经验 `get/save` 规则
+- 让 Codex 在这个项目中默认把 `expcap` 当作辅助能力使用
+
+## 默认行为
+
+### 1. 任务开始前默认先做 get
+
+在开始实质性分析、改代码、跑命令之前，优先执行：
+
+```bash
+expcap auto-start --task "<当前任务摘要>" --workspace "{workspace_path}"
+```
+
+如果命中经验，优先把命中结果作为当前执行策略的一部分。
+
+### 2. 任务收敛后默认尝试做 save
+
+当任务完成一轮收敛，或形成了稳定 lesson / pattern / anti-pattern 后，优先执行：
+
+```bash
+expcap auto-finish --workspace "{workspace_path}" --task "<当前任务摘要>" ...
+```
+
+如果经验高置信且明显可复用，再继续：
+
+```bash
+expcap promote --candidate "{workspace_path}/.agent-memory/candidates/<candidate_id>.json"
+```
+
+### 3. 作用域策略
+
+- 默认把当前项目内沉淀的经验视为 `workspace/project` 经验
+- 只有明显跨项目稳定的经验，才考虑后续晋升为 `global` 经验
+- 不要把项目局部 workaround 误提升为跨项目经验
+- 默认先激活 `project` 资产，再补充 `cross-project` 资产
+- 项目规范、历史决策、目录约定等，也可以作为 `context / rule` 类型知识沉淀
+
+### 4. 什么时候不要自动 save
+
+- 任务尚未收敛
+- 只是临时 workaround
+- 缺少验证结果
+- 用户明确要求不要记录
+
+## 说明
+
+- `expcap` 是全局 skill + 本地 runtime 能力
+- 当前项目经验默认落在 `.agent-memory/`
+- 正文真源是 JSON 文件，`.agent-memory/index.sqlite3` 是索引层
+"""
+
+
+def _agents_managed_block() -> str:
+    return f"""{EXPCAP_BLOCK_START}
+## Expcap Integration
+
+- 本项目额外启用经验资本化工作流，详细规则见 `AGENTS.expcap.md`
+- 不替换本项目原有 `AGENTS.md` 约束，只补充经验 `get/save` 行为
+- 任务开始前优先执行 `expcap auto-start`
+- 任务收敛后优先执行 `expcap auto-finish`
+- 高置信经验再继续 `promote`
+
+{EXPCAP_BLOCK_END}"""
+
+
+def install_project_agents(workspace: Path) -> dict[str, str | bool]:
+    workspace = workspace.resolve()
+    sidecar_path = workspace / "AGENTS.expcap.md"
+    sidecar_path.write_text(_agents_sidecar_content(workspace), encoding="utf-8")
+
+    agents_path = workspace / "AGENTS.md"
+    block = _agents_managed_block()
+    created_agents = False
+    updated_agents = False
+
+    if not agents_path.exists():
+        agents_path.write_text(
+            "# AGENTS.md\n\n"
+            "本项目启用了 `expcap` 经验资本化工作流，详细规则见 `AGENTS.expcap.md`。\n\n"
+            f"{block}\n",
+            encoding="utf-8",
+        )
+        created_agents = True
+        updated_agents = True
+    else:
+        original = agents_path.read_text(encoding="utf-8")
+        if EXPCAP_BLOCK_START in original and EXPCAP_BLOCK_END in original:
+            start = original.index(EXPCAP_BLOCK_START)
+            end = original.index(EXPCAP_BLOCK_END) + len(EXPCAP_BLOCK_END)
+            new_content = original[:start].rstrip() + "\n\n" + block + "\n"
+        else:
+            suffix = "" if original.endswith("\n") else "\n"
+            new_content = original + suffix + "\n" + block + "\n"
+        if new_content != original:
+            agents_path.write_text(new_content, encoding="utf-8")
+            updated_agents = True
+
+    return {
+        "workspace": str(workspace),
+        "agents_path": str(agents_path),
+        "sidecar_path": str(sidecar_path),
+        "created_agents": created_agents,
+        "updated_agents": updated_agents,
+    }

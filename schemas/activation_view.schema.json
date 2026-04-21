@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/activation_view.schema.json",
+  "title": "Activation View",
+  "type": "object",
+  "required": [
+    "activation_id",
+    "task_query",
+    "selected_assets",
+    "why_selected",
+    "rendered_context",
+    "fallback_episode_refs"
+  ],
+  "properties": {
+    "activation_id": { "type": "string" },
+    "task_query": { "type": "string" },
+    "workspace": { "type": ["string", "null"] },
+    "selected_assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["asset_id", "asset_type", "title", "reason"],
+        "properties": {
+          "asset_id": { "type": "string" },
+          "asset_type": { "type": "string" },
+          "knowledge_scope": { "type": "string" },
+          "knowledge_kind": { "type": "string" },
+          "title": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "why_selected": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "rendered_context": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "fallback_episode_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "created_at": { "type": "string" }
+  }
+}

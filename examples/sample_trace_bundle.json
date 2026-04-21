@@ -1,0 +1,46 @@
+{
+  "trace_id": "trace_20260413_001",
+  "host": "codex",
+  "workspace": "/path/to/agent-experience-capitalization",
+  "session_id": "sess_demo_001",
+  "task_hint": "fix pytest import error",
+  "user_request": "修复 pytest 导入错误，并确保测试通过。",
+  "constraints": [
+    "不要改 public API",
+    "优先最小改动"
+  ],
+  "events": [
+    {
+      "type": "command",
+      "content": "uv run pytest tests/test_imports.py",
+      "important": true
+    },
+    {
+      "type": "error",
+      "content": "ModuleNotFoundError: no module named foo",
+      "important": true
+    }
+  ],
+  "files_changed": [
+    "pkg/module.py",
+    "tests/test_imports.py"
+  ],
+  "verification": {
+    "commands": [
+      "uv run pytest tests/test_imports.py"
+    ],
+    "status": "passed",
+    "summary": "1 passed"
+  },
+  "result": {
+    "status": "success",
+    "summary": "修复导入路径并补充回归测试"
+  },
+  "artifacts": {
+    "diff_path": ".agent-memory/traces/diffs/trace_20260413_001.diff"
+  },
+  "timestamps": {
+    "started_at": "2026-04-13T10:00:00Z",
+    "ended_at": "2026-04-13T10:18:00Z"
+  }
+}

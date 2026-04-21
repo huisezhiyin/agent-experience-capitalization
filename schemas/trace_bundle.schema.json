@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/trace_bundle.schema.json",
+  "title": "Trace Bundle",
+  "type": "object",
+  "required": [
+    "trace_id",
+    "host",
+    "workspace",
+    "user_request",
+    "events",
+    "files_changed",
+    "verification",
+    "result"
+  ],
+  "properties": {
+    "trace_id": { "type": "string" },
+    "host": { "type": "string" },
+    "workspace": { "type": "string" },
+    "session_id": { "type": ["string", "null"] },
+    "task_hint": { "type": ["string", "null"] },
+    "user_request": { "type": "string" },
+    "constraints": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "content"],
+        "properties": {
+          "type": { "type": "string" },
+          "content": { "type": "string" },
+          "important": { "type": "boolean" }
+        }
+      }
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "verification": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "status": { "type": "string" },
+        "summary": { "type": ["string", "null"] }
+      }
+    },
+    "result": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string" },
+        "summary": { "type": ["string", "null"] }
+      }
+    },
+    "artifacts": { "type": "object" },
+    "timestamps": { "type": "object" }
+  }
+}

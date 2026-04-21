@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/candidate.schema.json",
+  "title": "Candidate",
+  "type": "object",
+  "required": [
+    "candidate_id",
+    "source_episode_ids",
+    "candidate_type",
+    "title",
+    "content",
+    "reusability_score",
+    "stability_score",
+    "confidence_score",
+    "constraint_value_score",
+    "scope",
+    "status"
+  ],
+  "properties": {
+    "candidate_id": { "type": "string" },
+    "source_episode_ids": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "candidate_type": { "type": "string" },
+    "knowledge_kind": { "type": "string" },
+    "title": { "type": "string" },
+    "content": { "type": "string" },
+    "reusability_score": { "type": "number" },
+    "stability_score": { "type": "number" },
+    "confidence_score": { "type": "number" },
+    "constraint_value_score": { "type": "number" },
+    "scope": {
+      "type": "object",
+      "required": ["level", "value"],
+      "properties": {
+        "level": { "type": "string" },
+        "value": { "type": "string" }
+      }
+    },
+    "conflicts_with": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "status": { "type": "string" },
+    "created_at": { "type": "string" }
+  }
+}

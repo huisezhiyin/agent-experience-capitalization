@@ -53,7 +53,37 @@ scripts/expcap status --workspace "$PWD"
 scripts/expcap install-project --workspace /path/to/your/project
 ```
 
+如果也希望给 Claude Code 写入同样的启用入口：
+
+```bash
+scripts/expcap install-project --workspace /path/to/your/project --include-claude
+```
+
+也可以直接使用一键启用脚本，它会安装本地 CLI 包、写入 `AGENTS.md` / `CLAUDE.md`，最后输出一次项目状态：
+
+```bash
+scripts/expcap-enable /path/to/your/project
+```
+
+如果希望顺带安装并同步 Milvus Lite：
+
+```bash
+EXPCAP_WITH_MILVUS=1 scripts/expcap-enable /path/to/your/project
+```
+
 接入后，项目会获得 `AGENTS.expcap.md`，agent 可在任务开始前默认执行 `auto-start`，任务收敛后默认执行 `auto-finish`。
+
+## Experience Dimensions
+
+`expcap` 不是只存一段文本，而是给经验带上多层维度，方便后续检索、审核和降权：
+
+- `knowledge_scope`：经验层级，目前支持 `project` 与 `cross-project`。项目经验默认只服务当前 workspace，跨项目经验会进入共享层。
+- `knowledge_kind`：知识类型，目前支持 `pattern`、`anti_pattern`、`rule`、`context`、`checklist`。
+- `scope.level / scope.value`：任务作用域，例如 `task-family::python-import-error` 或 `workspace::general-coding-task`，用于避免宽泛经验误召回。
+- `workspace / source_workspace`：经验来自哪个项目。当前版本主要按显式 `--workspace` 的规范化路径识别项目。
+- `temperature / review_status`：经验热度与健康状态，例如 `hot`、`warm`、`watch`、`needs_review`，用于观察真实帮助效果。
+
+项目识别当前是“显式 workspace 优先”：agent 或脚本把目标项目路径传给 `--workspace`，运行态把经验写到该项目的 `.agent-memory/`，并优先激活这个项目自己的资产。后续可以在这个基础上增加模糊项目识别，例如结合 git remote、仓库名、包名、目录结构和 `.agent-memory` 指纹来判断“这是哪个项目的延续”。
 
 当前阶段以研究与架构设计为主，核心方向是：
 

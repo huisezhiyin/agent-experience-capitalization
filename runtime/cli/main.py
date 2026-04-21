@@ -143,9 +143,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     install_project = subparsers.add_parser(
         "install-project",
-        help="Non-destructively integrate expcap into another project's AGENTS.md.",
+        help="Non-destructively integrate expcap into another project's agent instruction files.",
     )
     install_project.add_argument("--workspace", required=True, help="Target project workspace.")
+    install_project.add_argument(
+        "--include-claude",
+        action="store_true",
+        help="Also append an expcap block to CLAUDE.md for Claude Code users.",
+    )
 
     sync_milvus = subparsers.add_parser(
         "sync-milvus",
@@ -466,7 +471,7 @@ def _handle_review(args: argparse.Namespace) -> int:
 
 
 def _handle_install_project(args: argparse.Namespace) -> int:
-    result = install_project_agents(Path(args.workspace))
+    result = install_project_agents(Path(args.workspace), include_claude=args.include_claude)
     _print_json(result)
     return 0
 

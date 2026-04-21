@@ -7,7 +7,7 @@ EXPCAP_BLOCK_START = "<!-- EXPCAP START -->"
 EXPCAP_BLOCK_END = "<!-- EXPCAP END -->"
 
 
-def _agents_sidecar_content(workspace: Path) -> str:
+def _sidecar_content(workspace: Path) -> str:
     workspace_path = str(workspace.resolve())
     return f"""# AGENTS.expcap.md
 
@@ -68,12 +68,12 @@ expcap promote --candidate "{workspace_path}/.agent-memory/candidates/<candidate
 """
 
 
-def _agents_managed_block() -> str:
+def _managed_block(sidecar_name: str = "AGENTS.expcap.md") -> str:
     return f"""{EXPCAP_BLOCK_START}
 ## Expcap Integration
 
-- 本项目额外启用经验资本化工作流，详细规则见 `AGENTS.expcap.md`
-- 不替换本项目原有 `AGENTS.md` 约束，只补充经验 `get/save` 行为
+- 本项目额外启用经验资本化工作流，详细规则见 `{sidecar_name}`
+- 不替换本项目原有 agent 约束，只补充经验 `get/save` 行为
 - 任务开始前优先执行 `expcap auto-start`
 - 任务收敛后优先执行 `expcap auto-finish`
 - 高置信经验再继续 `promote`
@@ -81,42 +81,66 @@ def _agents_managed_block() -> str:
 {EXPCAP_BLOCK_END}"""
 
 
-def install_project_agents(workspace: Path) -> dict[str, str | bool]:
+def _upsert_managed_block(
+    path: Path,
+    *,
+    title: str,
+    intro: str,
+    sidecar_name: str,
+) -> tuple[bool, bool]:
+    block = _managed_block(sidecar_name=sidecar_name)
+    created = False
+    updated = False
+
+    if not path.exists():
+        path.write_text(f"# {title}\n\n{intro}\n\n{block}\n", encoding="utf-8")
+        return True, True
+
+    original = path.read_text(encoding="utf-8")
+    if EXPCAP_BLOCK_START in original and EXPCAP_BLOCK_END in original:
+        start = original.index(EXPCAP_BLOCK_START)
+        end = original.index(EXPCAP_BLOCK_END) + len(EXPCAP_BLOCK_END)
+        new_content = original[:start].rstrip() + "\n\n" + block + "\n" + original[end:].lstrip()
+    else:
+        suffix = "" if original.endswith("\n") else "\n"
+        new_content = original + suffix + "\n" + block + "\n"
+    if new_content != original:
+        path.write_text(new_content, encoding="utf-8")
+        updated = True
+    return created, updated
+
+
+def install_project_agents(workspace: Path, *, include_claude: bool = False) -> dict[str, str | bool]:
     workspace = workspace.resolve()
     sidecar_path = workspace / "AGENTS.expcap.md"
-    sidecar_path.write_text(_agents_sidecar_content(workspace), encoding="utf-8")
+    sidecar_path.write_text(_sidecar_content(workspace), encoding="utf-8")
 
     agents_path = workspace / "AGENTS.md"
-    block = _agents_managed_block()
-    created_agents = False
-    updated_agents = False
+    created_agents, updated_agents = _upsert_managed_block(
+        agents_path,
+        title="AGENTS.md",
+        intro="本项目启用了 `expcap` 经验资本化工作流，详细规则见 `AGENTS.expcap.md`。",
+        sidecar_name="AGENTS.expcap.md",
+    )
 
-    if not agents_path.exists():
-        agents_path.write_text(
-            "# AGENTS.md\n\n"
-            "本项目启用了 `expcap` 经验资本化工作流，详细规则见 `AGENTS.expcap.md`。\n\n"
-            f"{block}\n",
-            encoding="utf-8",
+    claude_path = workspace / "CLAUDE.md"
+    created_claude = False
+    updated_claude = False
+    if include_claude:
+        created_claude, updated_claude = _upsert_managed_block(
+            claude_path,
+            title="CLAUDE.md",
+            intro="本项目启用了 `expcap` 经验资本化工作流，详细规则见 `AGENTS.expcap.md`。",
+            sidecar_name="AGENTS.expcap.md",
         )
-        created_agents = True
-        updated_agents = True
-    else:
-        original = agents_path.read_text(encoding="utf-8")
-        if EXPCAP_BLOCK_START in original and EXPCAP_BLOCK_END in original:
-            start = original.index(EXPCAP_BLOCK_START)
-            end = original.index(EXPCAP_BLOCK_END) + len(EXPCAP_BLOCK_END)
-            new_content = original[:start].rstrip() + "\n\n" + block + "\n"
-        else:
-            suffix = "" if original.endswith("\n") else "\n"
-            new_content = original + suffix + "\n" + block + "\n"
-        if new_content != original:
-            agents_path.write_text(new_content, encoding="utf-8")
-            updated_agents = True
 
     return {
         "workspace": str(workspace),
         "agents_path": str(agents_path),
         "sidecar_path": str(sidecar_path),
+        "claude_path": str(claude_path) if include_claude else "",
         "created_agents": created_agents,
         "updated_agents": updated_agents,
+        "created_claude": created_claude,
+        "updated_claude": updated_claude,
     }

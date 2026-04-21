@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WORKSPACE="${1:-$PWD}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'USAGE'
+Usage:
+  scripts/expcap-enable [target-workspace]
+
+Environment:
+  EXPCAP_INCLUDE_CLAUDE=0  Skip CLAUDE.md integration.
+  EXPCAP_WITH_MILVUS=1     Install Milvus Lite extras and sync indexes.
+
+This bootstraps expcap for a project by installing the local CLI package and
+non-destructively appending expcap instructions to AGENTS.md and CLAUDE.md.
+USAGE
+  exit 0
+fi
+
+cd "$PROJECT_ROOT"
+
+if [[ ! -d ".venv" ]]; then
+  python3 -m venv .venv
+fi
+
+if [[ "${EXPCAP_WITH_MILVUS:-0}" == "1" ]]; then
+  .venv/bin/pip install -e ".[milvus]"
+else
+  .venv/bin/pip install -e .
+fi
+
+INSTALL_ARGS=(install-project --workspace "$WORKSPACE")
+if [[ "${EXPCAP_INCLUDE_CLAUDE:-1}" != "0" ]]; then
+  INSTALL_ARGS+=(--include-claude)
+fi
+
+scripts/expcap "${INSTALL_ARGS[@]}"
+
+if [[ "${EXPCAP_WITH_MILVUS:-0}" == "1" ]]; then
+  scripts/expcap sync-milvus --workspace "$WORKSPACE" --include-shared
+fi
+
+scripts/expcap status --workspace "$WORKSPACE" --limit 3

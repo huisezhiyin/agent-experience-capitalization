@@ -40,6 +40,25 @@ class InstallProjectTests(unittest.TestCase):
             self.assertEqual(once, twice)
             self.assertEqual(once.count("<!-- EXPCAP START -->"), 1)
 
+    def test_install_project_can_also_update_claude_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir(parents=True, exist_ok=True)
+            claude_path = workspace / "CLAUDE.md"
+            claude_path.write_text("# CLAUDE.md\n\n原有 Claude 规则。\n", encoding="utf-8")
+
+            result = install_project_agents(workspace, include_claude=True)
+
+            claude_text = claude_path.read_text(encoding="utf-8")
+            self.assertIn("原有 Claude 规则。", claude_text)
+            self.assertIn("<!-- EXPCAP START -->", claude_text)
+            self.assertIn("AGENTS.expcap.md", claude_text)
+            self.assertEqual(result["created_claude"], False)
+            self.assertEqual(result["updated_claude"], True)
+
+            install_project_agents(workspace, include_claude=True)
+            self.assertEqual(claude_path.read_text(encoding="utf-8").count("<!-- EXPCAP START -->"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

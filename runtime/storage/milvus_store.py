@@ -1,43 +1,105 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from functools import lru_cache
 import hashlib
 import math
+import os
 import re
+import warnings
 from pathlib import Path
 from typing import Any
 
 from runtime.storage.fs_store import iter_json_objects
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback.
+    fcntl = None
+
 
 COLLECTION_NAME = "experience_assets"
 EMBEDDING_DIM = 128
 
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GLOG_minloglevel", "2")
 
+
+@lru_cache(maxsize=1)
 def milvus_available() -> bool:
     try:
-        from pymilvus import MilvusClient  # noqa: F401
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="pkg_resources is deprecated as an API.*",
+                category=UserWarning,
+            )
+            from pymilvus import MilvusClient  # noqa: F401
     except Exception:
         return False
     return True
+
+
+def _compact_error(error: Exception) -> str:
+    return " ".join(str(error).split())[:240] or error.__class__.__name__
+
+
+@contextmanager
+def _milvus_db_lock(db_path: Path):
+    if fcntl is None:
+        yield None
+        return
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = db_path.with_name(f"{db_path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield "locked_by_another_process"
+            return
+        try:
+            yield None
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def milvus_backend_summary(db_path: Path) -> dict[str, Any]:
     summary = {
         "backend": "milvus-lite",
         "available": milvus_available(),
+        "status": "ready" if milvus_available() else "unavailable",
+        "degraded_reason": None,
+        "last_error": None,
         "db_path": str(db_path),
         "db_exists": db_path.exists(),
         "collection_name": COLLECTION_NAME,
         "collection_exists": False,
         "indexed_entities": None,
     }
-    client = _safe_client(db_path)
-    if client is None:
+    if not summary["available"]:
         return summary
 
+    with _milvus_db_lock(db_path) as lock_error:
+        if lock_error:
+            summary["status"] = "degraded"
+            summary["degraded_reason"] = lock_error
+            return summary
+        client = _safe_client_unlocked(db_path)
+        if client is None:
+            summary["status"] = "degraded"
+            summary["degraded_reason"] = "client_unavailable"
+            return summary
+        return _populate_backend_summary(client, summary)
+
+
+def _populate_backend_summary(client: Any, summary: dict[str, Any]) -> dict[str, Any]:
     try:
         summary["collection_exists"] = bool(client.has_collection(collection_name=COLLECTION_NAME))
-    except Exception:
+    except Exception as error:
+        summary["status"] = "degraded"
+        summary["degraded_reason"] = "collection_check_failed"
+        summary["last_error"] = _compact_error(error)
         return summary
 
     if not summary["collection_exists"]:
@@ -45,7 +107,10 @@ def milvus_backend_summary(db_path: Path) -> dict[str, Any]:
 
     try:
         stats = client.get_collection_stats(collection_name=COLLECTION_NAME)
-    except Exception:
+    except Exception as error:
+        summary["status"] = "degraded"
+        summary["degraded_reason"] = "stats_failed"
+        summary["last_error"] = _compact_error(error)
         stats = None
     if isinstance(stats, dict):
         for key in ("row_count", "rows", "num_rows", "insert_count"):
@@ -68,7 +133,10 @@ def milvus_backend_summary(db_path: Path) -> dict[str, Any]:
             )
             if isinstance(rows, list):
                 summary["indexed_entities"] = len(rows)
-        except Exception:
+        except Exception as error:
+            summary["status"] = "degraded"
+            summary["degraded_reason"] = "count_query_failed"
+            summary["last_error"] = _compact_error(error)
             pass
 
     return summary
@@ -81,13 +149,31 @@ def _client(db_path: Path) -> Any:
     return MilvusClient(str(db_path))
 
 
-def _safe_client(db_path: Path) -> Any | None:
+def _safe_client_unlocked(db_path: Path) -> Any | None:
     if not milvus_available():
         return None
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="pkg_resources is deprecated as an API.*",
+            category=UserWarning,
+        )
+        try:
+            return _client(db_path)
+        except Exception:
+            return None
+
+
+def _upsert_asset_vector_unlocked(client: Any, asset: dict[str, Any]) -> bool:
     try:
-        return _client(db_path)
+        _ensure_collection(client)
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            data=[prepare_asset_document(asset)],
+        )
+        return True
     except Exception:
-        return None
+        return False
 
 
 def _ensure_collection(client: Any) -> None:
@@ -163,35 +249,35 @@ def prepare_asset_document(asset: dict[str, Any]) -> dict[str, Any]:
 
 
 def upsert_asset_vector(db_path: Path, asset: dict[str, Any]) -> bool:
-    client = _safe_client(db_path)
-    if client is None:
-        return False
-    try:
-        _ensure_collection(client)
-        client.upsert(
-            collection_name=COLLECTION_NAME,
-            data=[prepare_asset_document(asset)],
-        )
-        return True
-    except Exception:
-        return False
+    with _milvus_db_lock(db_path) as lock_error:
+        if lock_error:
+            return False
+        client = _safe_client_unlocked(db_path)
+        if client is None:
+            return False
+        return _upsert_asset_vector_unlocked(client, asset)
 
 
 def sync_assets_directory(db_path: Path, assets_dir: Path) -> int:
-    client = _safe_client(db_path)
-    if client is None or not assets_dir.exists():
+    if not assets_dir.exists():
         return 0
-    try:
-        _ensure_collection(client)
-    except Exception:
-        return 0
-    count = 0
-    for asset in iter_json_objects(assets_dir):
-        if "asset_id" not in asset:
-            continue
-        if upsert_asset_vector(db_path, asset):
-            count += 1
-    return count
+    with _milvus_db_lock(db_path) as lock_error:
+        if lock_error:
+            return 0
+        client = _safe_client_unlocked(db_path)
+        if client is None:
+            return 0
+        try:
+            _ensure_collection(client)
+        except Exception:
+            return 0
+        count = 0
+        for asset in iter_json_objects(assets_dir):
+            if "asset_id" not in asset:
+                continue
+            if _upsert_asset_vector_unlocked(client, asset):
+                count += 1
+        return count
 
 
 def _build_filter(
@@ -218,39 +304,45 @@ def search_asset_vectors(
     if not db_path.exists():
         return []
 
-    client = _safe_client(db_path)
-    if client is None:
-        return []
-    if not client.has_collection(collection_name=COLLECTION_NAME):
-        return []
+    with _milvus_db_lock(db_path) as lock_error:
+        if lock_error:
+            return []
+        client = _safe_client_unlocked(db_path)
+        if client is None:
+            return []
+        try:
+            if not client.has_collection(collection_name=COLLECTION_NAME):
+                return []
+        except Exception:
+            return []
 
-    output_fields = [
-        "asset_id",
-        "workspace",
-        "source_workspace",
-        "knowledge_scope",
-        "knowledge_kind",
-        "asset_type",
-        "scope_level",
-        "scope_value",
-        "title",
-        "content",
-        "confidence",
-        "updated_at",
-        "created_at",
-    ]
-    filter_expr = _build_filter(knowledge_scope=knowledge_scope, workspace=workspace)
-    try:
-        result = client.search(
-            collection_name=COLLECTION_NAME,
-            data=[embed_text(query_text)],
-            filter=filter_expr,
-            limit=limit,
-            output_fields=output_fields,
-        )
-    except Exception:
-        return []
-    return _normalize_search_results(result)
+        output_fields = [
+            "asset_id",
+            "workspace",
+            "source_workspace",
+            "knowledge_scope",
+            "knowledge_kind",
+            "asset_type",
+            "scope_level",
+            "scope_value",
+            "title",
+            "content",
+            "confidence",
+            "updated_at",
+            "created_at",
+        ]
+        filter_expr = _build_filter(knowledge_scope=knowledge_scope, workspace=workspace)
+        try:
+            result = client.search(
+                collection_name=COLLECTION_NAME,
+                data=[embed_text(query_text)],
+                filter=filter_expr,
+                limit=limit,
+                output_fields=output_fields,
+            )
+        except Exception:
+            return []
+        return _normalize_search_results(result)
 
 
 def _normalize_search_results(result: Any) -> list[dict[str, Any]]:

@@ -1,7 +1,7 @@
 {
   "trace_id": "trace_20260413_001",
   "host": "codex",
-  "workspace": "/path/to/agent-experience-capitalization",
+  "workspace": "/path/to/workspace",
   "session_id": "sess_demo_001",
   "task_hint": "fix pytest import error",
   "user_request": "修复 pytest 导入错误，并确保测试通过。",

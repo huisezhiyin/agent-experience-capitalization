@@ -9,7 +9,7 @@
 克隆仓库后可以直接用仓库内 wrapper 试跑：
 
 ```bash
-git clone git@github.com:example-owner/agent-experience-capitalization.git
+git clone https://github.com/<owner>/agent-experience-capitalization.git
 cd agent-experience-capitalization
 
 python3 -m venv .venv
@@ -110,8 +110,6 @@ EXPCAP_WITH_MILVUS=1 scripts/expcap-enable /path/to/your/project
 - [Concept](docs/my_idea.md)
 - [Architecture](docs/experience_capitalization_architecture.md)
 - [MVP Spec](docs/mvp_spec.md)
-- [Chat Handoff 2026-04-17](docs/chat_handoff_20260417.md)
-- [Usage Audit And Optimization Roadmap 2026-04-17](docs/usage_audit_20260417.md)
 
 ## 当前代码骨架
 
@@ -126,12 +124,12 @@ EXPCAP_WITH_MILVUS=1 scripts/expcap-enable /path/to/your/project
 当前命令面为：
 
 ```bash
- expcap auto-start --task "fix pytest import error" --workspace "$PWD" --constraint "不要改 public API"
- expcap auto-finish --workspace "$PWD" --task "fix pytest import error" --command "uv run pytest tests/test_imports.py" --error "ModuleNotFoundError: no module named foo" --verification-status passed --verification-summary "1 passed" --result-status success --result-summary "修复导入路径并补充回归测试"
- expcap review-candidates --workspace "$PWD"
- expcap review-candidates --workspace "$PWD" --action approve --candidate-id cand_xxx
- expcap status --workspace "$PWD"
- expcap sync-milvus --workspace "$PWD" --include-shared
+expcap auto-start --task "fix pytest import error" --workspace "$PWD" --constraint "不要改 public API"
+expcap auto-finish --workspace "$PWD" --task "fix pytest import error" --command "uv run pytest tests/test_imports.py" --error "ModuleNotFoundError: no module named foo" --verification-status passed --verification-summary "1 passed" --result-status success --result-summary "修复导入路径并补充回归测试"
+expcap review-candidates --workspace "$PWD"
+expcap review-candidates --workspace "$PWD" --action approve --candidate-id cand_xxx
+expcap status --workspace "$PWD"
+expcap sync-milvus --workspace "$PWD" --include-shared
 python3 -m runtime.cli ingest --workspace "$PWD" --task "fix pytest import error" --command "uv run pytest tests/test_imports.py" --error "ModuleNotFoundError: no module named foo" --verification-status passed --verification-summary "1 passed" --result-status success --result-summary "修复导入路径并补充回归测试"
 python3 -m runtime.cli auto-finish --workspace "$PWD" --task "stabilize API contract checks" --constraint "不要破坏现有 API 契约" --verification-status passed --result-status success --knowledge-scope cross-project --knowledge-kind rule
 python3 -m runtime.cli install-project --workspace /path/to/another-repo
@@ -161,7 +159,7 @@ python3 -m unittest discover -s tests -v
 - `status` 会输出当前工作区的短测摘要，包括使用量、activation 帮助反馈、asset 温度、candidate 状态与 review queue
 - `status` 现在也会输出 retrieval backend 摘要，明确展示 `SQLite` 与 `Milvus Lite` 当前是否可用、db 是否存在、Milvus collection 是否已建立
 - `status` 现在也会输出 `backend_configuration`，明确展示当前运行是在 `local-first` 还是 `hybrid` 配置下
-- 优先调用 `expcap`；如果当前环境没有继承 PATH，可退回 `python3 -m runtime.cli`
+- 优先调用安装后的 `expcap`；如果当前环境没有安装 CLI，可退回 `python3 -m runtime.cli`
 - `install-project` 会非破坏式接入其他项目：保留原有 `AGENTS.md`，只追加 `expcap` 区块并生成 `AGENTS.expcap.md`
 - `.agent-memory/index.sqlite3` 负责本地状态索引、审核结果、activation log 与统计汇总，正文内容仍以 JSON 文件为真源
 - Milvus Lite 已作为可选语义召回层接入：本项目资产走 `<workspace>/.agent-memory/milvus.db`，跨项目资产走 `$CODEX_HOME/expcap-memory/milvus.db`

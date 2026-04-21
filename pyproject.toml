@@ -9,7 +9,7 @@ description = "Skill-first, local-first runtime for agent experience capitalizat
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-  { name = "example-owner", email = "user@example.com" }
+  { name = "agent-experience-capitalization contributors" }
 ]
 dependencies = []
 

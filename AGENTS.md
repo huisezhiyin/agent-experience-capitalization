@@ -15,7 +15,7 @@
 - 先根据用户当前任务描述，调用：
 
 ```bash
-expcap auto-start --task "<当前任务摘要>" --workspace /path/to/agent-experience-capitalization
+scripts/expcap auto-start --task "<当前任务摘要>" --workspace "$PWD"
 ```
 
 - 读取 `.agent-memory/views/` 下最新的 `activation_view`
@@ -69,13 +69,13 @@ expcap auto-start --task "<当前任务摘要>" --workspace /path/to/agent-exper
 优先使用本地包装器：
 
 ```bash
-expcap <subcommand> ...
+scripts/expcap <subcommand> ...
 ```
 
-它实际会调用本仓库中的：
+或使用安装后的 CLI：
 
 ```bash
-python3 -m runtime.cli <subcommand> ...
+expcap <subcommand> ...
 ```
 
 ## 当前阶段定位

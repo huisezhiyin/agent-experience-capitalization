@@ -19,6 +19,10 @@ def _sidecar_content(workspace: Path) -> str:
 - 只为当前项目补充经验 `get/save` 规则
 - 让 Codex 在这个项目中默认把 `expcap` 当作辅助能力使用
 
+## 核心定位
+
+`expcap` 不和 Codex / Claude Code 的个人记忆竞争。它专注于项目级、团队级、公司级的工程经验资产：可共享、可审阅、可交割，不绑定某一个人的模型账号。
+
 ## 默认行为
 
 ### 1. 任务开始前默认先做 get

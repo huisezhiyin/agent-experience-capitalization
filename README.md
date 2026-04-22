@@ -10,6 +10,10 @@
 
 `expcap` 的入口是 `skill`，后端是可插拔 runtime。它让 agent 在任务开始前自动激活项目经验，在任务结束后把有效经验沉淀成可共享、可交割的项目资产。单人团队可以完全本地运行；团队场景可以接入对象存储、云端 Milvus、Cloud SQL 等共享后端。
 
+**Short name:** TEAM memory — **Transferable Engineering Asset Memory**.
+
+`TEAM memory` means engineering experience that can move with the project: across agents, machines, teammates, and organizations.
+
 ## Search Keywords
 
 Agent experience, project memory, team memory, coding agents, agentic coding,
@@ -29,10 +33,14 @@ experience capitalization, semantic retrieval, RAG, Codex, Claude Code.
 `expcap` is not personal assistant memory. It is an external experience asset
 layer owned by a project or team.
 
+- It does not compete with Codex / Claude Code personal memory.
 - Assets are project-owned by default, not bound to one person's model account.
 - Assets should be portable and deliverable across agents, machines, and teammates.
 - Cloud backends are the natural team mode; local files are the solo/offline mode.
 - Local `.agent-memory/` is useful as a cache and development store, but should not be the only long-term source of truth for a team.
+
+See [Core Principles](docs/core_principles.md) for the guiding product line:
+project/team/company experience assets, not personal assistant memory.
 
 ## Open Source
 

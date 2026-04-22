@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -84,6 +85,57 @@ class MilvusStoreLockTests(unittest.TestCase):
             finally:
                 milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
                 lock_file.close()
+
+    def test_sync_assets_directory_with_report_prunes_stale_vectors(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.upserted_ids: list[str] = []
+                self.deleted_ids: list[str] = []
+
+            def has_collection(self, collection_name: str) -> bool:
+                return True
+
+            def upsert(self, collection_name: str, data: list[dict]) -> None:
+                self.upserted_ids.extend(str(item["asset_id"]) for item in data)
+
+            def query(self, collection_name: str, filter: str, output_fields: list[str], limit: int) -> list[dict]:
+                return [{"asset_id": "asset_live"}, {"asset_id": "asset_stale"}]
+
+            def delete(self, collection_name: str, ids: list[str]) -> dict:
+                self.deleted_ids.extend(ids)
+                return {"delete_count": len(ids)}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            assets_dir = Path(tmpdir) / "assets" / "patterns"
+            assets_dir.mkdir(parents=True)
+            (assets_dir / "asset_live.json").write_text(
+                json.dumps(
+                    {
+                        "asset_id": "asset_live",
+                        "asset_type": "pattern",
+                        "title": "Live asset",
+                        "content": "Still exists",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = FakeClient()
+
+            with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "_safe_client_unlocked",
+                return_value=client,
+            ):
+                report = milvus_store.sync_assets_directory_with_report(
+                    db_path,
+                    Path(tmpdir) / "assets",
+                    prune=True,
+                )
+
+            self.assertEqual(report, {"synced": 1, "pruned": 1})
+            self.assertEqual(client.upserted_ids, ["asset_live"])
+            self.assertEqual(client.deleted_ids, ["asset_stale"])
 
 
 if __name__ == "__main__":

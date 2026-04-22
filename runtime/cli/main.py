@@ -36,7 +36,7 @@ from runtime.storage.fs_store import (
 from runtime.storage.milvus_store import (
     milvus_available,
     milvus_backend_summary,
-    sync_assets_directory,
+    sync_assets_directory_with_report,
     upsert_asset_vector,
 )
 from runtime.storage.sqlite_store import (
@@ -161,6 +161,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--include-shared",
         action="store_true",
         help="Also sync shared cross-project assets from ~/.codex/expcap-memory/assets.",
+    )
+    sync_milvus.add_argument(
+        "--prune",
+        action="store_true",
+        help="Delete Milvus entities whose asset_id no longer exists in the source assets directory.",
     )
 
     review = subparsers.add_parser("review", help="Generate an episode from a trace bundle.")
@@ -695,16 +700,27 @@ def _handle_promote(args: argparse.Namespace) -> int:
 def _handle_sync_milvus(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     local_assets_dir = memory_root_for_workspace(workspace) / "assets"
-    local_synced = sync_assets_directory(default_milvus_db_path(workspace), local_assets_dir)
-    shared_synced = 0
+    local_report = sync_assets_directory_with_report(
+        default_milvus_db_path(workspace),
+        local_assets_dir,
+        prune=args.prune,
+    )
+    shared_report = {"synced": 0, "pruned": 0}
     if args.include_shared:
-        shared_synced = sync_assets_directory(shared_milvus_db_path(), shared_memory_root() / "assets")
+        shared_report = sync_assets_directory_with_report(
+            shared_milvus_db_path(),
+            shared_memory_root() / "assets",
+            prune=args.prune,
+        )
     _print_json(
         {
             "milvus_available": milvus_available(),
             "workspace": str(workspace),
-            "local_synced": local_synced,
-            "shared_synced": shared_synced,
+            "local_synced": local_report["synced"],
+            "local_pruned": local_report["pruned"],
+            "shared_synced": shared_report["synced"],
+            "shared_pruned": shared_report["pruned"],
+            "prune": args.prune,
             "local_milvus_db": str(default_milvus_db_path(workspace)),
             "shared_milvus_db": str(shared_milvus_db_path()) if args.include_shared else None,
         }

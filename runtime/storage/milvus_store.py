@@ -262,25 +262,69 @@ def upsert_asset_vector(db_path: Path, asset: dict[str, Any]) -> bool:
 
 
 def sync_assets_directory(db_path: Path, assets_dir: Path) -> int:
+    return sync_assets_directory_with_report(db_path, assets_dir)["synced"]
+
+
+def sync_assets_directory_with_report(db_path: Path, assets_dir: Path, *, prune: bool = False) -> dict[str, Any]:
+    report = {"synced": 0, "pruned": 0}
     if not assets_dir.exists():
-        return 0
+        return report
     with _milvus_db_lock(db_path) as lock_error:
         if lock_error:
-            return 0
+            return report
         client = _safe_client_unlocked(db_path)
         if client is None:
-            return 0
+            return report
         try:
             _ensure_collection(client)
         except Exception:
-            return 0
-        count = 0
+            return report
+        expected_asset_ids: set[str] = set()
         for asset in iter_json_objects(assets_dir):
-            if "asset_id" not in asset:
+            asset_id = asset.get("asset_id")
+            if not asset_id:
                 continue
+            expected_asset_ids.add(str(asset_id))
             if _upsert_asset_vector_unlocked(client, asset):
-                count += 1
-        return count
+                report["synced"] += 1
+        if prune:
+            report["pruned"] = _prune_stale_asset_vectors_unlocked(client, expected_asset_ids)
+        return report
+
+
+def _prune_stale_asset_vectors_unlocked(client: Any, expected_asset_ids: set[str]) -> int:
+    try:
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter='asset_id != ""',
+            output_fields=["asset_id"],
+            limit=16384,
+        )
+    except Exception:
+        return 0
+    if not isinstance(rows, list):
+        return 0
+
+    stale_asset_ids = [
+        str(row.get("asset_id"))
+        for row in rows
+        if isinstance(row, dict) and row.get("asset_id") and str(row.get("asset_id")) not in expected_asset_ids
+    ]
+    if not stale_asset_ids:
+        return 0
+    try:
+        result = client.delete(collection_name=COLLECTION_NAME, ids=stale_asset_ids)
+    except Exception:
+        return 0
+    if isinstance(result, dict):
+        for key in ("delete_count", "deleted_count", "delete_cnt"):
+            value = result.get(key)
+            if value is not None:
+                try:
+                    return int(value)
+                except Exception:
+                    break
+    return len(stale_asset_ids)
 
 
 def _build_filter(

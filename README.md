@@ -130,6 +130,7 @@ expcap review-candidates --workspace "$PWD"
 expcap review-candidates --workspace "$PWD" --action approve --candidate-id cand_xxx
 expcap status --workspace "$PWD"
 expcap sync-milvus --workspace "$PWD" --include-shared
+expcap sync-milvus --workspace "$PWD" --include-shared --prune
 python3 -m runtime.cli ingest --workspace "$PWD" --task "fix pytest import error" --command "uv run pytest tests/test_imports.py" --error "ModuleNotFoundError: no module named foo" --verification-status passed --verification-summary "1 passed" --result-status success --result-summary "修复导入路径并补充回归测试"
 python3 -m runtime.cli auto-finish --workspace "$PWD" --task "stabilize API contract checks" --constraint "不要破坏现有 API 契约" --verification-status passed --result-status success --knowledge-scope cross-project --knowledge-kind rule
 python3 -m runtime.cli install-project --workspace /path/to/another-repo
@@ -199,6 +200,8 @@ expcap status --workspace "$PWD" --deep-retrieval-check
 ```
 
 每次 `activate` 也会输出 `retrieval_summary`，并在每条 selected asset 上标注 `retrieval_sources` 与 `vector_score`。如果 `retrieval_sources` 包含 `milvus`，说明该经验确实经过 Milvus 语义召回参与排序。
+
+如果 `asset_coverage.possible_stale_entities` 大于 0，可以运行 `sync-milvus --prune` 清理 Milvus 中已经没有对应 JSON asset 的旧 entity。
 
 ## Backend 配置
 

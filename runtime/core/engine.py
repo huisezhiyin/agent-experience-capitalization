@@ -59,6 +59,15 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
     return result
 
 
+def _same_workspace_path(left: Any, right: str) -> bool:
+    if not left:
+        return False
+    try:
+        return Path(str(left)).expanduser().resolve() == Path(right).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return str(left) == right
+
+
 def _task_tokens(value: str) -> list[str]:
     token = []
     tokens: list[str] = []
@@ -585,7 +594,9 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
         score += 0.08
         evidence_bonus += 0.08
         evidence.append(f"作用域层级对齐 {scope['level']}")
-    if asset.get("workspace") and asset.get("workspace") == workspace:
+    if _same_workspace_path(asset.get("workspace"), workspace) or _same_workspace_path(
+        asset.get("source_workspace"), workspace
+    ):
         score += 0.22
         evidence_bonus += 0.22
         evidence.append("来源 workspace 与当前项目一致")

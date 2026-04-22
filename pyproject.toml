@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-experience-capitalization"
 version = "0.1.0"
-description = "Skill-first, local-first runtime for agent experience capitalization."
+description = "Skill-first, local-first memory runtime for coding agents to retrieve, reuse, and improve task experience."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -14,10 +14,18 @@ authors = [
 ]
 keywords = [
   "agent-memory",
+  "agentic-coding",
+  "ai-agents",
+  "claude-code",
+  "codex",
   "coding-agents",
   "experience-capitalization",
+  "local-first",
   "milvus",
   "rag",
+  "semantic-retrieval",
+  "sqlite",
+  "vector-search",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -27,6 +35,7 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Topic :: Software Development",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]

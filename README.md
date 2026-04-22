@@ -10,6 +10,20 @@
 
 `expcap` 的入口是 `skill`，后端是本地 runtime。它让 agent 在任务开始前自动激活历史经验，在任务结束后自动沉淀经验，并用 `SQLite` / `Milvus Lite` 等后端维护可复用经验。
 
+## Search Keywords
+
+Agent memory, coding agents, agentic coding, AI agents, developer tools,
+local-first, experience capitalization, semantic retrieval, vector search,
+RAG, Milvus, SQLite, Codex, Claude Code.
+
+## Use Cases
+
+- Give coding agents project-specific memory before they start a task.
+- Turn completed agent work into reusable experience assets.
+- Retrieve experience with Milvus Lite semantic search and SQLite state.
+- Track whether activated experience actually helped future tasks.
+- Bootstrap `AGENTS.md` / `CLAUDE.md` instructions for agent memory workflows.
+
 ## Open Source
 
 - License: Apache-2.0

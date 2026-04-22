@@ -225,6 +225,8 @@ export EXPCAP_SHARING_BACKEND=cloud-shared
 
 ## 当前检索策略
 
+`activate` 按轻量 experience RAG pipeline 执行：`retrieve -> rerank -> assemble`。
+
 - 先检索当前项目资产，再补跨项目资产
 - 如果 Milvus Lite 可用，先做语义召回候选，再与 SQLite / JSON 元数据混排
 - 最终只注入少量高价值上下文，避免把“相似但不适用”的内容塞进当前任务

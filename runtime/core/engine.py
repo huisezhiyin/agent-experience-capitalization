@@ -654,18 +654,20 @@ def _merge_assets(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
     return list(merged.values())
 
 
-def activate_assets(
+def _tag_retrieval_source(assets: list[dict[str, Any]], source: str) -> None:
+    for asset in assets:
+        asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), source])
+
+
+def _retrieve_activation_assets(
     *,
-    task: str,
     workspace: Path,
-    constraints: list[str],
+    workspace_str: str,
+    query_text: str,
     assets_dir: Path,
     candidates_dir: Path,
     db_path: Path | None = None,
 ) -> dict[str, Any]:
-    scope = _infer_scope(task)
-    workspace_str = str(workspace)
-    query_text = task if not constraints else f"{task} {' '.join(constraints)}"
     assets_dir.mkdir(parents=True, exist_ok=True)
     shared_assets_dir = shared_memory_root() / "assets"
     sync_assets_directory(default_milvus_db_path(workspace), assets_dir)
@@ -678,33 +680,29 @@ def activate_assets(
         knowledge_scope="project",
         workspace=workspace_str,
     )
-    for asset in vector_project_assets:
-        asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "milvus"])
+    _tag_retrieval_source(vector_project_assets, "milvus")
     vector_shared_assets = search_asset_vectors(
         shared_milvus_db_path(),
         query_text=query_text,
         limit=5,
         knowledge_scope="cross-project",
     )
-    for asset in vector_shared_assets:
-        asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "milvus"])
+    _tag_retrieval_source(vector_shared_assets, "milvus")
 
     assets: list[dict[str, Any]] = []
     if db_path:
         assets = list_assets(db_path, workspace=workspace_str)
-        for asset in assets:
-            asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "sqlite"])
+        _tag_retrieval_source(assets, "sqlite")
     if not assets:
         assets = list(iter_json_objects(assets_dir))
-        for asset in assets:
-            asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "json"])
+        _tag_retrieval_source(assets, "json")
     for asset in assets:
         asset.setdefault("knowledge_scope", "project")
         asset.setdefault("knowledge_kind", asset.get("asset_type", "pattern"))
 
     shared_assets = list(iter_json_objects(shared_assets_dir)) if shared_assets_dir.exists() else []
+    _tag_retrieval_source(shared_assets, "shared-json")
     for asset in shared_assets:
-        asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "shared-json"])
         asset.setdefault("knowledge_scope", "cross-project")
         asset.setdefault("knowledge_kind", asset.get("asset_type", "pattern"))
         asset.setdefault("workspace", None)
@@ -712,18 +710,41 @@ def activate_assets(
     assets = _merge_assets(vector_project_assets, assets)
     assets = _merge_assets(vector_shared_assets, assets + shared_assets)
 
+    used_candidate_fallback = False
     if not assets:
+        used_candidate_fallback = True
         candidates: list[dict[str, Any]] = []
         if db_path:
             candidates = list_candidates(db_path, workspace=workspace_str)
         if not candidates:
             candidates = list(iter_json_objects(candidates_dir))
         assets = [_candidate_as_asset(candidate) for candidate in candidates]
-        for asset in assets:
-            asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "candidate-fallback"])
+        _tag_retrieval_source(assets, "candidate-fallback")
 
-    scored_assets = []
-    feedback_stats = summarize_asset_feedback(db_path, asset_ids=[asset.get("asset_id") for asset in assets if asset.get("asset_id")]) if db_path else {}
+    return {
+        "assets": assets,
+        "vector_project_assets": vector_project_assets,
+        "vector_shared_assets": vector_shared_assets,
+        "used_sqlite_index": bool(db_path and db_path.exists()),
+        "used_candidate_fallback": used_candidate_fallback,
+    }
+
+
+def _rerank_activation_assets(
+    *,
+    task: str,
+    scope: dict[str, str],
+    workspace_str: str,
+    assets: list[dict[str, Any]],
+    db_path: Path | None = None,
+) -> list[tuple[float, dict[str, Any], dict[str, Any]]]:
+    scored_assets: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+    feedback_stats = (
+        summarize_asset_feedback(db_path, asset_ids=[asset.get("asset_id") for asset in assets if asset.get("asset_id")])
+        if db_path
+        else {}
+    )
+
     for asset in assets:
         if asset.get("asset_id") in feedback_stats:
             asset = apply_asset_effectiveness(asset, feedback_stats[asset["asset_id"]])
@@ -731,19 +752,13 @@ def activate_assets(
         scored_assets.append((details["score"], asset, details))
 
     scored_assets.sort(key=lambda item: item[0], reverse=True)
-    selected = []
-    why_selected = [
-        f"scope 命中 {scope['level']}::{scope['value']}",
-        "先召回项目内资产，再补跨项目资产，最后按证据与相关性混排",
-        "按 scope、knowledge_kind、confidence、status 联合排序",
-        "宽 scope、低证据、低置信命中会被显式降权",
-    ]
-    if constraints:
-        why_selected.append("显式约束被纳入激活说明")
-    if db_path and db_path.exists():
-        why_selected.append("已优先使用 SQLite 索引检索，再回退文件层")
-    if vector_project_assets or vector_shared_assets:
-        why_selected.append("Milvus Lite 语义召回已作为候选层参与排序")
+    return scored_assets
+
+
+def _select_activation_assets(
+    scored_assets: list[tuple[float, dict[str, Any], dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    selected: list[dict[str, Any]] = []
     selection_risks = _unique_preserve_order(
         [
             risk
@@ -778,6 +793,37 @@ def activate_assets(
             }
         )
 
+    return selected, selection_risks
+
+
+def _build_activation_why_selected(
+    *,
+    scope: dict[str, str],
+    constraints: list[str],
+    retrieval: dict[str, Any],
+) -> list[str]:
+    why_selected = [
+        f"scope 命中 {scope['level']}::{scope['value']}",
+        "先召回项目内资产，再补跨项目资产，最后按证据与相关性混排",
+        "按 scope、knowledge_kind、confidence、status 联合排序",
+        "宽 scope、低证据、低置信命中会被显式降权",
+    ]
+    if constraints:
+        why_selected.append("显式约束被纳入激活说明")
+    if retrieval["used_sqlite_index"]:
+        why_selected.append("已优先使用 SQLite 索引检索，再回退文件层")
+    if retrieval["vector_project_assets"] or retrieval["vector_shared_assets"]:
+        why_selected.append("Milvus Lite 语义召回已作为候选层参与排序")
+    if retrieval["used_candidate_fallback"]:
+        why_selected.append("未找到 active asset，已回退到 candidate 经验层")
+    return why_selected
+
+
+def _assemble_activation_context(
+    scored_assets: list[tuple[float, dict[str, Any], dict[str, Any]]],
+    *,
+    constraints: list[str],
+) -> tuple[list[str], list[str]]:
     rendered_context = [
         f"[{asset.get('knowledge_scope', 'project')}/{asset.get('knowledge_kind', asset.get('asset_type', 'pattern'))}] {asset['content']}"
         for _, asset, _ in scored_assets[: min(3, len(scored_assets))]
@@ -785,27 +831,69 @@ def activate_assets(
     if constraints:
         rendered_context.append(f"当前约束：{'；'.join(constraints)}")
 
+    fallback_episode_refs = [
+        ref
+        for _, asset, _ in scored_assets[:3]
+        for ref in asset.get("source_episode_ids", [])
+    ]
+    return rendered_context, fallback_episode_refs
+
+
+def _build_retrieval_summary(selected: list[dict[str, Any]], retrieval: dict[str, Any]) -> dict[str, int]:
+    return {
+        "milvus_project_candidates": len(retrieval["vector_project_assets"]),
+        "milvus_shared_candidates": len(retrieval["vector_shared_assets"]),
+        "selected_from_milvus": sum(1 for item in selected if "milvus" in item.get("retrieval_sources", [])),
+        "selected_from_sqlite": sum(1 for item in selected if "sqlite" in item.get("retrieval_sources", [])),
+        "selected_from_json": sum(1 for item in selected if "json" in item.get("retrieval_sources", []) or "shared-json" in item.get("retrieval_sources", [])),
+        "selected_from_candidate_fallback": sum(1 for item in selected if "candidate-fallback" in item.get("retrieval_sources", [])),
+    }
+
+
+def activate_assets(
+    *,
+    task: str,
+    workspace: Path,
+    constraints: list[str],
+    assets_dir: Path,
+    candidates_dir: Path,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    scope = _infer_scope(task)
+    workspace_str = str(workspace)
+    query_text = task if not constraints else f"{task} {' '.join(constraints)}"
+    retrieval = _retrieve_activation_assets(
+        workspace=workspace,
+        workspace_str=workspace_str,
+        query_text=query_text,
+        assets_dir=assets_dir,
+        candidates_dir=candidates_dir,
+        db_path=db_path,
+    )
+    scored_assets = _rerank_activation_assets(
+        task=task,
+        scope=scope,
+        workspace_str=workspace_str,
+        assets=retrieval["assets"],
+        db_path=db_path,
+    )
+    selected, selection_risks = _select_activation_assets(scored_assets)
+    rendered_context, fallback_episode_refs = _assemble_activation_context(scored_assets, constraints=constraints)
+
     return {
         "activation_id": f"act_{_slugify(task)}",
         "task_query": task,
         "workspace": str(workspace),
         "selected_assets": selected,
-        "why_selected": why_selected,
+        "why_selected": _build_activation_why_selected(scope=scope, constraints=constraints, retrieval=retrieval),
         "selection_risks": selection_risks,
-        "retrieval_summary": {
-            "milvus_project_candidates": len(vector_project_assets),
-            "milvus_shared_candidates": len(vector_shared_assets),
-            "selected_from_milvus": sum(1 for item in selected if "milvus" in item.get("retrieval_sources", [])),
-            "selected_from_sqlite": sum(1 for item in selected if "sqlite" in item.get("retrieval_sources", [])),
-            "selected_from_json": sum(1 for item in selected if "json" in item.get("retrieval_sources", []) or "shared-json" in item.get("retrieval_sources", [])),
-            "selected_from_candidate_fallback": sum(1 for item in selected if "candidate-fallback" in item.get("retrieval_sources", [])),
+        "retrieval_summary": _build_retrieval_summary(selected, retrieval),
+        "pipeline": {
+            "kind": "experience_rag_activation",
+            "stages": ["retrieve", "rerank", "assemble"],
         },
         "rendered_context": rendered_context,
-        "fallback_episode_refs": [
-            ref
-            for _, asset, _ in scored_assets[:3]
-            for ref in asset.get("source_episode_ids", [])
-        ],
+        "fallback_episode_refs": fallback_episode_refs,
         "created_at": _now_utc(),
     }
 

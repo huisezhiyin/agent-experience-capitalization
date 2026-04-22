@@ -113,6 +113,8 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("score_breakdown", activation["selected_assets"][0])
             self.assertIn("retrieval_sources", activation["selected_assets"][0])
             self.assertIn("retrieval_summary", activation)
+            self.assertEqual(activation["pipeline"]["kind"], "experience_rag_activation")
+            self.assertEqual(activation["pipeline"]["stages"], ["retrieve", "rerank", "assemble"])
             self.assertTrue(any("SQLite" in item for item in activation["why_selected"]))
 
             conn = sqlite3.connect(db_path)

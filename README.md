@@ -1,8 +1,22 @@
 # Agent Experience Capitalization
 
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![Status](https://img.shields.io/badge/status-pre--1.0-orange.svg)](GOVERNANCE.md)
+
 面向 `Codex`、`Claude Code` 等 coding agent 的本地优先经验资本化系统。
 
+**Description:** Skill-first, local-first memory runtime for coding agents to retrieve, reuse, and improve task experience.
+
 `expcap` 的入口是 `skill`，后端是本地 runtime。它让 agent 在任务开始前自动激活历史经验，在任务结束后自动沉淀经验，并用 `SQLite` / `Milvus Lite` 等后端维护可复用经验。
+
+## Open Source
+
+- License: Apache-2.0
+- Status: pre-1.0 prototype
+- Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md)
+- Security: see [SECURITY.md](SECURITY.md)
+- Governance: see [GOVERNANCE.md](GOVERNANCE.md)
 
 ## Quickstart
 

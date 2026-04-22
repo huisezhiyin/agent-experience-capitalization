@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import patch
 
 from runtime.core.engine import (
     activate_assets,
@@ -162,6 +163,50 @@ class EngineTests(unittest.TestCase):
                 min_score=0.70,
             )
         )
+
+    def test_promote_candidate_uses_backend_config_for_shareable_asset_metadata(self) -> None:
+        candidate = {
+            "candidate_id": "cand_demo_cloud_001",
+            "candidate_type": "pattern",
+            "workspace": "/tmp/demo",
+            "title": "共享资产后端契约",
+            "content": "资产 metadata 应随 backend 配置切换。",
+            "scope": {"level": "workspace", "value": "general-coding-task"},
+            "source_episode_ids": ["ep_demo_cloud_001"],
+            "reusability_score": 0.8,
+            "stability_score": 0.82,
+            "confidence_score": 0.81,
+            "constraint_value_score": 0.79,
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "EXPCAP_SOURCE_OF_TRUTH_BACKEND": "object-storage",
+                "EXPCAP_STATE_INDEX_BACKEND": "cloud-sql",
+                "EXPCAP_RETRIEVAL_BACKEND": "milvus",
+                "EXPCAP_SHARING_BACKEND": "cloud-shared",
+                "EXPCAP_PROJECT_ID": "github:org/repo",
+                "EXPCAP_OWNING_TEAM": "agent-platform",
+                "EXPCAP_ASSET_STORE_URI": "oss://bucket/expcap/assets",
+                "EXPCAP_STATE_INDEX_URI": "postgres://expcap",
+                "EXPCAP_RETRIEVAL_INDEX_URI": "https://milvus.example.com",
+            },
+            clear=True,
+        ):
+            asset = promote_candidate(candidate)
+
+        self.assertEqual(asset["project_id"], "github:org/repo")
+        self.assertEqual(asset["source_project"], "github:org/repo")
+        self.assertEqual(asset["owning_team"], "agent-platform")
+        self.assertEqual(asset["asset_storage"]["backend"], "object-storage")
+        self.assertEqual(asset["asset_storage"]["uri"], "oss://bucket/expcap/assets")
+        self.assertEqual(asset["state_index"]["backend"], "cloud-sql")
+        self.assertEqual(asset["state_index"]["uri"], "postgres://expcap")
+        self.assertEqual(asset["retrieval_index"]["backend"], "milvus")
+        self.assertEqual(asset["retrieval_index"]["uri"], "https://milvus.example.com")
+        self.assertEqual(asset["delivery"]["mode"], "shareable")
+        self.assertTrue(asset["delivery"]["shareable"])
 
     def test_activate_assets_exposes_match_evidence_and_risks(self) -> None:
         import json

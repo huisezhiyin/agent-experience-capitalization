@@ -24,6 +24,12 @@ class BackendConfigTests(unittest.TestCase):
                 "EXPCAP_STATE_INDEX_BACKEND": "cloud-sql",
                 "EXPCAP_RETRIEVAL_BACKEND": "milvus",
                 "EXPCAP_SHARING_BACKEND": "cloud-shared",
+                "EXPCAP_PROJECT_ID": "github:org/repo",
+                "EXPCAP_OWNING_TEAM": "agent-platform",
+                "EXPCAP_ASSET_STORE_URI": "oss://bucket/expcap/assets",
+                "EXPCAP_STATE_INDEX_URI": "postgres://expcap",
+                "EXPCAP_RETRIEVAL_INDEX_URI": "https://milvus.example.com",
+                "EXPCAP_SHARED_ASSET_STORE_URI": "oss://bucket/expcap/shared",
             }
         )
 
@@ -36,6 +42,12 @@ class BackendConfigTests(unittest.TestCase):
         self.assertFalse(config["local_mode"])
         self.assertTrue(config["shareable_enabled"])
         self.assertEqual(config["asset_portability"], "team-shareable")
+        self.assertEqual(config["project_identity"]["project_id"], "github:org/repo")
+        self.assertEqual(config["project_identity"]["owning_team"], "agent-platform")
+        self.assertEqual(config["backend_uris"]["asset_store"], "oss://bucket/expcap/assets")
+        self.assertEqual(config["backend_uris"]["state_index"], "postgres://expcap")
+        self.assertEqual(config["backend_uris"]["retrieval_index"], "https://milvus.example.com")
+        self.assertEqual(config["backend_uris"]["shared_asset_store"], "oss://bucket/expcap/shared")
 
     def test_resolve_backend_config_falls_back_for_unknown_values(self) -> None:
         config = resolve_backend_config(

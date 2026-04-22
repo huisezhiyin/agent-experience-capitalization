@@ -270,9 +270,15 @@ export EXPCAP_SOURCE_OF_TRUTH_BACKEND=object-storage
 export EXPCAP_STATE_INDEX_BACKEND=cloud-sql
 export EXPCAP_RETRIEVAL_BACKEND=milvus
 export EXPCAP_SHARING_BACKEND=cloud-shared
+export EXPCAP_PROJECT_ID=github:org/repo
+export EXPCAP_OWNING_TEAM=agent-platform
+export EXPCAP_ASSET_STORE_URI=oss://bucket/expcap/assets
+export EXPCAP_STATE_INDEX_URI=postgres://expcap
+export EXPCAP_RETRIEVAL_INDEX_URI=https://milvus.example.com
+export EXPCAP_SHARED_ASSET_STORE_URI=oss://bucket/expcap/shared
 ```
 
-当前这一步先提供配置抽象、状态展示和资产契约字段，不要求云端实现已经全部接通。
+当前这一步先提供配置抽象、状态展示和资产契约字段，不要求云端实现已经全部接通。目标是让本地模式和云端模式共用同一套 asset contract：本地把契约跑扎实，云端实现只替换 backend 与 URI。
 
 ## 当前检索策略
 

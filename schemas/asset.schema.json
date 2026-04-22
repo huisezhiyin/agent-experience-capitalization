@@ -56,7 +56,16 @@
       "type": "object",
       "properties": {
         "backend": { "type": "string" },
+        "uri": { "type": ["string", "null"] },
         "collection": { "type": ["string", "null"] },
+        "portable": { "type": "boolean" }
+      }
+    },
+    "state_index": {
+      "type": "object",
+      "properties": {
+        "backend": { "type": "string" },
+        "uri": { "type": ["string", "null"] },
         "portable": { "type": "boolean" }
       }
     },
@@ -65,7 +74,8 @@
       "properties": {
         "portable": { "type": "boolean" },
         "shareable": { "type": "boolean" },
-        "owner": { "type": "string" }
+        "owner": { "type": "string" },
+        "mode": { "type": "string" }
       }
     },
     "confidence": { "type": "number" },

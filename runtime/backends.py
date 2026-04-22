@@ -24,6 +24,11 @@ def _normalize_choice(
     return default
 
 
+def _optional_value(value: str | None) -> str | None:
+    normalized = (value or "").strip()
+    return normalized or None
+
+
 def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, object]:
     env_map = env or os.environ
     source_of_truth = _normalize_choice(
@@ -50,6 +55,14 @@ def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, ob
     local_mode = source_of_truth == "local-json" and state_index == "sqlite" and sharing == "local-shared"
     cloud_enabled = source_of_truth == "object-storage" or state_index == "cloud-sql" or retrieval == "milvus" or sharing == "cloud-shared"
     shareable_enabled = sharing == "cloud-shared" or source_of_truth == "object-storage" or retrieval == "milvus"
+    project_id = _optional_value(env_map.get("EXPCAP_PROJECT_ID"))
+    owning_team = _optional_value(env_map.get("EXPCAP_OWNING_TEAM"))
+    backend_uris = {
+        "asset_store": _optional_value(env_map.get("EXPCAP_ASSET_STORE_URI")),
+        "state_index": _optional_value(env_map.get("EXPCAP_STATE_INDEX_URI")),
+        "retrieval_index": _optional_value(env_map.get("EXPCAP_RETRIEVAL_INDEX_URI")),
+        "shared_asset_store": _optional_value(env_map.get("EXPCAP_SHARED_ASSET_STORE_URI")),
+    }
 
     return {
         "profile": "shareable" if shareable_enabled else "local-mode" if local_mode else "custom",
@@ -61,10 +74,21 @@ def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, ob
         "local_mode": local_mode,
         "shareable_enabled": shareable_enabled,
         "asset_portability": "team-shareable" if shareable_enabled else "local-deliverable",
+        "project_identity": {
+            "project_id": project_id,
+            "owning_team": owning_team,
+        },
+        "backend_uris": backend_uris,
         "env_overrides": {
             "EXPCAP_SOURCE_OF_TRUTH_BACKEND": env_map.get("EXPCAP_SOURCE_OF_TRUTH_BACKEND"),
             "EXPCAP_STATE_INDEX_BACKEND": env_map.get("EXPCAP_STATE_INDEX_BACKEND"),
             "EXPCAP_RETRIEVAL_BACKEND": env_map.get("EXPCAP_RETRIEVAL_BACKEND"),
             "EXPCAP_SHARING_BACKEND": env_map.get("EXPCAP_SHARING_BACKEND"),
+            "EXPCAP_PROJECT_ID": env_map.get("EXPCAP_PROJECT_ID"),
+            "EXPCAP_OWNING_TEAM": env_map.get("EXPCAP_OWNING_TEAM"),
+            "EXPCAP_ASSET_STORE_URI": env_map.get("EXPCAP_ASSET_STORE_URI"),
+            "EXPCAP_STATE_INDEX_URI": env_map.get("EXPCAP_STATE_INDEX_URI"),
+            "EXPCAP_RETRIEVAL_INDEX_URI": env_map.get("EXPCAP_RETRIEVAL_INDEX_URI"),
+            "EXPCAP_SHARED_ASSET_STORE_URI": env_map.get("EXPCAP_SHARED_ASSET_STORE_URI"),
         },
     }

@@ -47,3 +47,5 @@ The storage backend is replaceable, but the asset contract is not.
   vector retrieval.
 - Cloud backends should make assets easier to share and deliver, not make local
   development impossible.
+- Local and cloud modes should share the same asset contract. Cloud adoption
+  should be a backend configuration change, not a product rewrite.

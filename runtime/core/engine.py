@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from runtime.backends import resolve_backend_config
 from runtime.storage.fs_store import (
     default_milvus_db_path,
     iter_json_objects,
@@ -424,7 +425,12 @@ def promote_candidate(
 ) -> dict[str, Any]:
     asset_type = candidate["candidate_type"]
     asset_id = candidate["candidate_id"].replace("cand_", f"{asset_type}_", 1)
-    source_project = candidate.get("project_id") or candidate.get("workspace")
+    backend_config = resolve_backend_config()
+    project_identity = backend_config["project_identity"]
+    backend_uris = backend_config["backend_uris"]
+    project_id = candidate.get("project_id") or project_identity.get("project_id") or candidate.get("workspace")
+    owning_team = candidate.get("owning_team") or project_identity.get("owning_team")
+    source_project = candidate.get("source_project") or project_id
     score = (
         candidate.get("reusability_score", 0)
         + candidate.get("stability_score", 0)
@@ -434,9 +440,9 @@ def promote_candidate(
     return {
         "asset_id": asset_id,
         "workspace": candidate.get("workspace"),
-        "project_id": candidate.get("project_id") or candidate.get("workspace"),
+        "project_id": project_id,
         "source_project": source_project,
-        "owning_team": candidate.get("owning_team"),
+        "owning_team": owning_team,
         "asset_type": asset_type,
         "knowledge_scope": knowledge_scope,
         "knowledge_kind": knowledge_kind or candidate.get("knowledge_kind", asset_type),
@@ -446,12 +452,35 @@ def promote_candidate(
         "source_workspace": candidate.get("workspace"),
         "source_episode_ids": candidate["source_episode_ids"],
         "source_candidate_ids": [candidate["candidate_id"]],
-        "asset_storage": candidate.get("asset_storage", {"backend": "local-json", "portable": True}),
-        "retrieval_index": candidate.get("retrieval_index", {"backend": "milvus-lite", "portable": True}),
+        "asset_storage": candidate.get(
+            "asset_storage",
+            {
+                "backend": backend_config["source_of_truth"],
+                "uri": backend_uris.get("asset_store"),
+                "portable": True,
+            },
+        ),
+        "state_index": candidate.get(
+            "state_index",
+            {
+                "backend": backend_config["state_index"],
+                "uri": backend_uris.get("state_index"),
+                "portable": True,
+            },
+        ),
+        "retrieval_index": candidate.get(
+            "retrieval_index",
+            {
+                "backend": backend_config["retrieval"],
+                "uri": backend_uris.get("retrieval_index"),
+                "portable": True,
+            },
+        ),
         "delivery": {
             "portable": True,
-            "shareable": knowledge_scope in {"project", "cross-project"},
+            "shareable": bool(backend_config["shareable_enabled"]) or knowledge_scope in {"project", "cross-project"},
             "owner": "project" if knowledge_scope == "project" else "team",
+            "mode": backend_config["profile"],
         },
         "confidence": round(score, 2),
         "status": "active",
@@ -462,13 +491,18 @@ def promote_candidate(
 
 
 def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
-    source_project = candidate.get("project_id") or candidate.get("workspace")
+    backend_config = resolve_backend_config()
+    project_identity = backend_config["project_identity"]
+    backend_uris = backend_config["backend_uris"]
+    project_id = candidate.get("project_id") or project_identity.get("project_id") or candidate.get("workspace")
+    owning_team = candidate.get("owning_team") or project_identity.get("owning_team")
+    source_project = candidate.get("source_project") or project_id
     return {
         "asset_id": candidate["candidate_id"],
         "workspace": candidate.get("workspace"),
-        "project_id": candidate.get("project_id") or candidate.get("workspace"),
+        "project_id": project_id,
         "source_project": source_project,
-        "owning_team": candidate.get("owning_team"),
+        "owning_team": owning_team,
         "asset_type": candidate["candidate_type"],
         "knowledge_scope": candidate.get("knowledge_scope", "project"),
         "knowledge_kind": candidate.get("knowledge_kind", candidate.get("candidate_type", "pattern")),
@@ -478,12 +512,35 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
         "source_workspace": candidate.get("workspace"),
         "source_episode_ids": candidate.get("source_episode_ids", []),
         "source_candidate_ids": [candidate["candidate_id"]],
-        "asset_storage": candidate.get("asset_storage", {"backend": "local-json", "portable": True}),
-        "retrieval_index": candidate.get("retrieval_index", {"backend": "milvus-lite", "portable": True}),
+        "asset_storage": candidate.get(
+            "asset_storage",
+            {
+                "backend": backend_config["source_of_truth"],
+                "uri": backend_uris.get("asset_store"),
+                "portable": True,
+            },
+        ),
+        "state_index": candidate.get(
+            "state_index",
+            {
+                "backend": backend_config["state_index"],
+                "uri": backend_uris.get("state_index"),
+                "portable": True,
+            },
+        ),
+        "retrieval_index": candidate.get(
+            "retrieval_index",
+            {
+                "backend": backend_config["retrieval"],
+                "uri": backend_uris.get("retrieval_index"),
+                "portable": True,
+            },
+        ),
         "delivery": {
             "portable": True,
             "shareable": True,
             "owner": "project",
+            "mode": backend_config["profile"],
         },
         "confidence": candidate.get("confidence_score", 0.6),
         "status": candidate.get("status", "candidate"),

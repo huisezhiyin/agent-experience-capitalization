@@ -28,7 +28,39 @@ class MilvusStoreLockTests(unittest.TestCase):
 
             self.assertEqual(summary["status"], "degraded")
             self.assertEqual(summary["degraded_reason"], "locked_by_another_process")
-            self.assertFalse(summary["collection_exists"])
+            self.assertIsNone(summary["collection_exists"])
+
+    def test_backend_summary_is_lightweight_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            db_path.touch()
+            with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "_safe_client_unlocked",
+                side_effect=AssertionError("lightweight summary should not open a Milvus client"),
+            ):
+                summary = milvus_store.milvus_backend_summary(db_path)
+
+            self.assertEqual(summary["status"], "ready")
+            self.assertFalse(summary["deep_check"])
+            self.assertTrue(summary["db_exists"])
+            self.assertIsNone(summary["collection_exists"])
+            self.assertIsNone(summary["indexed_entities"])
+
+    def test_backend_summary_deep_check_opens_client(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "_safe_client_unlocked",
+                return_value=None,
+            ) as safe_client:
+                summary = milvus_store.milvus_backend_summary(db_path, deep_check=True)
+
+            safe_client.assert_called_once_with(db_path)
+            self.assertTrue(summary["deep_check"])
+            self.assertEqual(summary["status"], "degraded")
+            self.assertEqual(summary["degraded_reason"], "client_unavailable")
 
     def test_vector_operations_skip_when_db_is_locked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

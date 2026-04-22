@@ -268,6 +268,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="How many recent items to include per section. Defaults to 5.",
     )
     status.add_argument("--output", help="Optional output path for the status JSON.")
+    status.add_argument(
+        "--deep-retrieval-check",
+        action="store_true",
+        help="Open retrieval backends for deeper health checks. Defaults to lightweight checks only.",
+    )
 
     return parser
 
@@ -875,8 +880,14 @@ def _handle_status(args: argparse.Namespace) -> int:
         }
         for activation in activations[: args.limit]
     ]
-    local_milvus = milvus_backend_summary(default_milvus_db_path(workspace))
-    shared_milvus = milvus_backend_summary(shared_milvus_db_path())
+    local_milvus = milvus_backend_summary(
+        default_milvus_db_path(workspace),
+        deep_check=args.deep_retrieval_check,
+    )
+    shared_milvus = milvus_backend_summary(
+        shared_milvus_db_path(),
+        deep_check=args.deep_retrieval_check,
+    )
 
     payload = {
         "workspace": str(workspace),

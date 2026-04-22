@@ -862,6 +862,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue(payload["retrieval_backends"]["sqlite"]["db_exists"])
             self.assertEqual(payload["retrieval_backends"]["milvus"]["local"]["backend"], "milvus-lite")
             self.assertIn("available", payload["retrieval_backends"]["milvus"])
+            self.assertFalse(payload["retrieval_backends"]["milvus"]["local"]["deep_check"])
             self.assertIn("collection_exists", payload["retrieval_backends"]["milvus"]["local"])
             self.assertEqual(payload["backend_configuration"]["profile"], "local-first")
             self.assertEqual(payload["backend_configuration"]["source_of_truth"], "local-json")

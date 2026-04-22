@@ -157,7 +157,7 @@ python3 -m unittest discover -s tests -v
 - `promote/auto-finish` 现在支持 `project` 与 `cross-project` 两层资产，以及 `pattern / anti_pattern / rule / context / checklist` 等知识类型
 - `review-candidates` 现在既能生成待审队列，也能直接执行 `approve / reject / promote` 审核动作，并留下 `review_history`
 - `status` 会输出当前工作区的短测摘要，包括使用量、activation 帮助反馈、asset 温度、candidate 状态与 review queue
-- `status` 现在也会输出 retrieval backend 摘要，明确展示 `SQLite` 与 `Milvus Lite` 当前是否可用、db 是否存在、Milvus collection 是否已建立
+- `status` 现在也会输出 retrieval backend 摘要。默认只做轻量检查，不启动 Milvus Lite；如需检查 collection/entity 数，可加 `--deep-retrieval-check`
 - `status` 现在也会输出 `backend_configuration`，明确展示当前运行是在 `local-first` 还是 `hybrid` 配置下
 - 优先调用安装后的 `expcap`；如果当前环境没有安装 CLI，可退回 `python3 -m runtime.cli`
 - `install-project` 会非破坏式接入其他项目：保留原有 `AGENTS.md`，只追加 `expcap` 区块并生成 `AGENTS.expcap.md`
@@ -187,9 +187,15 @@ expcap status --workspace "$PWD"
 如果这轮测试要顺带观察检索层，也建议额外看：
 
 - `retrieval_backends.sqlite`：SQLite 状态索引是否正常生成
-- `retrieval_backends.milvus.local`：当前工作区的 Milvus Lite 是否可用、db 是否存在、collection 是否已建立
-- `retrieval_backends.milvus.shared`：跨项目共享语义索引是否已经接通
+- `retrieval_backends.milvus.local`：当前工作区的 Milvus Lite 配置是否可用、db 是否存在、是否被锁住
+- `retrieval_backends.milvus.shared`：跨项目共享语义索引配置是否可用、db 是否存在、是否被锁住
 - `backend_configuration`：当前 source of truth / state index / retrieval / sharing 分别请求的是哪一类 backend
+
+默认 `status` 不会打开 Milvus Lite client，避免日报在受限环境中被本地 socket 初始化拖住。需要深度检查时可以运行：
+
+```bash
+expcap status --workspace "$PWD" --deep-retrieval-check
+```
 
 ## Backend 配置
 

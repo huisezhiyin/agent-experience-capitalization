@@ -64,17 +64,19 @@ def _milvus_db_lock(db_path: Path):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def milvus_backend_summary(db_path: Path) -> dict[str, Any]:
+def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[str, Any]:
+    available = milvus_available()
     summary = {
         "backend": "milvus-lite",
-        "available": milvus_available(),
-        "status": "ready" if milvus_available() else "unavailable",
+        "available": available,
+        "status": "ready" if available and db_path.exists() else "not_initialized" if available else "unavailable",
+        "deep_check": deep_check,
         "degraded_reason": None,
         "last_error": None,
         "db_path": str(db_path),
         "db_exists": db_path.exists(),
         "collection_name": COLLECTION_NAME,
-        "collection_exists": False,
+        "collection_exists": None if not deep_check else False,
         "indexed_entities": None,
     }
     if not summary["available"]:
@@ -84,6 +86,8 @@ def milvus_backend_summary(db_path: Path) -> dict[str, Any]:
         if lock_error:
             summary["status"] = "degraded"
             summary["degraded_reason"] = lock_error
+            return summary
+        if not deep_check:
             return summary
         client = _safe_client_unlocked(db_path)
         if client is None:
@@ -137,7 +141,6 @@ def _populate_backend_summary(client: Any, summary: dict[str, Any]) -> dict[str,
             summary["status"] = "degraded"
             summary["degraded_reason"] = "count_query_failed"
             summary["last_error"] = _compact_error(error)
-            pass
 
     return summary
 

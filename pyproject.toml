@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-experience-capitalization"
 version = "0.1.0"
-description = "Skill-first, local-first memory runtime for coding agents to retrieve, reuse, and improve task experience."
+description = "Project-owned, team-shareable experience memory for coding agents."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -20,7 +20,9 @@ keywords = [
   "codex",
   "coding-agents",
   "experience-capitalization",
-  "local-first",
+  "project-memory",
+  "team-memory",
+  "shareable-assets",
   "milvus",
   "rag",
   "semantic-retrieval",

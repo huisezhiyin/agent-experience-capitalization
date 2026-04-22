@@ -47,16 +47,20 @@ def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, ob
         default="local-shared",
     )
 
-    local_first = source_of_truth == "local-json" and state_index == "sqlite" and sharing == "local-shared"
+    local_mode = source_of_truth == "local-json" and state_index == "sqlite" and sharing == "local-shared"
     cloud_enabled = source_of_truth == "object-storage" or state_index == "cloud-sql" or retrieval == "milvus" or sharing == "cloud-shared"
+    shareable_enabled = sharing == "cloud-shared" or source_of_truth == "object-storage" or retrieval == "milvus"
 
     return {
-        "profile": "local-first" if local_first else "hybrid" if cloud_enabled else "custom",
+        "profile": "shareable" if shareable_enabled else "local-mode" if local_mode else "custom",
         "source_of_truth": source_of_truth,
         "state_index": state_index,
         "retrieval": retrieval,
         "sharing": sharing,
         "cloud_enabled": cloud_enabled,
+        "local_mode": local_mode,
+        "shareable_enabled": shareable_enabled,
+        "asset_portability": "team-shareable" if shareable_enabled else "local-deliverable",
         "env_overrides": {
             "EXPCAP_SOURCE_OF_TRUTH_BACKEND": env_map.get("EXPCAP_SOURCE_OF_TRUTH_BACKEND"),
             "EXPCAP_STATE_INDEX_BACKEND": env_map.get("EXPCAP_STATE_INDEX_BACKEND"),

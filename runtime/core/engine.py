@@ -424,6 +424,7 @@ def promote_candidate(
 ) -> dict[str, Any]:
     asset_type = candidate["candidate_type"]
     asset_id = candidate["candidate_id"].replace("cand_", f"{asset_type}_", 1)
+    source_project = candidate.get("project_id") or candidate.get("workspace")
     score = (
         candidate.get("reusability_score", 0)
         + candidate.get("stability_score", 0)
@@ -433,6 +434,9 @@ def promote_candidate(
     return {
         "asset_id": asset_id,
         "workspace": candidate.get("workspace"),
+        "project_id": candidate.get("project_id") or candidate.get("workspace"),
+        "source_project": source_project,
+        "owning_team": candidate.get("owning_team"),
         "asset_type": asset_type,
         "knowledge_scope": knowledge_scope,
         "knowledge_kind": knowledge_kind or candidate.get("knowledge_kind", asset_type),
@@ -442,6 +446,13 @@ def promote_candidate(
         "source_workspace": candidate.get("workspace"),
         "source_episode_ids": candidate["source_episode_ids"],
         "source_candidate_ids": [candidate["candidate_id"]],
+        "asset_storage": candidate.get("asset_storage", {"backend": "local-json", "portable": True}),
+        "retrieval_index": candidate.get("retrieval_index", {"backend": "milvus-lite", "portable": True}),
+        "delivery": {
+            "portable": True,
+            "shareable": knowledge_scope in {"project", "cross-project"},
+            "owner": "project" if knowledge_scope == "project" else "team",
+        },
         "confidence": round(score, 2),
         "status": "active",
         "last_used_at": None,
@@ -451,9 +462,13 @@ def promote_candidate(
 
 
 def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
+    source_project = candidate.get("project_id") or candidate.get("workspace")
     return {
         "asset_id": candidate["candidate_id"],
         "workspace": candidate.get("workspace"),
+        "project_id": candidate.get("project_id") or candidate.get("workspace"),
+        "source_project": source_project,
+        "owning_team": candidate.get("owning_team"),
         "asset_type": candidate["candidate_type"],
         "knowledge_scope": candidate.get("knowledge_scope", "project"),
         "knowledge_kind": candidate.get("knowledge_kind", candidate.get("candidate_type", "pattern")),
@@ -463,6 +478,13 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
         "source_workspace": candidate.get("workspace"),
         "source_episode_ids": candidate.get("source_episode_ids", []),
         "source_candidate_ids": [candidate["candidate_id"]],
+        "asset_storage": candidate.get("asset_storage", {"backend": "local-json", "portable": True}),
+        "retrieval_index": candidate.get("retrieval_index", {"backend": "milvus-lite", "portable": True}),
+        "delivery": {
+            "portable": True,
+            "shareable": True,
+            "owner": "project",
+        },
         "confidence": candidate.get("confidence_score", 0.6),
         "status": candidate.get("status", "candidate"),
         "last_used_at": None,

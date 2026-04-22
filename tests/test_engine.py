@@ -141,6 +141,11 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(asset["knowledge_scope"], "cross-project")
         self.assertEqual(asset["knowledge_kind"], "rule")
         self.assertEqual(asset["source_workspace"], "/tmp/demo")
+        self.assertEqual(asset["project_id"], "/tmp/demo")
+        self.assertEqual(asset["source_project"], "/tmp/demo")
+        self.assertTrue(asset["delivery"]["portable"])
+        self.assertTrue(asset["delivery"]["shareable"])
+        self.assertEqual(asset["delivery"]["owner"], "team")
         self.assertFalse(
             should_promote_candidate(
                 candidate,

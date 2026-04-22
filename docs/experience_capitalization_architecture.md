@@ -1,10 +1,12 @@
-# 面向 Codex / Claude Code 的经验资本化增强层
+# 面向 Codex / Claude Code 的项目经验资产层
 
 ## 1. 文档定位
 
 本文档不是最终实现 spec，而是一份偏技术架构设计的研究草案。
 
-目标不是复刻 Hermes Agent 全部工程能力，而是抽取其中最有价值的经验治理理念，设计一层可挂载在 `Codex` 与 `Claude Code` 之上的本地优先增强层，用于实现更稳健的“自学习 / 自强化”闭环。
+目标不是复刻 Hermes Agent 全部工程能力，而是抽取其中最有价值的经验治理理念，设计一层可挂载在 `Codex` 与 `Claude Code` 之上的项目经验资产层，用于实现更稳健的“自学习 / 自强化”闭环。
+
+新的核心定位是：经验资产属于项目或团队，而不是属于某一个人的模型账号。本地模式服务单人团队和离线开发；云端共享模式服务团队协作、资产交割和跨机器复用。
 
 本文档重点回答以下问题：
 
@@ -40,7 +42,8 @@
 ### 3.1 设计目标
 
 - 面向 `Codex` 与 `Claude Code` 两类宿主优先设计
-- 采用 `local-first` 架构，本地文件与本地数据库为主
+- 支持本地模式，但核心语义是 project-owned / team-shareable
+- 支持云端共享后端，让经验资产可以交割给项目和团队
 - 通过 `plugin` 提供证据采集、调度与存储能力
 - 通过 `skill` 提供经验提炼、估值与晋升能力
 - 保持宿主中立，尽量减少对单一厂商接口的强依赖
@@ -52,7 +55,7 @@
 - 不复刻 Hermes 的 CLI、gateway、cron、browser、terminal tool 全套体系
 - 不在第一阶段构建全自动自治 agent
 - 不在第一阶段追求完全通用的宿主兼容层
-- 不在第一阶段引入复杂的在线服务端依赖
+- 不在第一阶段强制引入复杂的在线服务端依赖；云端能力以可插拔后端演进
 - 不默认采集全部对话和全部过程细节
 
 
@@ -120,13 +123,13 @@ Skill / Prompt Injection / Context Hints
 从系统实现重心看，后续更推荐演化为：
 
 - 轻 `skill`
-- 重 `local runtime`
+- 重 runtime
 
 也就是：
 
 - `skill` 作为 agent-facing API
-- `local runtime` 作为本地经验后端
-- 文件与数据库作为长期存储与治理基础
+- runtime 作为经验资产后端
+- 共享后端作为团队长期真源，本地文件与数据库作为单人模式和缓存层
 
 
 ## 6. 为什么是 Skill + Plugin 协同
@@ -543,7 +546,13 @@ skill 不负责保存复杂状态，而是负责：
 
 ## 10. 存储层设计
 
-建议采用“文件 + SQLite”双存储策略。
+存储层应区分“产品语义”和“部署形态”：
+
+- 产品语义：资产是 project-owned / team-shareable / deliverable。
+- 团队模式：对象存储或 Git 仓库存资产正文，Cloud SQL/Postgres 存状态索引，云端 Milvus/Zilliz/Qdrant 存语义索引。
+- 本地模式：`.agent-memory/`、SQLite、Milvus Lite 是单人团队和离线开发的本地实现。
+
+MVP 可以继续采用“文件 + SQLite”双存储策略，但它应被视为 local-mode backend，而不是最终产品边界。
 
 ### 10.1 文件存储
 
@@ -621,7 +630,18 @@ skill 不负责保存复杂状态，而是负责：
 - SQLite 负责检索、状态、评分、关系
 - 文件负责正文、审查、人工编辑
 
-这样更适合 local-first 场景，也更利于和 agent 直接协作。
+这样更适合 local-mode 场景，也更利于和 agent 直接协作。团队模式下，这组文件可以成为本地 cache 或可导入/导出的资产包，最终真源应迁移到共享后端。
+
+### 10.5 资产交割字段
+
+长期资产应逐步具备以下元数据：
+
+- `project_id`：稳定项目标识，优先来自 git remote、仓库名或团队配置，而不是本机路径。
+- `source_project`：经验最初从哪个项目产生。
+- `owning_team`：资产归属团队，可为空以支持单人模式。
+- `asset_storage`：资产正文所在后端，例如 `local-json`、`object-storage`、`git`。
+- `retrieval_index`：语义索引所在后端，例如 `milvus-lite`、`milvus`、`qdrant`。
+- `delivery`：资产是否 portable/shareable，以及 owner 是 project 还是 team。
 
 
 ## 11. 任务后数据流
@@ -924,14 +944,14 @@ plugin 不只是采集器，还应是编排器。
 
 建议至少支持三类作用域：
 
-- `global`
-- `workspace`
+- `team`
+- `project`
 - `task-family`
 
 其中：
 
-- `global` 只承载高稳定、高置信资产
-- `workspace` 承载仓库局部经验
+- `team` 承载多个项目验证后的团队级经验
+- `project` 承载仓库局部经验，是默认主形态
 - `task-family` 承载某类问题域的专项经验
 
 
@@ -1072,7 +1092,7 @@ project-root/
 
 从技术架构上看，一个面向 `Codex / Claude Code` 的经验资本化增强层是成立的，并且最合理的形态不是“新 agent”，而是：
 
-> 一个 `local-first` 的 `skill + plugin` 协同系统。
+> 一个 project-owned、team-shareable 的 `skill + runtime/plugin` 协同系统。
 
 其中：
 

@@ -4,25 +4,35 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![Status](https://img.shields.io/badge/status-pre--1.0-orange.svg)](GOVERNANCE.md)
 
-面向 `Codex`、`Claude Code` 等 coding agent 的本地优先经验资本化系统。
+面向 `Codex`、`Claude Code` 等 coding agent 的项目级经验资产系统。
 
-**Description:** Skill-first, local-first memory runtime for coding agents to retrieve, reuse, and improve task experience.
+**Description:** Project-owned, team-shareable experience memory for coding agents.
 
-`expcap` 的入口是 `skill`，后端是本地 runtime。它让 agent 在任务开始前自动激活历史经验，在任务结束后自动沉淀经验，并用 `SQLite` / `Milvus Lite` 等后端维护可复用经验。
+`expcap` 的入口是 `skill`，后端是可插拔 runtime。它让 agent 在任务开始前自动激活项目经验，在任务结束后把有效经验沉淀成可共享、可交割的项目资产。单人团队可以完全本地运行；团队场景可以接入对象存储、云端 Milvus、Cloud SQL 等共享后端。
 
 ## Search Keywords
 
-Agent memory, coding agents, agentic coding, AI agents, developer tools,
-local-first, experience capitalization, semantic retrieval, vector search,
-RAG, Milvus, SQLite, Codex, Claude Code.
+Agent experience, project memory, team memory, coding agents, agentic coding,
+AI agents, developer tools, shareable assets, deliverable knowledge,
+experience capitalization, semantic retrieval, RAG, Codex, Claude Code.
 
 ## Use Cases
 
-- Give coding agents project-specific memory before they start a task.
-- Turn completed agent work into reusable experience assets.
-- Retrieve experience with Milvus Lite semantic search and SQLite state.
+- Give coding agents project-owned memory before they start a task.
+- Turn completed agent work into reusable, reviewable, deliverable assets.
+- Share project/team experience through cloud-capable asset and retrieval backends.
 - Track whether activated experience actually helped future tasks.
 - Bootstrap `AGENTS.md` / `CLAUDE.md` instructions for agent memory workflows.
+
+## Product Position
+
+`expcap` is not personal assistant memory. It is an external experience asset
+layer owned by a project or team.
+
+- Assets are project-owned by default, not bound to one person's model account.
+- Assets should be portable and deliverable across agents, machines, and teammates.
+- Cloud backends are the natural team mode; local files are the solo/offline mode.
+- Local `.agent-memory/` is useful as a cache and development store, but should not be the only long-term source of truth for a team.
 
 ## Open Source
 
@@ -109,6 +119,8 @@ EXPCAP_WITH_MILVUS=1 scripts/expcap-enable /path/to/your/project
 - `knowledge_kind`：知识类型，目前支持 `pattern`、`anti_pattern`、`rule`、`context`、`checklist`。
 - `scope.level / scope.value`：任务作用域，例如 `task-family::python-import-error` 或 `workspace::general-coding-task`，用于避免宽泛经验误召回。
 - `workspace / source_workspace`：经验来自哪个项目。当前版本主要按显式 `--workspace` 的规范化路径识别项目。
+- `project_id / source_project / owning_team`：资产所有权与来源。后续团队模式会优先用稳定项目标识，而不是本机路径。
+- `asset_storage / retrieval_index / delivery`：资产存储、召回索引与可交割性提示。当前本地实现先写入默认值，后续可映射到 OSS/S3、云端 Milvus、Cloud SQL 等共享后端。
 - `temperature / review_status`：经验热度与健康状态，例如 `hot`、`warm`、`watch`、`needs_review`，用于观察真实帮助效果。
 
 项目识别当前是“显式 workspace 优先”：agent 或脚本把目标项目路径传给 `--workspace`，运行态把经验写到该项目的 `.agent-memory/`，并优先激活这个项目自己的资产。后续可以在这个基础上增加模糊项目识别，例如结合 git remote、仓库名、包名、目录结构和 `.agent-memory` 指纹来判断“这是哪个项目的延续”。
@@ -116,8 +128,9 @@ EXPCAP_WITH_MILVUS=1 scripts/expcap-enable /path/to/your/project
 当前阶段以研究与架构设计为主，核心方向是：
 
 - 轻 `skill`，作为默认入口
-- 重 `local runtime`，作为真正后端
-- 本地文件 + `SQLite` 状态层 + `Milvus Lite` 可选语义召回层
+- 重 runtime，作为真正后端
+- 资产语义上 project-owned / team-shareable
+- 云端共享后端面向团队交割，本地后端面向单人和离线测试
 - 将任务经验从 `trace -> episode -> candidate -> asset -> activation` 制度化流转
 
 ## 北极星目标
@@ -187,7 +200,7 @@ python3 -m unittest discover -s tests -v
 - `review-candidates` 现在既能生成待审队列，也能直接执行 `approve / reject / promote` 审核动作，并留下 `review_history`
 - `status` 会输出当前工作区的短测摘要，包括使用量、activation 帮助反馈、asset 温度、candidate 状态与 review queue
 - `status` 现在也会输出 retrieval backend 摘要。默认只做轻量检查，不启动 Milvus Lite；如需检查 collection/entity 数，可加 `--deep-retrieval-check`
-- `status` 现在也会输出 `backend_configuration`，明确展示当前运行是在 `local-first` 还是 `hybrid` 配置下
+- `status` 现在也会输出 `backend_configuration`，明确展示当前运行是在 `local-mode` 还是 `shareable` 配置下
 - 优先调用安装后的 `expcap`；如果当前环境没有安装 CLI，可退回 `python3 -m runtime.cli`
 - `install-project` 会非破坏式接入其他项目：保留原有 `AGENTS.md`，只追加 `expcap` 区块并生成 `AGENTS.expcap.md`
 - `.agent-memory/index.sqlite3` 负责本地状态索引、审核结果、activation log 与统计汇总，正文内容仍以 JSON 文件为真源
@@ -233,14 +246,16 @@ expcap status --workspace "$PWD" --deep-retrieval-check
 
 ## Backend 配置
 
-当前默认策略是 `local-first`：
+当前默认实现是 `local-mode`，适合单人团队、离线开发和短期测试：
 
 - `source_of_truth=local-json`
 - `state_index=sqlite`
 - `retrieval=milvus-lite`
 - `sharing=local-shared`
 
-如果后面要切到混合模式，可以通过环境变量显式声明目标 backend：
+团队模式的目标是 `shareable`：资产正文、索引和状态都可以交给共享后端，让经验资产不绑定单人机器。
+
+可以通过环境变量显式声明目标 backend：
 
 ```bash
 export EXPCAP_SOURCE_OF_TRUTH_BACKEND=object-storage
@@ -249,7 +264,7 @@ export EXPCAP_RETRIEVAL_BACKEND=milvus
 export EXPCAP_SHARING_BACKEND=cloud-shared
 ```
 
-当前这一步先提供配置抽象与状态展示，不要求云端实现已经全部接通。
+当前这一步先提供配置抽象、状态展示和资产契约字段，不要求云端实现已经全部接通。
 
 ## 当前检索策略
 
@@ -302,7 +317,8 @@ python3 -m venv .venv
 从技术路线看，当前更推荐：
 
 - `skill` 作为 agent-facing API 与默认入口
-- `local runtime` 作为真正后端
-- `SQLite` 作为默认状态索引层
-- `Milvus Lite` 作为推荐的语义增强层
+- runtime 作为真正后端
+- shared asset store 作为团队资产真源
+- cloud Milvus / vector DB 作为团队语义召回层
+- SQLite / Milvus Lite 作为单人本地模式和缓存层
 - 后续按 `CLI runtime -> stateful runtime -> optional local service` 演化

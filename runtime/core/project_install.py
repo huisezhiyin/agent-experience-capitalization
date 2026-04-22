@@ -47,9 +47,9 @@ expcap promote --candidate "{workspace_path}/.agent-memory/candidates/<candidate
 
 ### 3. 作用域策略
 
-- 默认把当前项目内沉淀的经验视为 `workspace/project` 经验
-- 只有明显跨项目稳定的经验，才考虑后续晋升为 `global` 经验
-- 不要把项目局部 workaround 误提升为跨项目经验
+- 默认把当前项目内沉淀的经验视为 project-owned 经验
+- 只有经过多个项目验证的稳定经验，才考虑后续晋升为 team-shared 经验
+- 不要把项目局部 workaround 误提升为团队共享经验
 - 默认先激活 `project` 资产，再补充 `cross-project` 资产
 - 项目规范、历史决策、目录约定等，也可以作为 `context / rule` 类型知识沉淀
 

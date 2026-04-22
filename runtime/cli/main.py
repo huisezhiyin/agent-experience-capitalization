@@ -888,6 +888,17 @@ def _handle_status(args: argparse.Namespace) -> int:
         shared_milvus_db_path(),
         deep_check=args.deep_retrieval_check,
     )
+    milvus_indexed_entities = local_milvus.get("indexed_entities")
+    possible_stale_entities = (
+        max(milvus_indexed_entities - len(assets), 0)
+        if isinstance(milvus_indexed_entities, int)
+        else None
+    )
+    milvus_asset_coverage = (
+        round(min(float(milvus_indexed_entities), float(len(assets))) / len(assets), 4)
+        if isinstance(milvus_indexed_entities, int) and assets
+        else None
+    )
 
     payload = {
         "workspace": str(workspace),
@@ -907,6 +918,13 @@ def _handle_status(args: argparse.Namespace) -> int:
                 "available": milvus_available(),
                 "local": local_milvus,
                 "shared": shared_milvus,
+                "asset_coverage": {
+                    "indexed_entities": milvus_indexed_entities,
+                    "asset_rows": len(assets),
+                    "coverage_ratio": milvus_asset_coverage,
+                    "possible_stale_entities": possible_stale_entities,
+                    "deep_check_required": milvus_asset_coverage is None,
+                },
             },
         },
         "counts": {

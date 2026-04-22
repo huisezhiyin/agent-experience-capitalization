@@ -189,6 +189,7 @@ expcap status --workspace "$PWD"
 - `retrieval_backends.sqlite`：SQLite 状态索引是否正常生成
 - `retrieval_backends.milvus.local`：当前工作区的 Milvus Lite 配置是否可用、db 是否存在、是否被锁住
 - `retrieval_backends.milvus.shared`：跨项目共享语义索引配置是否可用、db 是否存在、是否被锁住
+- `retrieval_backends.milvus.asset_coverage`：深度检查时展示 Milvus indexed entity 与当前 asset 数的覆盖关系，并提示可能的 stale entity
 - `backend_configuration`：当前 source of truth / state index / retrieval / sharing 分别请求的是哪一类 backend
 
 默认 `status` 不会打开 Milvus Lite client，避免日报在受限环境中被本地 socket 初始化拖住。需要深度检查时可以运行：
@@ -196,6 +197,8 @@ expcap status --workspace "$PWD"
 ```bash
 expcap status --workspace "$PWD" --deep-retrieval-check
 ```
+
+每次 `activate` 也会输出 `retrieval_summary`，并在每条 selected asset 上标注 `retrieval_sources` 与 `vector_score`。如果 `retrieval_sources` 包含 `milvus`，说明该经验确实经过 Milvus 语义召回参与排序。
 
 ## Backend 配置
 

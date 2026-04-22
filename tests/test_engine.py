@@ -238,6 +238,8 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(activation["selected_assets"][0]["match_evidence"])
             self.assertIn("score_breakdown", activation["selected_assets"][0])
             self.assertIn("effectiveness_summary", activation["selected_assets"][0])
+            self.assertIn("retrieval_sources", activation["selected_assets"][0])
+            self.assertIn("retrieval_summary", activation)
             self.assertTrue(any("跨项目经验" in item for item in activation["selection_risks"]))
 
     def test_build_asset_effectiveness_summary_marks_needs_review_for_cold_assets(self) -> None:

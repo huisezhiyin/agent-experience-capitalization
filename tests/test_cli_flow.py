@@ -111,6 +111,8 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue(activation["selected_assets"][0]["match_evidence"])
             self.assertIn("risk_flags", activation["selected_assets"][0])
             self.assertIn("score_breakdown", activation["selected_assets"][0])
+            self.assertIn("retrieval_sources", activation["selected_assets"][0])
+            self.assertIn("retrieval_summary", activation)
             self.assertTrue(any("SQLite" in item for item in activation["why_selected"]))
 
             conn = sqlite3.connect(db_path)
@@ -864,6 +866,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("available", payload["retrieval_backends"]["milvus"])
             self.assertFalse(payload["retrieval_backends"]["milvus"]["local"]["deep_check"])
             self.assertIn("collection_exists", payload["retrieval_backends"]["milvus"]["local"])
+            self.assertTrue(payload["retrieval_backends"]["milvus"]["asset_coverage"]["deep_check_required"])
             self.assertEqual(payload["backend_configuration"]["profile"], "local-first")
             self.assertEqual(payload["backend_configuration"]["source_of_truth"], "local-json")
             self.assertEqual(payload["backend_configuration"]["state_index"], "sqlite")

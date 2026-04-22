@@ -636,12 +636,20 @@ def _merge_assets(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
         if not asset_id:
             continue
         if asset_id not in merged:
-            merged[asset_id] = dict(asset)
+            item = dict(asset)
+            item["retrieval_sources"] = _unique_preserve_order(item.get("retrieval_sources", []))
+            merged[asset_id] = item
             continue
         current = merged[asset_id]
         combined = dict(current)
         combined.update({key: value for key, value in asset.items() if value not in (None, "", [], {})})
         combined["vector_score"] = max(float(current.get("vector_score", 0.0)), float(asset.get("vector_score", 0.0)))
+        combined["retrieval_sources"] = _unique_preserve_order(
+            [
+                *current.get("retrieval_sources", []),
+                *asset.get("retrieval_sources", []),
+            ]
+        )
         merged[asset_id] = combined
     return list(merged.values())
 
@@ -670,24 +678,33 @@ def activate_assets(
         knowledge_scope="project",
         workspace=workspace_str,
     )
+    for asset in vector_project_assets:
+        asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "milvus"])
     vector_shared_assets = search_asset_vectors(
         shared_milvus_db_path(),
         query_text=query_text,
         limit=5,
         knowledge_scope="cross-project",
     )
+    for asset in vector_shared_assets:
+        asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "milvus"])
 
     assets: list[dict[str, Any]] = []
     if db_path:
         assets = list_assets(db_path, workspace=workspace_str)
+        for asset in assets:
+            asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "sqlite"])
     if not assets:
         assets = list(iter_json_objects(assets_dir))
+        for asset in assets:
+            asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "json"])
     for asset in assets:
         asset.setdefault("knowledge_scope", "project")
         asset.setdefault("knowledge_kind", asset.get("asset_type", "pattern"))
 
     shared_assets = list(iter_json_objects(shared_assets_dir)) if shared_assets_dir.exists() else []
     for asset in shared_assets:
+        asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "shared-json"])
         asset.setdefault("knowledge_scope", "cross-project")
         asset.setdefault("knowledge_kind", asset.get("asset_type", "pattern"))
         asset.setdefault("workspace", None)
@@ -702,6 +719,8 @@ def activate_assets(
         if not candidates:
             candidates = list(iter_json_objects(candidates_dir))
         assets = [_candidate_as_asset(candidate) for candidate in candidates]
+        for asset in assets:
+            asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), "candidate-fallback"])
 
     scored_assets = []
     feedback_stats = summarize_asset_feedback(db_path, asset_ids=[asset.get("asset_id") for asset in assets if asset.get("asset_id")]) if db_path else {}
@@ -752,6 +771,8 @@ def activate_assets(
                 "effectiveness_summary": details["effectiveness_summary"],
                 "temperature": details["effectiveness_summary"]["temperature"],
                 "review_status": details["effectiveness_summary"]["review_status"],
+                "retrieval_sources": asset.get("retrieval_sources", []),
+                "vector_score": round(float(asset.get("vector_score", 0.0)), 4),
                 "match_evidence": details["evidence"][:5],
                 "risk_flags": details["risk_flags"][:5],
             }
@@ -771,6 +792,14 @@ def activate_assets(
         "selected_assets": selected,
         "why_selected": why_selected,
         "selection_risks": selection_risks,
+        "retrieval_summary": {
+            "milvus_project_candidates": len(vector_project_assets),
+            "milvus_shared_candidates": len(vector_shared_assets),
+            "selected_from_milvus": sum(1 for item in selected if "milvus" in item.get("retrieval_sources", [])),
+            "selected_from_sqlite": sum(1 for item in selected if "sqlite" in item.get("retrieval_sources", [])),
+            "selected_from_json": sum(1 for item in selected if "json" in item.get("retrieval_sources", []) or "shared-json" in item.get("retrieval_sources", [])),
+            "selected_from_candidate_fallback": sum(1 for item in selected if "candidate-fallback" in item.get("retrieval_sources", [])),
+        },
         "rendered_context": rendered_context,
         "fallback_episode_refs": [
             ref

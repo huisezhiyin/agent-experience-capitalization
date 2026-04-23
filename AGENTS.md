@@ -79,7 +79,9 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" scripts/expcap aut
 
 ## 当前运行时入口
 
-优先使用集中存储模式运行本地包装器：
+优先入口是 `expcap` skill；CLI 是 skill 背后的执行层。对 Codex 来说，先按 skill 规则执行 `auto-start / auto-finish / status / doctor`，不要让用户手工记命令。
+
+需要直接运行命令时，使用集中存储模式运行本地包装器：
 
 ```bash
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" scripts/expcap <subcommand> ...

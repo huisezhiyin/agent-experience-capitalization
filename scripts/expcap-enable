@@ -12,15 +12,21 @@ Usage:
 
 Environment:
   EXPCAP_INCLUDE_CLAUDE=0  Skip CLAUDE.md integration.
+  EXPCAP_INSTALL_CODEX_SKILL=0
+                            Skip installing the Codex skill entrypoint.
   EXPCAP_WITH_MILVUS=1     Install Milvus Lite extras and sync indexes.
 
 This bootstraps expcap for a project by installing the local CLI package and
 non-destructively appending expcap instructions to AGENTS.md and CLAUDE.md.
+By default it also installs the Codex skill entrypoint.
 USAGE
   exit 0
 fi
 
 cd "$PROJECT_ROOT"
+
+export EXPCAP_STORAGE_PROFILE="${EXPCAP_STORAGE_PROFILE:-user-cache}"
+export EXPCAP_HOME="${EXPCAP_HOME:-$HOME/.expcap}"
 
 if [[ ! -d ".venv" ]]; then
   python3 -m venv .venv
@@ -30,6 +36,10 @@ if [[ "${EXPCAP_WITH_MILVUS:-0}" == "1" ]]; then
   .venv/bin/pip install -e ".[milvus]"
 else
   .venv/bin/pip install -e .
+fi
+
+if [[ "${EXPCAP_INSTALL_CODEX_SKILL:-1}" != "0" ]]; then
+  scripts/install-codex-skill
 fi
 
 INSTALL_ARGS=(install-project --workspace "$WORKSPACE")

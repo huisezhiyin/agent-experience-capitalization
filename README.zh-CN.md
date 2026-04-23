@@ -40,41 +40,58 @@ git clone <repo-url>
 cd agent-experience-capitalization
 
 python3 -m venv .venv
-.venv/bin/pip install -e .
+. .venv/bin/activate
+.venv/bin/pip install -e ".[milvus]"
+scripts/install-codex-skill
 scripts/expcap --help
 ```
 
-安装 Milvus Lite，以启用核心语义召回路径：
+上面的命令默认安装 Milvus Lite，因为 Milvus 是核心语义召回层：
 
 ```bash
-.venv/bin/pip install -e ".[milvus]"
 scripts/expcap sync-milvus --workspace "$PWD" --include-shared
 ```
 
 ## 快速开始
 
-下面的流程会创建 trace，review 成 episode，提取 candidate，晋升 asset，然后执行一次 activation：
+推荐入口是 Codex skill：`skills/expcap/SKILL.md`。先安装 skill，然后让
+agent 通过 skill 执行经验激活和沉淀，而不是让每个用户记住底层 CLI。
+
+短周期测试推荐使用集中本地存储：
 
 ```bash
-scripts/expcap ingest \
-  --workspace "$PWD" \
+export EXPCAP_STORAGE_PROFILE=user-cache
+export EXPCAP_HOME="$HOME/.expcap"
+```
+
+任务开始前激活相关经验：
+
+```bash
+expcap auto-start --task "fix pytest import error" --workspace "$PWD"
+```
+
+任务结束后沉淀可复用经验：
+
+```bash
+expcap auto-finish \
   --task "fix pytest import error" \
+  --workspace "$PWD" \
   --command "python3 -m unittest discover -s tests -v" \
-  --error "ModuleNotFoundError: no module named foo" \
   --verification-status passed \
   --verification-summary "tests passed" \
   --result-status success \
-  --result-summary "fixed import path" \
-  --trace-id trace_demo_import_fix
-
-scripts/expcap review --input .agent-memory/traces/bundles/trace_demo_import_fix.json
-scripts/expcap extract --episode .agent-memory/episodes/ep_demo_import_fix.json
-scripts/expcap promote --candidate .agent-memory/candidates/cand_demo_import_fix.json
-scripts/expcap activate --task "fix pytest import error" --workspace "$PWD"
-scripts/expcap status --workspace "$PWD"
+  --result-summary "fixed import path"
 ```
 
-运行数据会写入 `.agent-memory/`。这个目录应始终排除在源码提交之外。
+检查闭环：
+
+```bash
+expcap status --workspace "$PWD"
+expcap doctor --workspace "$PWD"
+```
+
+推荐 `user-cache` profile 会把运行数据写入 `$EXPCAP_HOME`。如果显式使用项目本地模式，`.agent-memory/`
+仍应排除在源码提交之外。
 
 ## Agent 工作流
 
@@ -91,12 +108,14 @@ scripts/expcap install-project --workspace /path/to/project --include-claude
 ```
 
 安装器会非破坏式追加说明，创建 `AGENTS.expcap.md`，并确保 `.agent-memory/`
-写入 `.gitignore`。之后 agent 可以使用：
+写入 `.gitignore`。之后 agent 可以使用 skill-backed 默认工作流：
 
 ```bash
 expcap auto-start --task "your task" --workspace "$PWD"
 expcap auto-finish --task "your task" --workspace "$PWD" --verification-status passed --result-status success
 ```
+
+如果需要手动调试，底层流程仍然可用：`ingest -> review -> extract -> promote -> activate`。
 
 ## 核心概念
 

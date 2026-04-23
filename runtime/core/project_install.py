@@ -18,7 +18,7 @@ def _sidecar_content(workspace: Path) -> str:
 
 - 不替换原有 `AGENTS.md`
 - 只为当前项目补充经验 `get/save` 规则
-- 让 Codex 在这个项目中默认把 `expcap` 当作辅助能力使用
+- 让 Codex 在这个项目中默认通过 `expcap` skill 执行经验 `get/save`
 - 默认把运行数据写入 `EXPCAP_HOME` 集中数据中心，而不是项目目录
 
 ## 核心定位
@@ -69,9 +69,10 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap promote --c
 ## 说明
 
 - `expcap` 是全局 skill + 本地 runtime 能力
+- skill 是推荐入口，CLI 是执行层
 - 当前项目经验默认落在 `EXPCAP_HOME/projects/...`
 - `.agent-memory/` 仅作为显式 `EXPCAP_STORAGE_PROFILE=local` 的兼容目录
-- 正文真源是 JSON 文件，SQLite 是索引层
+- 正文真源是 JSON 文件，Milvus 是核心语义召回层，SQLite 是轻量状态/日志索引
 """
 
 

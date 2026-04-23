@@ -45,43 +45,61 @@ git clone <repo-url>
 cd agent-experience-capitalization
 
 python3 -m venv .venv
-.venv/bin/pip install -e .
+. .venv/bin/activate
+.venv/bin/pip install -e ".[milvus]"
+scripts/install-codex-skill
 scripts/expcap --help
 ```
 
-Install Milvus Lite support for the core semantic retrieval path:
+Milvus Lite is installed by default above because Milvus is the core semantic
+retrieval layer:
 
 ```bash
-.venv/bin/pip install -e ".[milvus]"
 scripts/expcap sync-milvus --workspace "$PWD" --include-shared
 ```
 
 ## Quickstart
 
-Create a trace, review it, extract a candidate, promote it into an asset, then
-activate it:
+The recommended entrypoint is the Codex skill in
+`skills/expcap/SKILL.md`. Install it once, then let the agent run the workflow
+through the skill instead of making every user memorize CLI commands.
+
+Use centralized local storage for short-cycle testing:
 
 ```bash
-scripts/expcap ingest \
-  --workspace "$PWD" \
+export EXPCAP_STORAGE_PROFILE=user-cache
+export EXPCAP_HOME="$HOME/.expcap"
+```
+
+Start a task by activating relevant experience:
+
+```bash
+expcap auto-start --task "fix pytest import error" --workspace "$PWD"
+```
+
+Finish a task by saving the reusable lesson:
+
+```bash
+expcap auto-finish \
   --task "fix pytest import error" \
+  --workspace "$PWD" \
   --command "python3 -m unittest discover -s tests -v" \
-  --error "ModuleNotFoundError: no module named foo" \
   --verification-status passed \
   --verification-summary "tests passed" \
   --result-status success \
-  --result-summary "fixed import path" \
-  --trace-id trace_demo_import_fix
-
-scripts/expcap review --input .agent-memory/traces/bundles/trace_demo_import_fix.json
-scripts/expcap extract --episode .agent-memory/episodes/ep_demo_import_fix.json
-scripts/expcap promote --candidate .agent-memory/candidates/cand_demo_import_fix.json
-scripts/expcap activate --task "fix pytest import error" --workspace "$PWD"
-scripts/expcap status --workspace "$PWD"
+  --result-summary "fixed import path"
 ```
 
-Runtime data is written to `.agent-memory/`. Keep that directory out of source
-control.
+Check the loop:
+
+```bash
+expcap status --workspace "$PWD"
+expcap doctor --workspace "$PWD"
+```
+
+Runtime data is written to `$EXPCAP_HOME` with the recommended `user-cache`
+profile. Keep `.agent-memory/` out of source control for explicit project-local
+testing.
 
 ## Agent Workflow
 
@@ -99,12 +117,15 @@ scripts/expcap install-project --workspace /path/to/project --include-claude
 
 The installer appends non-destructive instructions and creates
 `AGENTS.expcap.md`. It also ensures `.agent-memory/` is present in
-`.gitignore`. Agents can then use:
+`.gitignore`. Agents can then use the skill-backed default workflow:
 
 ```bash
 expcap auto-start --task "your task" --workspace "$PWD"
 expcap auto-finish --task "your task" --workspace "$PWD" --verification-status passed --result-status success
 ```
+
+For manual debugging, the lower-level pipeline is still available:
+`ingest -> review -> extract -> promote -> activate`.
 
 ## Core Concepts
 

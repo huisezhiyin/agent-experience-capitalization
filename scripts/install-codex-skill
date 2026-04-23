@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+TARGET_DIR="$CODEX_HOME/skills/expcap"
+
+mkdir -p "$TARGET_DIR"
+cp "$PROJECT_ROOT/skills/expcap/SKILL.md" "$TARGET_DIR/SKILL.md"
+
+cat <<EOF
+Installed expcap skill:
+  $TARGET_DIR/SKILL.md
+
+Recommended runtime defaults:
+  export EXPCAP_STORAGE_PROFILE=user-cache
+  export EXPCAP_HOME="\$HOME/.expcap"
+EOF

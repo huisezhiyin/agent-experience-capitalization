@@ -6,6 +6,8 @@ import hashlib
 import math
 import os
 import re
+import socket
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Any
@@ -44,15 +46,49 @@ def _compact_error(error: Exception) -> str:
     return " ".join(str(error).split())[:240] or error.__class__.__name__
 
 
+@lru_cache(maxsize=1)
+def milvus_runtime_available() -> bool:
+    if not milvus_available():
+        return False
+    if not hasattr(socket, "AF_UNIX"):
+        return True
+
+    probe_path = Path(tempfile.gettempdir()) / f"expcap_milvus_probe_{os.getpid()}.sock"
+    try:
+        if probe_path.exists():
+            probe_path.unlink()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.bind(str(probe_path))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            probe_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+
 @contextmanager
 def _milvus_db_lock(db_path: Path):
     if fcntl is None:
         yield None
         return
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        yield f"lock_unavailable: {_compact_error(error)}"
+        return
     lock_path = db_path.with_name(f"{db_path.name}.lock")
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
+    try:
+        lock_file = lock_path.open("a+", encoding="utf-8")
+    except OSError as error:
+        yield f"lock_unavailable: {_compact_error(error)}"
+        return
+    with lock_file:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -66,12 +102,20 @@ def _milvus_db_lock(db_path: Path):
 
 def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[str, Any]:
     available = milvus_available()
+    runtime_available = milvus_runtime_available() if available else False
     summary = {
         "backend": "milvus-lite",
         "available": available,
-        "status": "ready" if available and db_path.exists() else "not_initialized" if available else "unavailable",
+        "runtime_available": runtime_available,
+        "status": "ready"
+        if available and runtime_available and db_path.exists()
+        else "not_initialized"
+        if available and runtime_available
+        else "degraded"
+        if available
+        else "unavailable",
         "deep_check": deep_check,
-        "degraded_reason": None,
+        "degraded_reason": None if runtime_available or not available else "unix_socket_bind_unavailable",
         "last_error": None,
         "db_path": str(db_path),
         "db_exists": db_path.exists(),
@@ -80,6 +124,8 @@ def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[s
         "indexed_entities": None,
     }
     if not summary["available"]:
+        return summary
+    if not summary["runtime_available"]:
         return summary
 
     with _milvus_db_lock(db_path) as lock_error:
@@ -153,7 +199,7 @@ def _client(db_path: Path) -> Any:
 
 
 def _safe_client_unlocked(db_path: Path) -> Any | None:
-    if not milvus_available():
+    if not milvus_available() or not milvus_runtime_available():
         return None
     with warnings.catch_warnings():
         warnings.filterwarnings(

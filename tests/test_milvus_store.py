@@ -21,7 +21,11 @@ class MilvusStoreLockTests(unittest.TestCase):
             db_path = Path(tmpdir) / "milvus.db"
             lock_file = self._hold_lock(db_path)
             try:
-                with patch.object(milvus_store, "milvus_available", return_value=True):
+                with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                    milvus_store,
+                    "milvus_runtime_available",
+                    return_value=True,
+                ):
                     summary = milvus_store.milvus_backend_summary(db_path)
             finally:
                 milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
@@ -36,6 +40,10 @@ class MilvusStoreLockTests(unittest.TestCase):
             db_path = Path(tmpdir) / "milvus.db"
             db_path.touch()
             with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "milvus_runtime_available",
+                return_value=True,
+            ), patch.object(
                 milvus_store,
                 "_safe_client_unlocked",
                 side_effect=AssertionError("lightweight summary should not open a Milvus client"),
@@ -53,6 +61,10 @@ class MilvusStoreLockTests(unittest.TestCase):
             db_path = Path(tmpdir) / "milvus.db"
             with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
                 milvus_store,
+                "milvus_runtime_available",
+                return_value=True,
+            ), patch.object(
+                milvus_store,
                 "_safe_client_unlocked",
                 return_value=None,
             ) as safe_client:
@@ -63,6 +75,38 @@ class MilvusStoreLockTests(unittest.TestCase):
             self.assertEqual(summary["status"], "degraded")
             self.assertEqual(summary["degraded_reason"], "client_unavailable")
 
+    def test_backend_summary_degrades_when_runtime_cannot_bind_unix_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            db_path.touch()
+            with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "milvus_runtime_available",
+                return_value=False,
+            ), patch.object(
+                milvus_store,
+                "_safe_client_unlocked",
+                side_effect=AssertionError("runtime degradation should not open a Milvus client"),
+            ):
+                summary = milvus_store.milvus_backend_summary(db_path)
+
+            self.assertEqual(summary["status"], "degraded")
+            self.assertFalse(summary["runtime_available"])
+            self.assertEqual(summary["degraded_reason"], "unix_socket_bind_unavailable")
+
+    def test_backend_summary_degrades_when_lock_file_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "milvus_runtime_available",
+                return_value=True,
+            ), patch.object(Path, "open", side_effect=PermissionError("denied")):
+                summary = milvus_store.milvus_backend_summary(db_path)
+
+            self.assertEqual(summary["status"], "degraded")
+            self.assertTrue(summary["degraded_reason"].startswith("lock_unavailable"))
+
     def test_vector_operations_skip_when_db_is_locked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "milvus.db"
@@ -72,6 +116,10 @@ class MilvusStoreLockTests(unittest.TestCase):
             lock_file = self._hold_lock(db_path)
             try:
                 with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                    milvus_store,
+                    "milvus_runtime_available",
+                    return_value=True,
+                ), patch.object(
                     milvus_store,
                     "_safe_client_unlocked",
                     side_effect=AssertionError("locked operations should not open a Milvus client"),
@@ -123,6 +171,10 @@ class MilvusStoreLockTests(unittest.TestCase):
             client = FakeClient()
 
             with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "milvus_runtime_available",
+                return_value=True,
+            ), patch.object(
                 milvus_store,
                 "_safe_client_unlocked",
                 return_value=client,

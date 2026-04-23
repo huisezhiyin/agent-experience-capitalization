@@ -1,13 +1,36 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any, Iterator
 
+from runtime.backends import resolve_backend_config
 
-def memory_root_for_workspace(workspace: Path) -> Path:
-    return workspace / ".agent-memory"
+
+def _slugify_path_part(value: str) -> str:
+    cleaned = []
+    for ch in value.lower():
+        if ch.isalnum():
+            cleaned.append(ch)
+        elif cleaned and cleaned[-1] != "-":
+            cleaned.append("-")
+    return "".join(cleaned).strip("-") or "project"
+
+
+def expcap_home() -> Path:
+    configured = os.environ.get("EXPCAP_HOME")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".expcap").resolve()
+
+
+def project_storage_key(workspace: Path) -> str:
+    project_id = os.environ.get("EXPCAP_PROJECT_ID")
+    raw_value = project_id.strip() if project_id else str(workspace.expanduser().resolve())
+    digest = hashlib.sha1(raw_value.encode("utf-8")).hexdigest()[:10]
+    return f"{_slugify_path_part(raw_value)[:72]}-{digest}"
 
 
 def codex_home() -> Path:
@@ -19,6 +42,37 @@ def codex_home() -> Path:
 
 def shared_memory_root() -> Path:
     return codex_home() / "expcap-memory"
+
+
+def memory_root_for_workspace(workspace: Path) -> Path:
+    profile = str(resolve_backend_config().get("storage_profile", "local"))
+    if profile == "local":
+        return workspace / ".agent-memory"
+    if profile == "user-cache":
+        return expcap_home() / "projects" / project_storage_key(workspace)
+    return expcap_home() / "cache" / project_storage_key(workspace)
+
+
+def storage_layout_for_workspace(workspace: Path) -> dict[str, Any]:
+    config = resolve_backend_config()
+    memory_root = memory_root_for_workspace(workspace)
+    shared_root = shared_memory_root()
+    return {
+        "storage_profile": config["storage_profile"],
+        "data_source_mode": config["data_source_mode"],
+        "project_owned_assets": config["project_owned_assets"],
+        "local_runtime_data_in_project": config["local_runtime_data_in_project"],
+        "project_storage_key": project_storage_key(workspace),
+        "memory_root": str(memory_root),
+        "asset_root": str(memory_root / "assets"),
+        "state_index_path": str(memory_root / "index.sqlite3"),
+        "retrieval_index_path": str(memory_root / "milvus.db"),
+        "shared_memory_root": str(shared_root),
+        "shared_asset_root": str(shared_root / "assets"),
+        "shared_state_index_path": str(shared_root / "index.sqlite3"),
+        "shared_retrieval_index_path": str(shared_root / "milvus.db"),
+        "remote_uris": config["backend_uris"],
+    }
 
 
 def default_db_path(workspace: Path) -> Path:

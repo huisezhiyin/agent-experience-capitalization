@@ -205,7 +205,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(asset["state_index"]["uri"], "postgres://expcap")
         self.assertEqual(asset["retrieval_index"]["backend"], "milvus")
         self.assertEqual(asset["retrieval_index"]["uri"], "https://milvus.example.com")
-        self.assertEqual(asset["delivery"]["mode"], "shareable")
+        self.assertEqual(asset["delivery"]["mode"], "shared")
         self.assertTrue(asset["delivery"]["shareable"])
 
     def test_activate_assets_exposes_match_evidence_and_risks(self) -> None:

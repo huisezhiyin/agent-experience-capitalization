@@ -119,15 +119,34 @@ Activation view 会包含 `source_provenance`、`match_evidence`、`risk_flags`
 
 ## 存储
 
-默认本地模式：
+经验资产始终有项目归属，即使数据源是共享的。项目保留 identity 和 ownership
+元数据，存储可以是项目本地、用户级缓存或远端共享后端。
+
+Storage profile：
+
+- `local`：运行数据写入项目 `.agent-memory/`。
+- `user-cache`：运行数据写入 `EXPCAP_HOME`，不落在项目目录。
+- `shared`：正文真源、状态索引和召回都预期使用共享后端。
+- `hybrid`：共享正文/召回，加本地缓存和 SQLite 状态索引。
+
+默认本地 profile：
 
 - JSON 文件是正文真源。
 - SQLite 存储状态、索引、审核结果和 activation log。
 - Milvus Lite 可作为可选语义召回层。
 
+把本地运行数据移出项目目录：
+
+```bash
+export EXPCAP_STORAGE_PROFILE=user-cache
+export EXPCAP_HOME="$HOME/.expcap"
+export EXPCAP_PROJECT_ID=github:org/repo
+```
+
 共享模式使用同一套 asset contract：
 
 ```bash
+export EXPCAP_STORAGE_PROFILE=shared
 export EXPCAP_SOURCE_OF_TRUTH_BACKEND=object-storage
 export EXPCAP_STATE_INDEX_BACKEND=cloud-sql
 export EXPCAP_RETRIEVAL_BACKEND=milvus

@@ -969,11 +969,14 @@ class CliFlowTests(unittest.TestCase):
             self.assertFalse(payload["retrieval_backends"]["milvus"]["local"]["deep_check"])
             self.assertIn("collection_exists", payload["retrieval_backends"]["milvus"]["local"])
             self.assertTrue(payload["retrieval_backends"]["milvus"]["asset_coverage"]["deep_check_required"])
-            self.assertEqual(payload["backend_configuration"]["profile"], "local-mode")
+            self.assertEqual(payload["backend_configuration"]["profile"], "local")
+            self.assertEqual(payload["backend_configuration"]["storage_profile"], "local")
             self.assertEqual(payload["backend_configuration"]["source_of_truth"], "local-json")
             self.assertEqual(payload["backend_configuration"]["state_index"], "sqlite")
             self.assertEqual(payload["backend_configuration"]["retrieval"], "milvus-lite")
             self.assertEqual(payload["backend_configuration"]["asset_portability"], "local-deliverable")
+            self.assertEqual(payload["storage_layout"]["storage_profile"], "local")
+            self.assertTrue(payload["storage_layout"]["local_runtime_data_in_project"])
 
     def test_cli_auto_finish_persists_asset_effectiveness_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

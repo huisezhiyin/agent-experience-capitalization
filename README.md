@@ -128,15 +128,36 @@ Assets carry scope and lifecycle metadata:
 
 ## Storage
 
-Default local mode:
+Assets are project-owned even when the data source is shared. The project keeps
+identity and ownership metadata; storage can be local, user-level, or remote.
+
+Storage profiles:
+
+- `local`: runtime data lives in the project `.agent-memory/` directory.
+- `user-cache`: runtime data lives under `EXPCAP_HOME` and stays out of the
+  project directory.
+- `shared`: source of truth, state, and retrieval are expected to be shared
+  backends.
+- `hybrid`: shared source/retrieval with a local cache and SQLite state index.
+
+Default local profile:
 
 - JSON files are the source of truth.
 - SQLite stores state, indexes, review decisions, and activation logs.
 - Milvus Lite can be used as an optional semantic retrieval layer.
 
-Shared mode is expressed through the same asset contract:
+Move local runtime data out of the project:
 
 ```bash
+export EXPCAP_STORAGE_PROFILE=user-cache
+export EXPCAP_HOME="$HOME/.expcap"
+export EXPCAP_PROJECT_ID=github:org/repo
+```
+
+Shared mode uses the same asset contract:
+
+```bash
+export EXPCAP_STORAGE_PROFILE=shared
 export EXPCAP_SOURCE_OF_TRUTH_BACKEND=object-storage
 export EXPCAP_STATE_INDEX_BACKEND=cloud-sql
 export EXPCAP_RETRIEVAL_BACKEND=milvus

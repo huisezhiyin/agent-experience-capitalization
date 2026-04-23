@@ -43,8 +43,12 @@ Short name: **TEAM memory** — **Transferable Engineering Asset Memory**.
 The storage backend is replaceable, but the asset contract is not.
 
 - Solo/local mode can use `.agent-memory/`, SQLite, and Milvus Lite.
+- Project ownership does not require project-directory storage. A project can
+  own assets whose source of truth lives in a user cache or shared backend.
 - Team mode should support shared asset stores, shared state indexes, and shared
   vector retrieval.
+- Retrieval should expose provenance so agents can judge whether a shared asset
+  applies to the current task.
 - Cloud backends should make assets easier to share and deliver, not make local
   development impossible.
 - Local and cloud modes should share the same asset contract. Cloud adoption

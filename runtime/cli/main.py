@@ -33,6 +33,7 @@ from runtime.storage.fs_store import (
     shared_db_path,
     shared_memory_root,
     shared_milvus_db_path,
+    storage_layout_for_workspace,
     workspace_from_payload,
 )
 from runtime.storage.milvus_store import (
@@ -983,6 +984,7 @@ def _build_status_payload(*, workspace: Path, limit: int, deep_retrieval_check: 
         "workspace": str(workspace),
         "generated_at": now_utc(),
         "backend_configuration": resolve_backend_config(),
+        "storage_layout": storage_layout_for_workspace(workspace),
         "retrieval_backends": {
             "sqlite": {
                 "backend": "sqlite",

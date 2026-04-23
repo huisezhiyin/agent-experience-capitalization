@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import tempfile
+import time
 import warnings
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,14 @@ def _compact_error(error: Exception) -> str:
     return " ".join(str(error).split())[:240] or error.__class__.__name__
 
 
+def _milvus_lock_wait_seconds() -> float:
+    raw_value = os.environ.get("EXPCAP_MILVUS_LOCK_WAIT_SECONDS", "0.25")
+    try:
+        return max(float(raw_value), 0.0)
+    except ValueError:
+        return 0.25
+
+
 @lru_cache(maxsize=1)
 def milvus_runtime_available() -> bool:
     if not milvus_available():
@@ -71,6 +80,25 @@ def milvus_runtime_available() -> bool:
             pass
 
 
+def _try_acquire_lock(lock_file: Any) -> bool:
+    assert fcntl is not None
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _write_lock_metadata(lock_file: Any) -> None:
+    try:
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid={os.getpid()} acquired_at={time.time():.3f}\n")
+        lock_file.flush()
+    except Exception:
+        pass
+
+
 @contextmanager
 def _milvus_db_lock(db_path: Path):
     if fcntl is None:
@@ -89,12 +117,14 @@ def _milvus_db_lock(db_path: Path):
         yield f"lock_unavailable: {_compact_error(error)}"
         return
     with lock_file:
+        deadline = time.monotonic() + _milvus_lock_wait_seconds()
+        while not _try_acquire_lock(lock_file):
+            if time.monotonic() >= deadline:
+                yield "locked_by_another_process"
+                return
+            time.sleep(0.05)
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield "locked_by_another_process"
-            return
-        try:
+            _write_lock_metadata(lock_file)
             yield None
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

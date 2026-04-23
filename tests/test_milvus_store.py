@@ -1,5 +1,7 @@
 import json
+import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -34,6 +36,35 @@ class MilvusStoreLockTests(unittest.TestCase):
             self.assertEqual(summary["status"], "degraded")
             self.assertEqual(summary["degraded_reason"], "locked_by_another_process")
             self.assertIsNone(summary["collection_exists"])
+
+    def test_backend_summary_waits_for_transient_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            db_path.touch()
+            lock_file = self._hold_lock(db_path)
+
+            def release_lock() -> None:
+                milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
+                lock_file.close()
+
+            timer = threading.Timer(0.1, release_lock)
+            timer.start()
+            try:
+                with patch.dict(os.environ, {"EXPCAP_MILVUS_LOCK_WAIT_SECONDS": "1"}), patch.object(
+                    milvus_store,
+                    "milvus_available",
+                    return_value=True,
+                ), patch.object(
+                    milvus_store,
+                    "milvus_runtime_available",
+                    return_value=True,
+                ):
+                    summary = milvus_store.milvus_backend_summary(db_path)
+            finally:
+                timer.join(timeout=1)
+
+            self.assertEqual(summary["status"], "ready")
+            self.assertIsNone(summary["degraded_reason"])
 
     def test_backend_summary_is_lightweight_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

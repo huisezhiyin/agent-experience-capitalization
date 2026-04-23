@@ -266,6 +266,50 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(asset["knowledge_scope"], "cross-project")
             self.assertEqual(asset["knowledge_kind"], "rule")
 
+    def test_cli_status_treats_recent_unresolved_activation_as_pending_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "inspect current logging quality",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["status"]
+            self.assertEqual(payload["activation_feedback_summary"]["missing_total"], 1)
+            self.assertEqual(payload["activation_feedback_summary"]["pending"], 1)
+            self.assertEqual(payload["activation_feedback_summary"]["missing"], 0)
+            self.assertEqual(payload["activation_feedback_summary"]["pending_hours"], 24.0)
+
     def test_cli_auto_finish_records_activation_help_feedback_for_later_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"

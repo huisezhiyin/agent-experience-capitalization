@@ -1,5 +1,7 @@
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,60 @@ from runtime.storage.sqlite_store import (
 
 ALL_CANDIDATE_STATUSES = ("new", "needs_review", "approved", "rejected", "promoted")
 DEFAULT_REVIEW_QUEUE_STATUSES = ("needs_review", "approved", "new")
+DEFAULT_FEEDBACK_PENDING_HOURS = 24.0
+
+
+def _feedback_pending_hours() -> float:
+    raw_value = os.environ.get("EXPCAP_FEEDBACK_PENDING_HOURS")
+    if raw_value is None:
+        return DEFAULT_FEEDBACK_PENDING_HOURS
+    try:
+        return max(float(raw_value), 0.0)
+    except ValueError:
+        return DEFAULT_FEEDBACK_PENDING_HOURS
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _is_pending_feedback(activation: dict[str, Any], *, now: datetime, pending_hours: float) -> bool:
+    created_at = _parse_datetime(activation.get("created_at"))
+    if created_at is None:
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return now - created_at <= timedelta(hours=pending_hours)
+
+
+def _summarize_activation_feedback(activations: list[dict[str, Any]]) -> dict[str, Any]:
+    feedback_summary = {
+        "supported_strong": 0,
+        "supported_weak": 0,
+        "unclear": 0,
+        "pending": 0,
+        "missing": 0,
+        "missing_total": 0,
+    }
+    pending_hours = _feedback_pending_hours()
+    now = datetime.now(timezone.utc)
+    for activation in activations:
+        help_signal = activation.get("feedback", {}).get("help_signal")
+        if help_signal in {"supported_strong", "supported_weak", "unclear"}:
+            feedback_summary[help_signal] += 1
+        else:
+            feedback_summary["missing_total"] += 1
+            if _is_pending_feedback(activation, now=now, pending_hours=pending_hours):
+                feedback_summary["pending"] += 1
+            else:
+                feedback_summary["missing"] += 1
+    feedback_summary["pending_hours"] = pending_hours
+    return feedback_summary
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -816,18 +872,7 @@ def _handle_status(args: argparse.Namespace) -> int:
     traces = list(iter_json_objects(memory_root / "traces" / "bundles"))
     episodes = list(iter_json_objects(memory_root / "episodes"))
 
-    feedback_summary = {
-        "supported_strong": 0,
-        "supported_weak": 0,
-        "unclear": 0,
-        "missing": 0,
-    }
-    for activation in activations:
-        help_signal = activation.get("feedback", {}).get("help_signal")
-        if help_signal in feedback_summary:
-            feedback_summary[help_signal] += 1
-        else:
-            feedback_summary["missing"] += 1
+    feedback_summary = _summarize_activation_feedback(activations)
 
     temperature_summary = {"hot": 0, "warm": 0, "neutral": 0, "cool": 0}
     review_status_summary = {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}

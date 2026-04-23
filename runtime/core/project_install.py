@@ -5,6 +5,7 @@ from pathlib import Path
 
 EXPCAP_BLOCK_START = "<!-- EXPCAP START -->"
 EXPCAP_BLOCK_END = "<!-- EXPCAP END -->"
+EXPCAP_GITIGNORE_ENTRY = ".agent-memory/"
 
 
 def _sidecar_content(workspace: Path) -> str:
@@ -67,7 +68,7 @@ expcap promote --candidate "{workspace_path}/.agent-memory/candidates/<candidate
 ## 说明
 
 - `expcap` 是全局 skill + 本地 runtime 能力
-- 当前项目经验默认落在 `.agent-memory/`
+- 当前项目经验默认落在 `.agent-memory/`，该目录应加入 `.gitignore`
 - 正文真源是 JSON 文件，`.agent-memory/index.sqlite3` 是索引层
 """
 
@@ -114,10 +115,31 @@ def _upsert_managed_block(
     return created, updated
 
 
+def _ensure_gitignore_entry(workspace: Path) -> tuple[Path, bool, bool]:
+    gitignore_path = workspace / ".gitignore"
+    if not gitignore_path.exists():
+        gitignore_path.write_text(
+            "# expcap local runtime data\n.agent-memory/\n",
+            encoding="utf-8",
+        )
+        return gitignore_path, True, True
+
+    original = gitignore_path.read_text(encoding="utf-8")
+    entries = {line.strip() for line in original.splitlines()}
+    if EXPCAP_GITIGNORE_ENTRY in entries or ".agent-memory" in entries:
+        return gitignore_path, False, False
+
+    suffix = "" if original.endswith("\n") else "\n"
+    new_content = original + suffix + "\n# expcap local runtime data\n.agent-memory/\n"
+    gitignore_path.write_text(new_content, encoding="utf-8")
+    return gitignore_path, False, True
+
+
 def install_project_agents(workspace: Path, *, include_claude: bool = False) -> dict[str, str | bool]:
     workspace = workspace.resolve()
     sidecar_path = workspace / "AGENTS.expcap.md"
     sidecar_path.write_text(_sidecar_content(workspace), encoding="utf-8")
+    gitignore_path, created_gitignore, updated_gitignore = _ensure_gitignore_entry(workspace)
 
     agents_path = workspace / "AGENTS.md"
     created_agents, updated_agents = _upsert_managed_block(
@@ -142,9 +164,12 @@ def install_project_agents(workspace: Path, *, include_claude: bool = False) -> 
         "workspace": str(workspace),
         "agents_path": str(agents_path),
         "sidecar_path": str(sidecar_path),
+        "gitignore_path": str(gitignore_path),
         "claude_path": str(claude_path) if include_claude else "",
         "created_agents": created_agents,
         "updated_agents": updated_agents,
+        "created_gitignore": created_gitignore,
+        "updated_gitignore": updated_gitignore,
         "created_claude": created_claude,
         "updated_claude": updated_claude,
     }

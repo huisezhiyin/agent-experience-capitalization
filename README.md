@@ -78,7 +78,8 @@ scripts/expcap activate --task "fix pytest import error" --workspace "$PWD"
 scripts/expcap status --workspace "$PWD"
 ```
 
-Runtime data is written to `.agent-memory/`, which is ignored by git by default.
+Runtime data is written to `.agent-memory/`. Keep that directory out of source
+control.
 
 ## Agent Workflow
 
@@ -95,7 +96,8 @@ scripts/expcap install-project --workspace /path/to/project --include-claude
 ```
 
 The installer appends non-destructive instructions and creates
-`AGENTS.expcap.md`. Agents can then use:
+`AGENTS.expcap.md`. It also ensures `.agent-memory/` is present in
+`.gitignore`. Agents can then use:
 
 ```bash
 expcap auto-start --task "your task" --workspace "$PWD"

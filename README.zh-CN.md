@@ -73,7 +73,7 @@ scripts/expcap activate --task "fix pytest import error" --workspace "$PWD"
 scripts/expcap status --workspace "$PWD"
 ```
 
-运行数据会写入 `.agent-memory/`，默认不会提交到 git。
+运行数据会写入 `.agent-memory/`。这个目录应始终排除在源码提交之外。
 
 ## Agent 工作流
 
@@ -89,7 +89,8 @@ scripts/expcap install-project --workspace /path/to/project
 scripts/expcap install-project --workspace /path/to/project --include-claude
 ```
 
-安装器会非破坏式追加说明，并创建 `AGENTS.expcap.md`。之后 agent 可以使用：
+安装器会非破坏式追加说明，创建 `AGENTS.expcap.md`，并确保 `.agent-memory/`
+写入 `.gitignore`。之后 agent 可以使用：
 
 ```bash
 expcap auto-start --task "your task" --workspace "$PWD"

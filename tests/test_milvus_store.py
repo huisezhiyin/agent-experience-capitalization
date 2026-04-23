@@ -66,6 +66,23 @@ class MilvusStoreLockTests(unittest.TestCase):
             self.assertEqual(summary["status"], "ready")
             self.assertIsNone(summary["degraded_reason"])
 
+    def test_milvus_lock_summary_reports_owner_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            lock_file = self._hold_lock(db_path)
+            milvus_store._write_lock_metadata(lock_file)
+            try:
+                summary = milvus_store.milvus_lock_summary(db_path)
+            finally:
+                milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
+                lock_file.close()
+
+            self.assertTrue(summary["lock_exists"])
+            self.assertTrue(summary["locked"])
+            self.assertEqual(summary["metadata"]["pid"], os.getpid())
+            self.assertTrue(summary["pid_exists"])
+            self.assertIsInstance(summary["age_seconds"], float)
+
     def test_backend_summary_is_lightweight_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "milvus.db"

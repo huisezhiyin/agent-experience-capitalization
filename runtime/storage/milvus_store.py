@@ -99,6 +99,83 @@ def _write_lock_metadata(lock_file: Any) -> None:
         pass
 
 
+def _parse_lock_metadata(raw_value: str) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for part in raw_value.split():
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        if key == "pid":
+            try:
+                metadata[key] = int(value)
+            except ValueError:
+                metadata[key] = value
+        elif key == "acquired_at":
+            try:
+                metadata[key] = float(value)
+            except ValueError:
+                metadata[key] = value
+        else:
+            metadata[key] = value
+    return metadata
+
+
+def _process_exists(pid: Any) -> bool | None:
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return None
+
+
+def milvus_lock_summary(db_path: Path) -> dict[str, Any]:
+    lock_path = db_path.with_name(f"{db_path.name}.lock")
+    raw_value = ""
+    if lock_path.exists():
+        try:
+            raw_value = lock_path.read_text(encoding="utf-8").strip()
+        except OSError as error:
+            raw_value = f"read_error={_compact_error(error)}"
+    metadata = _parse_lock_metadata(raw_value)
+
+    locked: bool | None = None
+    lock_error = None
+    if fcntl is not None:
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lock_file:
+                if _try_acquire_lock(lock_file):
+                    locked = False
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                else:
+                    locked = True
+        except OSError as error:
+            lock_error = _compact_error(error)
+
+    pid_exists = _process_exists(metadata.get("pid"))
+    age_seconds = None
+    if isinstance(metadata.get("acquired_at"), float):
+        age_seconds = round(max(time.time() - metadata["acquired_at"], 0.0), 3)
+
+    return {
+        "lock_path": str(lock_path),
+        "lock_exists": lock_path.exists(),
+        "locked": locked,
+        "lock_error": lock_error,
+        "metadata_raw": raw_value,
+        "metadata": metadata,
+        "pid_exists": pid_exists,
+        "age_seconds": age_seconds,
+        "stale_hint": bool(locked and pid_exists is False),
+    }
+
+
 @contextmanager
 def _milvus_db_lock(db_path: Path):
     if fcntl is None:

@@ -38,6 +38,7 @@ from runtime.storage.fs_store import (
 from runtime.storage.milvus_store import (
     milvus_available,
     milvus_backend_summary,
+    milvus_lock_summary,
     sync_assets_directory_with_report,
     upsert_asset_vector,
 )
@@ -330,6 +331,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     status.add_argument("--output", help="Optional output path for the status JSON.")
     status.add_argument(
+        "--deep-retrieval-check",
+        action="store_true",
+        help="Open retrieval backends for deeper health checks. Defaults to lightweight checks only.",
+    )
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="Diagnose workspace health, retrieval backends, feedback gaps, and review queues.",
+    )
+    doctor.add_argument("--workspace", required=True, help="Workspace path to diagnose.")
+    doctor.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="How many recent items to include per section. Defaults to 5.",
+    )
+    doctor.add_argument("--output", help="Optional output path for the doctor JSON.")
+    doctor.add_argument(
         "--deep-retrieval-check",
         action="store_true",
         help="Open retrieval backends for deeper health checks. Defaults to lightweight checks only.",
@@ -856,8 +875,7 @@ def _handle_review_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
-def _handle_status(args: argparse.Namespace) -> int:
-    workspace = Path(args.workspace).resolve()
+def _build_status_payload(*, workspace: Path, limit: int, deep_retrieval_check: bool) -> dict[str, Any]:
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
     ensure_db(db_path)
@@ -913,7 +931,7 @@ def _handle_status(args: argparse.Namespace) -> int:
             assets,
             key=lambda item: item.get("updated_at") or item.get("created_at") or "",
             reverse=True,
-        )[: args.limit]
+        )[:limit]
     ]
     recent_candidates = [
         {
@@ -929,7 +947,7 @@ def _handle_status(args: argparse.Namespace) -> int:
             candidates,
             key=lambda item: item.get("updated_at") or item.get("created_at") or "",
             reverse=True,
-        )[: args.limit]
+        )[:limit]
     ]
     recent_activations = [
         {
@@ -939,15 +957,15 @@ def _handle_status(args: argparse.Namespace) -> int:
             "help_signal": activation.get("feedback", {}).get("help_signal"),
             "created_at": activation.get("created_at"),
         }
-        for activation in activations[: args.limit]
+        for activation in activations[:limit]
     ]
     local_milvus = milvus_backend_summary(
         default_milvus_db_path(workspace),
-        deep_check=args.deep_retrieval_check,
+        deep_check=deep_retrieval_check,
     )
     shared_milvus = milvus_backend_summary(
         shared_milvus_db_path(),
-        deep_check=args.deep_retrieval_check,
+        deep_check=deep_retrieval_check,
     )
     milvus_indexed_entities = local_milvus.get("indexed_entities")
     possible_stale_entities = (
@@ -961,7 +979,7 @@ def _handle_status(args: argparse.Namespace) -> int:
         else None
     )
 
-    payload = {
+    return {
         "workspace": str(workspace),
         "generated_at": now_utc(),
         "backend_configuration": resolve_backend_config(),
@@ -1004,12 +1022,142 @@ def _handle_status(args: argparse.Namespace) -> int:
         "candidate_review_queue": {
             "candidate_count": review_queue["candidate_count"],
             "status_summary": review_queue["status_summary"],
-            "top_items": review_queue["items"][: args.limit],
+            "top_items": review_queue["items"][:limit],
         },
         "recent_assets": recent_assets,
         "recent_candidates": recent_candidates,
         "recent_activations": recent_activations,
     }
+
+
+def _diagnostic_check(name: str, status: str, summary: str, recommendation: str | None = None) -> dict[str, Any]:
+    payload = {
+        "name": name,
+        "status": status,
+        "summary": summary,
+    }
+    if recommendation:
+        payload["recommendation"] = recommendation
+    return payload
+
+
+def _build_doctor_payload(*, workspace: Path, limit: int, deep_retrieval_check: bool) -> dict[str, Any]:
+    status_payload = _build_status_payload(
+        workspace=workspace,
+        limit=limit,
+        deep_retrieval_check=deep_retrieval_check,
+    )
+    memory_root = memory_root_for_workspace(workspace)
+    local_milvus_path = default_milvus_db_path(workspace)
+    shared_milvus_path = shared_milvus_db_path()
+    local_lock = milvus_lock_summary(local_milvus_path)
+    shared_lock = milvus_lock_summary(shared_milvus_path)
+
+    checks: list[dict[str, Any]] = []
+    counts = status_payload["counts"]
+    sqlite_backend = status_payload["retrieval_backends"]["sqlite"]
+    milvus_backend = status_payload["retrieval_backends"]["milvus"]
+    feedback = status_payload["activation_feedback_summary"]
+    queue = status_payload["candidate_review_queue"]
+    asset_health = status_payload["asset_effectiveness_summary"]["review_status"]
+
+    checks.append(
+        _diagnostic_check(
+            "sqlite_index",
+            "pass" if sqlite_backend["db_exists"] else "fail",
+            f"SQLite index has {sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, and {sqlite_backend['activation_log_rows']} activation logs.",
+            None if sqlite_backend["db_exists"] else "Run any expcap command with --workspace to initialize the local index.",
+        )
+    )
+    checks.append(
+        _diagnostic_check(
+            "candidate_review_queue",
+            "pass" if queue["candidate_count"] == 0 else "warn",
+            f"Candidate review queue has {queue['candidate_count']} pending items.",
+            None if queue["candidate_count"] == 0 else "Run expcap review-candidates and approve, reject, or promote the top items.",
+        )
+    )
+    checks.append(
+        _diagnostic_check(
+            "asset_review_health",
+            "pass" if asset_health.get("needs_review", 0) == 0 else "warn",
+            f"Asset review status: healthy={asset_health.get('healthy', 0)}, watch={asset_health.get('watch', 0)}, needs_review={asset_health.get('needs_review', 0)}, unproven={asset_health.get('unproven', 0)}.",
+            None if asset_health.get("needs_review", 0) == 0 else "Review needs_review assets before allowing them to dominate activation.",
+        )
+    )
+    missing = int(feedback.get("missing", 0) or 0)
+    pending = int(feedback.get("pending", 0) or 0)
+    checks.append(
+        _diagnostic_check(
+            "activation_feedback",
+            "pass" if missing == 0 else "warn",
+            f"Activation feedback: strong={feedback.get('supported_strong', 0)}, weak={feedback.get('supported_weak', 0)}, pending={pending}, stale_missing={missing}.",
+            None if missing == 0 else "Finish or annotate older unresolved activations so help-rate metrics stay meaningful.",
+        )
+    )
+
+    local_milvus = milvus_backend["local"]
+    local_milvus_status = "pass" if local_milvus["status"] == "ready" else "warn"
+    checks.append(
+        _diagnostic_check(
+            "local_milvus",
+            local_milvus_status,
+            f"Local Milvus Lite is {local_milvus['status']} ({local_milvus.get('degraded_reason') or 'no degraded reason'}).",
+            None
+            if local_milvus_status == "pass"
+            else "If it remains locked, stop the stale process or switch retrieval to a shared/cloud Milvus backend.",
+        )
+    )
+    if local_lock["locked"]:
+        checks.append(
+            _diagnostic_check(
+                "local_milvus_lock",
+                "warn",
+                f"Local Milvus lock is held at {local_lock['lock_path']} with metadata: {local_lock['metadata_raw'] or 'empty'}.",
+                "Do not delete the lock while a live process owns it. If pid_exists is false, a future reset command can safely remove it.",
+            )
+        )
+
+    severity_order = {"fail": 2, "warn": 1, "pass": 0}
+    overall_status = "pass"
+    if any(check["status"] == "fail" for check in checks):
+        overall_status = "fail"
+    elif any(check["status"] == "warn" for check in checks):
+        overall_status = "warn"
+
+    recommendations = [
+        check["recommendation"]
+        for check in checks
+        if check.get("recommendation")
+    ]
+    recommendations = list(dict.fromkeys(recommendations))
+
+    return {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "overall_status": overall_status,
+        "checks": sorted(checks, key=lambda item: severity_order[item["status"]], reverse=True),
+        "recommendations": recommendations,
+        "milvus_locks": {
+            "local": local_lock,
+            "shared": shared_lock,
+        },
+        "status": status_payload,
+        "memory_root": str(memory_root),
+        "local_milvus_db": str(local_milvus_path),
+        "shared_milvus_db": str(shared_milvus_path),
+        "counts": counts,
+    }
+
+
+def _handle_status(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    memory_root = memory_root_for_workspace(workspace)
+    payload = _build_status_payload(
+        workspace=workspace,
+        limit=args.limit,
+        deep_retrieval_check=args.deep_retrieval_check,
+    )
     output_path = (
         Path(args.output)
         if args.output
@@ -1017,6 +1165,24 @@ def _handle_status(args: argparse.Namespace) -> int:
     )
     save_json(output_path, payload)
     _print_json({"saved_to": str(output_path), "status": payload})
+    return 0
+
+
+def _handle_doctor(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    memory_root = memory_root_for_workspace(workspace)
+    payload = _build_doctor_payload(
+        workspace=workspace,
+        limit=args.limit,
+        deep_retrieval_check=args.deep_retrieval_check,
+    )
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root / "reviews" / "doctor.json"
+    )
+    save_json(output_path, payload)
+    _print_json({"saved_to": str(output_path), "doctor": payload})
     return 0
 
 
@@ -1048,6 +1214,8 @@ def main() -> int:
         return _handle_review_candidates(args)
     if args.command == "status":
         return _handle_status(args)
+    if args.command == "doctor":
+        return _handle_doctor(args)
 
     parser.error(f"unknown command: {args.command}")
     return 2

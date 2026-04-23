@@ -310,6 +310,58 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["activation_feedback_summary"]["missing"], 0)
             self.assertEqual(payload["activation_feedback_summary"]["pending_hours"], 24.0)
 
+    def test_cli_doctor_reports_workspace_health_and_recommendations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "inspect current logging quality",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "doctor",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            doctor = payload["doctor"]
+            check_names = {item["name"] for item in doctor["checks"]}
+            self.assertEqual(
+                Path(payload["saved_to"]).resolve(),
+                (workspace / ".agent-memory" / "reviews" / "doctor.json").resolve(),
+            )
+            self.assertIn(doctor["overall_status"], {"pass", "warn", "fail"})
+            self.assertIn("sqlite_index", check_names)
+            self.assertIn("activation_feedback", check_names)
+            self.assertIn("local_milvus", check_names)
+            self.assertIn("milvus_locks", doctor)
+            self.assertEqual(doctor["status"]["activation_feedback_summary"]["pending"], 1)
+
     def test_cli_auto_finish_records_activation_help_feedback_for_later_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"

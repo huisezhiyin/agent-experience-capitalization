@@ -154,6 +154,12 @@ Use `status` for short-cycle evaluation:
 expcap status --workspace "$PWD"
 ```
 
+Use `doctor` when you need actionable diagnostics:
+
+```bash
+expcap doctor --workspace "$PWD"
+```
+
 Watch these fields:
 
 - `activation_feedback_summary`: helped, pending, or stale missing feedback.
@@ -164,6 +170,7 @@ Watch these fields:
 
 Milvus Lite is intentionally optional. If it is locked or unavailable, the
 runtime should degrade to JSON/SQLite instead of blocking the workflow.
+`doctor` also reports Milvus lock metadata and safe recovery recommendations.
 
 ## Documentation
 

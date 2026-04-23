@@ -145,6 +145,12 @@ export EXPCAP_SHARED_ASSET_STORE_URI=s3://bucket/expcap/shared
 expcap status --workspace "$PWD"
 ```
 
+需要可执行诊断时使用 `doctor`：
+
+```bash
+expcap doctor --workspace "$PWD"
+```
+
 重点观察：
 
 - `activation_feedback_summary`：经验是否帮忙、是否 pending、是否 stale missing。
@@ -153,7 +159,7 @@ expcap status --workspace "$PWD"
 - `retrieval_backends`：SQLite 与 Milvus 是否可用。
 - `backend_configuration`：当前是本地模式还是共享模式。
 
-Milvus Lite 是可选层。如果它被锁住或不可用，runtime 应该降级到 JSON/SQLite，而不是阻塞工作流。
+Milvus Lite 是可选层。如果它被锁住或不可用，runtime 应该降级到 JSON/SQLite，而不是阻塞工作流。`doctor` 也会报告 Milvus lock 元数据和安全恢复建议。
 
 ## 文档
 

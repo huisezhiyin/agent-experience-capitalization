@@ -3,12 +3,27 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![Status](https://img.shields.io/badge/status-pre--1.0-orange.svg)](GOVERNANCE.md)
+[![Codex Skill](https://img.shields.io/badge/Codex%20Skill-ready-brightgreen.svg)](skills/expcap/SKILL.md)
 
 面向 coding agent 的项目级记忆层。
 
 `expcap` 把有效的 agent 工作沉淀成可复用的工程资产。这些资产属于项目和团队，而不是某个用户、某台机器或某个模型账号。
 
 语言：[English](README.md) | [简体中文](README.zh-CN.md)
+
+## 用 Codex 一键启用
+
+现成 Codex skill：[`skills/expcap/SKILL.md`](skills/expcap/SKILL.md)。
+
+一条命令完成本地接入：
+
+```bash
+git clone <repo-url>
+cd agent-experience-capitalization
+scripts/codex-skill-quickstart
+```
+
+它会把 skill 安装到 `~/.codex/skills/expcap`，安装带 Milvus Lite 的 runtime，接入当前项目，并运行 `doctor` 让你立刻确认是否可用。
 
 ## 为什么
 
@@ -34,6 +49,8 @@
 - 提供共享对象存储、云端状态索引和托管向量检索的后端契约。
 
 ## 安装
+
+Codex 用户优先使用上面的一键接入。手动安装：
 
 ```bash
 git clone <repo-url>

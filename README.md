@@ -3,6 +3,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![Status](https://img.shields.io/badge/status-pre--1.0-orange.svg)](GOVERNANCE.md)
+[![Codex Skill](https://img.shields.io/badge/Codex%20Skill-ready-brightgreen.svg)](skills/expcap/SKILL.md)
 
 Project-owned memory for coding agents.
 
@@ -10,6 +11,22 @@ Project-owned memory for coding agents.
 the project, not to one person, one machine, or one model account.
 
 Language: [English](README.md) | [Chinese](README.zh-CN.md)
+
+## Use With Codex
+
+Ready-to-use Codex skill: [`skills/expcap/SKILL.md`](skills/expcap/SKILL.md).
+
+One-command local setup:
+
+```bash
+git clone <repo-url>
+cd agent-experience-capitalization
+scripts/codex-skill-quickstart
+```
+
+This installs the skill into `~/.codex/skills/expcap`, installs the runtime with
+Milvus Lite support, enables the current project, and runs `doctor` so you can
+verify the setup immediately.
 
 ## Why
 
@@ -39,6 +56,8 @@ It is designed for:
   hosted vector search.
 
 ## Install
+
+Use the one-command setup above for Codex. Manual setup:
 
 ```bash
 git clone <repo-url>

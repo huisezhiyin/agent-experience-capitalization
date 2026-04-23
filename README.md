@@ -140,18 +140,26 @@ Storage profiles:
   backends.
 - `hybrid`: shared source/retrieval with a local cache and SQLite state index.
 
-Default local profile:
+Recommended default for agent workflows:
+
+```bash
+export EXPCAP_STORAGE_PROFILE=user-cache
+export EXPCAP_HOME="$HOME/.expcap"
+```
+
+This keeps runtime data out of the project directory while preserving
+project-owned asset identity.
+
+Explicit local profile:
 
 - JSON files are the source of truth.
 - SQLite stores state, indexes, review decisions, and activation logs.
 - Milvus Lite can be used as an optional semantic retrieval layer.
 
-Move local runtime data out of the project:
+To force project-local storage:
 
 ```bash
-export EXPCAP_STORAGE_PROFILE=user-cache
-export EXPCAP_HOME="$HOME/.expcap"
-export EXPCAP_PROJECT_ID=github:org/repo
+export EXPCAP_STORAGE_PROFILE=local
 ```
 
 Shared mode uses the same asset contract:

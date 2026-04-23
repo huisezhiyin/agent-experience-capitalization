@@ -12,6 +12,15 @@
 
 ## 默认规则
 
+默认使用集中数据中心，而不是把运行数据写入项目目录：
+
+```bash
+export EXPCAP_STORAGE_PROFILE=user-cache
+export EXPCAP_HOME="$HOME/.expcap"
+```
+
+项目仍然拥有经验资产；只是 trace、episode、candidate、asset、SQLite、Milvus Lite 等运行数据默认存放到 `EXPCAP_HOME/projects/...`。
+
 ### 1. 任务开始前默认先做 get
 
 在开始实质性分析、改代码、跑命令之前：
@@ -19,10 +28,10 @@
 - 先根据用户当前任务描述，调用：
 
 ```bash
-scripts/expcap auto-start --task "<当前任务摘要>" --workspace "$PWD"
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" scripts/expcap auto-start --task "<当前任务摘要>" --workspace "$PWD"
 ```
 
-- 读取 `.agent-memory/views/` 下最新的 `activation_view`
+- 读取命令输出中的 `activation_view` 或 `saved_to` 指向的 view 文件
 - 如果存在命中经验，在正式工作前向用户用 1-3 句话简短说明：
   - 激活了什么经验
   - 为什么命中
@@ -70,16 +79,16 @@ scripts/expcap auto-start --task "<当前任务摘要>" --workspace "$PWD"
 
 ## 当前运行时入口
 
-优先使用本地包装器：
+优先使用集中存储模式运行本地包装器：
 
 ```bash
-scripts/expcap <subcommand> ...
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" scripts/expcap <subcommand> ...
 ```
 
 或使用安装后的 CLI：
 
 ```bash
-expcap <subcommand> ...
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap <subcommand> ...
 ```
 
 ## 当前阶段定位

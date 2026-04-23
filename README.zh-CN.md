@@ -129,18 +129,25 @@ Storage profile：
 - `shared`：正文真源、状态索引和召回都预期使用共享后端。
 - `hybrid`：共享正文/召回，加本地缓存和 SQLite 状态索引。
 
-默认本地 profile：
+Agent 工作流推荐默认：
+
+```bash
+export EXPCAP_STORAGE_PROFILE=user-cache
+export EXPCAP_HOME="$HOME/.expcap"
+```
+
+这样运行数据不会落在项目目录，同时仍保留 project-owned asset identity。
+
+显式 local profile：
 
 - JSON 文件是正文真源。
 - SQLite 存储状态、索引、审核结果和 activation log。
 - Milvus Lite 可作为可选语义召回层。
 
-把本地运行数据移出项目目录：
+如果需要强制写回项目目录：
 
 ```bash
-export EXPCAP_STORAGE_PROFILE=user-cache
-export EXPCAP_HOME="$HOME/.expcap"
-export EXPCAP_PROJECT_ID=github:org/repo
+export EXPCAP_STORAGE_PROFILE=local
 ```
 
 共享模式使用同一套 asset contract：

@@ -19,6 +19,7 @@ def _sidecar_content(workspace: Path) -> str:
 - 不替换原有 `AGENTS.md`
 - 只为当前项目补充经验 `get/save` 规则
 - 让 Codex 在这个项目中默认把 `expcap` 当作辅助能力使用
+- 默认把运行数据写入 `EXPCAP_HOME` 集中数据中心，而不是项目目录
 
 ## 核心定位
 
@@ -31,7 +32,7 @@ def _sidecar_content(workspace: Path) -> str:
 在开始实质性分析、改代码、跑命令之前，优先执行：
 
 ```bash
-expcap auto-start --task "<当前任务摘要>" --workspace "{workspace_path}"
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap auto-start --task "<当前任务摘要>" --workspace "{workspace_path}"
 ```
 
 如果命中经验，优先把命中结果作为当前执行策略的一部分。
@@ -41,13 +42,13 @@ expcap auto-start --task "<当前任务摘要>" --workspace "{workspace_path}"
 当任务完成一轮收敛，或形成了稳定 lesson / pattern / anti-pattern 后，优先执行：
 
 ```bash
-expcap auto-finish --workspace "{workspace_path}" --task "<当前任务摘要>" ...
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap auto-finish --workspace "{workspace_path}" --task "<当前任务摘要>" ...
 ```
 
 如果经验高置信且明显可复用，再继续：
 
 ```bash
-expcap promote --candidate "{workspace_path}/.agent-memory/candidates/<candidate_id>.json"
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap promote --candidate "<auto-finish 输出的 candidate path>"
 ```
 
 ### 3. 作用域策略
@@ -68,8 +69,9 @@ expcap promote --candidate "{workspace_path}/.agent-memory/candidates/<candidate
 ## 说明
 
 - `expcap` 是全局 skill + 本地 runtime 能力
-- 当前项目经验默认落在 `.agent-memory/`，该目录应加入 `.gitignore`
-- 正文真源是 JSON 文件，`.agent-memory/index.sqlite3` 是索引层
+- 当前项目经验默认落在 `EXPCAP_HOME/projects/...`
+- `.agent-memory/` 仅作为显式 `EXPCAP_STORAGE_PROFILE=local` 的兼容目录
+- 正文真源是 JSON 文件，SQLite 是索引层
 """
 
 
@@ -79,8 +81,8 @@ def _managed_block(sidecar_name: str = "AGENTS.expcap.md") -> str:
 
 - 本项目额外启用经验资本化工作流，详细规则见 `{sidecar_name}`
 - 不替换本项目原有 agent 约束，只补充经验 `get/save` 行为
-- 任务开始前优先执行 `expcap auto-start`
-- 任务收敛后优先执行 `expcap auto-finish`
+- 任务开始前优先执行集中存储模式的 `expcap auto-start`
+- 任务收敛后优先执行集中存储模式的 `expcap auto-finish`
 - 高置信经验再继续 `promote`
 
 {EXPCAP_BLOCK_END}"""

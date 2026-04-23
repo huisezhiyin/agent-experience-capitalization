@@ -30,7 +30,7 @@
 - 将完成的工作转成 `trace -> episode -> candidate -> asset`。
 - 记录被激活的经验是否真的帮到了任务。
 - 维护 candidate review queue 和 asset 健康状态。
-- 支持本地 JSON/SQLite，以及可选 Milvus Lite 语义召回。
+- Milvus 是核心语义召回层；SQLite 只是轻量状态索引和降级层。
 - 提供共享对象存储、云端状态索引和托管向量检索的后端契约。
 
 ## 安装
@@ -44,7 +44,7 @@ python3 -m venv .venv
 scripts/expcap --help
 ```
 
-可选启用 Milvus Lite：
+安装 Milvus Lite，以启用核心语义召回路径：
 
 ```bash
 .venv/bin/pip install -e ".[milvus]"
@@ -141,8 +141,8 @@ export EXPCAP_HOME="$HOME/.expcap"
 显式 local profile：
 
 - JSON 文件是正文真源。
-- SQLite 存储状态、索引、审核结果和 activation log。
-- Milvus Lite 可作为可选语义召回层。
+- Milvus Lite 是本地核心语义召回层。
+- SQLite 存储轻量状态、审核结果、activation log 和降级用 metadata index。
 
 如果需要强制写回项目目录：
 
@@ -187,10 +187,10 @@ expcap doctor --workspace "$PWD"
 - `activation_feedback_summary`：经验是否帮忙、是否 pending、是否 stale missing。
 - `candidate_review_queue`：是否有需要人工审核的候选。
 - `asset_effectiveness_summary`：资产热度和健康状态。
-- `retrieval_backends`：SQLite 与 Milvus 是否可用。
+- `retrieval_backends`：Milvus 核心召回是否可用，以及 SQLite 轻量索引是否健康。
 - `backend_configuration`：当前是本地模式还是共享模式。
 
-Milvus Lite 是可选层。如果它被锁住或不可用，runtime 应该降级到 JSON/SQLite，而不是阻塞工作流。`doctor` 也会报告 Milvus lock 元数据和安全恢复建议。
+Milvus 是核心召回能力。如果 Milvus Lite 被锁住或不可用，runtime 应该降级到 JSON/SQLite 以保证工作不中断，但 `doctor` 必须清楚暴露该降级，因为召回质量会下降。`doctor` 也会报告 Milvus lock 元数据和安全恢复建议。
 
 ## 文档
 

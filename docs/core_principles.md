@@ -42,7 +42,10 @@ Short name: **TEAM memory** — **Transferable Engineering Asset Memory**.
 
 The storage backend is replaceable, but the asset contract is not.
 
-- Solo/local mode can use `.agent-memory/`, SQLite, and Milvus Lite.
+- Milvus is the core semantic retrieval capability. SQLite is a lightweight
+  state index, review log, activation log, and fallback layer.
+- Solo/local mode can use `.agent-memory/`, SQLite, and Milvus Lite, but
+  Milvus Lite should still be treated as the primary retrieval path.
 - Project ownership does not require project-directory storage. A project can
   own assets whose source of truth lives in a user cache or shared backend.
 - Team mode should support shared asset stores, shared state indexes, and shared

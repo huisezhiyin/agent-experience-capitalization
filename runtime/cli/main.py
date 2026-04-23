@@ -880,6 +880,7 @@ def _build_status_payload(*, workspace: Path, limit: int, deep_retrieval_check: 
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
     ensure_db(db_path)
+    backend_config = resolve_backend_config()
 
     assets = list_assets(db_path, workspace=str(workspace))
     candidates = list_candidates(
@@ -983,11 +984,13 @@ def _build_status_payload(*, workspace: Path, limit: int, deep_retrieval_check: 
     return {
         "workspace": str(workspace),
         "generated_at": now_utc(),
-        "backend_configuration": resolve_backend_config(),
+        "backend_configuration": backend_config,
         "storage_layout": storage_layout_for_workspace(workspace),
         "retrieval_backends": {
             "sqlite": {
                 "backend": "sqlite",
+                "role": "lightweight-state-index",
+                "core_retrieval": False,
                 "available": True,
                 "db_path": str(db_path),
                 "db_exists": db_path.exists(),
@@ -996,6 +999,8 @@ def _build_status_payload(*, workspace: Path, limit: int, deep_retrieval_check: 
                 "activation_log_rows": len(activations),
             },
             "milvus": {
+                "role": "core-semantic-retrieval",
+                "core_retrieval": backend_config["retrieval"] in {"milvus-lite", "milvus"},
                 "available": milvus_available(),
                 "local": local_milvus,
                 "shared": shared_milvus,

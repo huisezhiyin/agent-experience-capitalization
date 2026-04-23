@@ -122,6 +122,12 @@ def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, ob
         "state_index": state_index,
         "retrieval": retrieval,
         "sharing": sharing,
+        "state_index_role": "lightweight-state-index" if state_index == "sqlite" else "shared-state-index",
+        "retrieval_role": (
+            "core-semantic-retrieval"
+            if retrieval in {"milvus-lite", "milvus"}
+            else "lightweight-metadata-retrieval"
+        ),
         "cloud_enabled": cloud_enabled,
         "local_mode": local_mode,
         "shareable_enabled": shareable_enabled,

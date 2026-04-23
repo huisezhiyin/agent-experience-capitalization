@@ -976,9 +976,9 @@ def _build_activation_why_selected(
     if constraints:
         why_selected.append("显式约束被纳入激活说明")
     if retrieval["used_sqlite_index"]:
-        why_selected.append("已优先使用 SQLite 索引检索，再回退文件层")
+        why_selected.append("SQLite 作为轻量状态索引参与过滤、日志与降级召回")
     if retrieval["vector_project_assets"] or retrieval["vector_shared_assets"]:
-        why_selected.append("Milvus Lite 语义召回已作为候选层参与排序")
+        why_selected.append("Milvus 语义召回作为核心候选层参与排序")
     if retrieval["used_candidate_fallback"]:
         why_selected.append("未找到 active asset，已回退到 candidate 经验层")
     return why_selected

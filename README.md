@@ -33,7 +33,8 @@ It is designed for:
 - Converts completed work into `trace -> episode -> candidate -> asset`.
 - Tracks whether activated experience actually helped.
 - Maintains candidate review queues and asset health signals.
-- Supports local JSON/SQLite storage and optional Milvus Lite retrieval.
+- Uses Milvus as the core semantic retrieval layer; SQLite remains a lightweight
+  state index and fallback.
 - Exposes a backend contract for shared object stores, cloud state indexes, and
   hosted vector search.
 
@@ -48,7 +49,7 @@ python3 -m venv .venv
 scripts/expcap --help
 ```
 
-Optional Milvus Lite support:
+Install Milvus Lite support for the core semantic retrieval path:
 
 ```bash
 .venv/bin/pip install -e ".[milvus]"
@@ -153,8 +154,9 @@ project-owned asset identity.
 Explicit local profile:
 
 - JSON files are the source of truth.
-- SQLite stores state, indexes, review decisions, and activation logs.
-- Milvus Lite can be used as an optional semantic retrieval layer.
+- Milvus Lite is the local core semantic retrieval layer.
+- SQLite stores lightweight state, review decisions, activation logs, and
+  fallback metadata indexes.
 
 To force project-local storage:
 
@@ -201,12 +203,15 @@ Watch these fields:
 - `activation_feedback_summary`: helped, pending, or stale missing feedback.
 - `candidate_review_queue`: candidates that need human review.
 - `asset_effectiveness_summary`: asset temperature and review health.
-- `retrieval_backends`: SQLite and Milvus readiness.
+- `retrieval_backends`: Milvus core retrieval readiness and SQLite lightweight
+  index health.
 - `backend_configuration`: active local/shareable backend profile.
 
-Milvus Lite is intentionally optional. If it is locked or unavailable, the
-runtime should degrade to JSON/SQLite instead of blocking the workflow.
-`doctor` also reports Milvus lock metadata and safe recovery recommendations.
+Milvus is the core retrieval capability. If Milvus Lite is locked or
+unavailable, the runtime should degrade to JSON/SQLite so work can continue, but
+`doctor` should surface the degradation clearly because retrieval quality is
+reduced. `doctor` also reports Milvus lock metadata and safe recovery
+recommendations.
 
 ## Documentation
 

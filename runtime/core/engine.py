@@ -658,6 +658,14 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
         score += 0.08
         evidence_bonus += 0.08
         evidence.append(f"内容命中关键词：{', '.join(content_hits[:3])}")
+    distinctive_hits = _unique_preserve_order(
+        [token for token in [*title_hits, *content_hits] if len(token) >= 6]
+    )
+    if distinctive_hits:
+        distinctive_bonus = min(0.18 * len(distinctive_hits), 0.72)
+        score += distinctive_bonus
+        evidence_bonus += distinctive_bonus
+        evidence.append(f"特征关键词命中：{', '.join(distinctive_hits[:3])}")
     if asset.get("status") == "active":
         score += 0.05
         evidence_bonus += 0.05
@@ -943,7 +951,7 @@ def _select_activation_assets(
                 "source_provenance": provenance,
                 "llm_use_guidance": _llm_use_guidance(asset, details, provenance),
                 "vector_score": round(float(asset.get("vector_score", 0.0)), 4),
-                "match_evidence": details["evidence"][:5],
+                "match_evidence": details["evidence"][:8],
                 "risk_flags": details["risk_flags"][:5],
             }
         )

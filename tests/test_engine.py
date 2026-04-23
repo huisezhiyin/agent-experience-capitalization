@@ -515,6 +515,77 @@ class EngineTests(unittest.TestCase):
             self.assertGreater(broad_item["score_breakdown"]["penalty_score"], 0)
             self.assertTrue(any("作用域较宽" in item for item in broad_item["risk_flags"]))
 
+    def test_activate_assets_prioritizes_distinctive_keyword_match_over_hot_generic_asset(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_dir = workspace / ".agent-memory" / "assets" / "patterns"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            generic_asset = assets_dir / "pattern_hot_generic_001.json"
+            generic_asset.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_hot_generic_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "general expcap review workflow",
+                        "content": "review status metrics and keep feedback healthy.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.75,
+                        "status": "active",
+                        "historical_help": {
+                            "activation_count": 10,
+                            "supported_count": 10,
+                            "supported_strong_count": 10,
+                            "supported_weak_count": 0,
+                            "weighted_support_score": 10.0,
+                            "support_ratio": 1.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            exact_asset = assets_dir / "pattern_exact_sentinel_001.json"
+            exact_asset.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_exact_sentinel_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "EXPCAP_E2E_SENTINEL centralized save get workflow",
+                        "content": "EXPCAP_E2E_SENTINEL verifies centralized storage save get logging.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.75,
+                        "status": "active",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            activation = activate_assets(
+                task="EXPCAP_E2E_SENTINEL centralized save get workflow",
+                workspace=workspace,
+                constraints=[],
+                assets_dir=workspace / ".agent-memory" / "assets",
+                candidates_dir=candidates_dir,
+                db_path=None,
+            )
+
+            self.assertEqual(activation["selected_assets"][0]["asset_id"], "pattern_exact_sentinel_001")
+            self.assertTrue(
+                any("特征关键词命中" in item for item in activation["selected_assets"][0]["match_evidence"])
+            )
+
     def test_explain_activation_view_mentions_top_evidence_and_risk(self) -> None:
         explained = explain_object(
             {

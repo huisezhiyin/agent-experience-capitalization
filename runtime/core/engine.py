@@ -749,6 +749,66 @@ def _tag_retrieval_source(assets: list[dict[str, Any]], source: str) -> None:
         asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), source])
 
 
+def _source_provenance(asset: dict[str, Any], workspace: str) -> dict[str, Any]:
+    source_workspace = asset.get("source_workspace") or asset.get("workspace")
+    same_project = _same_workspace_path(source_workspace, workspace)
+    retrieval_sources = _unique_preserve_order(asset.get("retrieval_sources", []))
+    knowledge_scope = asset.get("knowledge_scope", "project")
+
+    if "candidate-fallback" in retrieval_sources:
+        source_kind = "candidate_fallback"
+    elif same_project:
+        source_kind = "current_project"
+    elif knowledge_scope == "cross-project":
+        source_kind = "cross_project"
+    else:
+        source_kind = "project_asset"
+
+    return {
+        "source_kind": source_kind,
+        "knowledge_scope": knowledge_scope,
+        "source_workspace": source_workspace,
+        "same_project": same_project,
+        "storage_sources": retrieval_sources,
+        "source_episode_ids": asset.get("source_episode_ids", []),
+        "source_candidate_ids": asset.get("source_candidate_ids", []),
+        "data_source_confirmed": bool(retrieval_sources or source_workspace or asset.get("source_episode_ids")),
+    }
+
+
+def _llm_use_guidance(asset: dict[str, Any], details: dict[str, Any], provenance: dict[str, Any]) -> dict[str, Any]:
+    risk_flags = details.get("risk_flags", [])
+    review_status = details.get("effectiveness_summary", {}).get("review_status", "unproven")
+    temperature = details.get("effectiveness_summary", {}).get("temperature", "neutral")
+    evidence_count = len(details.get("evidence", []))
+
+    if review_status == "needs_review" or temperature == "cool":
+        suggested_action = "verify_before_use"
+    elif provenance["source_kind"] == "current_project" and not risk_flags:
+        suggested_action = "prefer_if_relevant"
+    elif provenance["source_kind"] == "cross_project":
+        suggested_action = "use_as_reference"
+    else:
+        suggested_action = "consider_with_context"
+
+    checks = [
+        "Use only if the current task, codebase, and constraints match the source evidence.",
+        "Ignore this asset if its source project, scope, or risks do not fit the current context.",
+    ]
+    if provenance["source_kind"] == "cross_project":
+        checks.append("Treat cross-project experience as inspiration, not a project rule.")
+    if risk_flags:
+        checks.append("Review risk_flags before applying the recommendation.")
+    if evidence_count <= 2:
+        checks.append("Evidence is thin; prefer local code inspection over this memory if they disagree.")
+
+    return {
+        "decision_owner": "llm",
+        "suggested_action": suggested_action,
+        "checks": _unique_preserve_order(checks),
+    }
+
+
 def _retrieve_activation_assets(
     *,
     workspace: Path,
@@ -847,6 +907,8 @@ def _rerank_activation_assets(
 
 def _select_activation_assets(
     scored_assets: list[tuple[float, dict[str, Any], dict[str, Any]]],
+    *,
+    workspace_str: str,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     selected: list[dict[str, Any]] = []
     selection_risks = _unique_preserve_order(
@@ -858,6 +920,7 @@ def _select_activation_assets(
     )
 
     for score, asset, details in scored_assets[:5]:
+        provenance = _source_provenance(asset, workspace_str)
         selected.append(
             {
                 "asset_id": asset["asset_id"],
@@ -865,7 +928,7 @@ def _select_activation_assets(
                 "knowledge_scope": asset.get("knowledge_scope", "project"),
                 "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
                 "title": asset["title"],
-                "reason": f"匹配分数 {score:.2f}，{details['evidence'][0] if details['evidence'] else '与当前任务相关'}。",
+                "reason": f"候选来源已确认，匹配分数 {score:.2f}；是否采用应由模型结合当前上下文判断。",
                 "match_score": round(score, 2),
                 "score_breakdown": {
                     "base_score": round(details["base_score"], 2),
@@ -877,6 +940,8 @@ def _select_activation_assets(
                 "temperature": details["effectiveness_summary"]["temperature"],
                 "review_status": details["effectiveness_summary"]["review_status"],
                 "retrieval_sources": asset.get("retrieval_sources", []),
+                "source_provenance": provenance,
+                "llm_use_guidance": _llm_use_guidance(asset, details, provenance),
                 "vector_score": round(float(asset.get("vector_score", 0.0)), 4),
                 "match_evidence": details["evidence"][:5],
                 "risk_flags": details["risk_flags"][:5],
@@ -894,9 +959,11 @@ def _build_activation_why_selected(
 ) -> list[str]:
     why_selected = [
         f"scope 命中 {scope['level']}::{scope['value']}",
+        "召回结果作为带来源候选提供，最终是否采用由 LLM 基于当前上下文判断",
+        "排序只表示候选优先级，不代表必须使用",
+        "每条候选都携带 source_provenance、match_evidence 与 risk_flags",
+        "宽 scope、低证据、低置信命中会被显式降权，但不会替代 LLM 判断",
         "先召回项目内资产，再补跨项目资产，最后按证据与相关性混排",
-        "按 scope、knowledge_kind、confidence、status 联合排序",
-        "宽 scope、低证据、低置信命中会被显式降权",
     ]
     if constraints:
         why_selected.append("显式约束被纳入激活说明")
@@ -967,7 +1034,7 @@ def activate_assets(
         assets=retrieval["assets"],
         db_path=db_path,
     )
-    selected, selection_risks = _select_activation_assets(scored_assets)
+    selected, selection_risks = _select_activation_assets(scored_assets, workspace_str=workspace_str)
     rendered_context, fallback_episode_refs = _assemble_activation_context(scored_assets, constraints=constraints)
 
     return {

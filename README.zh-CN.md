@@ -26,6 +26,7 @@
 ## 能做什么
 
 - 在任务开始时激活相关项目经验。
+- 返回带来源的候选经验，让 LLM 自行判断是否适用。
 - 将完成的工作转成 `trace -> episode -> candidate -> asset`。
 - 记录被激活的经验是否真的帮到了任务。
 - 维护 candidate review queue 和 asset 健康状态。
@@ -105,6 +106,9 @@ expcap auto-finish --task "your task" --workspace "$PWD" --verification-status p
 - `asset`：晋升后的项目或团队记忆资产。
 - `activation`：未来任务中被选中的资产。
 - `feedback`：activation 是否真的帮到了任务。
+
+Activation view 会包含 `source_provenance`、`match_evidence`、`risk_flags`
+和 `llm_use_guidance`。召回层负责提供带来源的候选，coding agent 仍需结合当前任务判断是否采用。
 
 资产带有作用域和生命周期字段：
 

@@ -289,9 +289,14 @@ class EngineTests(unittest.TestCase):
             self.assertIn("score_breakdown", activation["selected_assets"][0])
             self.assertIn("effectiveness_summary", activation["selected_assets"][0])
             self.assertIn("retrieval_sources", activation["selected_assets"][0])
+            self.assertIn("source_provenance", activation["selected_assets"][0])
+            self.assertIn("llm_use_guidance", activation["selected_assets"][0])
+            self.assertEqual(activation["selected_assets"][0]["llm_use_guidance"]["decision_owner"], "llm")
+            self.assertTrue(activation["selected_assets"][0]["source_provenance"]["data_source_confirmed"])
             self.assertIn("retrieval_summary", activation)
             self.assertEqual(activation["pipeline"]["kind"], "experience_rag_activation")
             self.assertEqual(activation["pipeline"]["stages"], ["retrieve", "rerank", "assemble"])
+            self.assertTrue(any("最终是否采用由 LLM" in item for item in activation["why_selected"]))
             self.assertTrue(any("跨项目经验" in item for item in activation["selection_risks"]))
 
     def test_build_asset_effectiveness_summary_marks_needs_review_for_cold_assets(self) -> None:

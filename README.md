@@ -29,6 +29,7 @@ It is designed for:
 ## What It Does
 
 - Activates relevant project experience at the start of a task.
+- Returns sourced candidates so the LLM can decide whether each asset applies.
 - Converts completed work into `trace -> episode -> candidate -> asset`.
 - Tracks whether activated experience actually helped.
 - Maintains candidate review queues and asset health signals.
@@ -112,6 +113,10 @@ expcap auto-finish --task "your task" --workspace "$PWD" --verification-status p
 - `asset`: promoted project/team memory.
 - `activation`: selected assets injected into a future task.
 - `feedback`: whether activation helped.
+
+Activation views include `source_provenance`, `match_evidence`, `risk_flags`,
+and `llm_use_guidance`. Retrieval provides sourced candidates; the coding agent
+is still responsible for deciding whether an asset fits the current task.
 
 Assets carry scope and lifecycle metadata:
 

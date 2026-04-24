@@ -20,6 +20,10 @@ from runtime.core.engine import (
     should_promote_candidate,
 )
 from runtime.core.project_install import install_project_agents
+from runtime.core.project_policy import (
+    DEFAULT_PROJECT_STATUS,
+    load_project_policy,
+)
 from runtime.storage.fs_store import (
     default_activation_view_path,
     default_db_path,
@@ -64,6 +68,7 @@ from runtime.storage.sqlite_store import (
 ALL_CANDIDATE_STATUSES = ("new", "needs_review", "approved", "rejected", "promoted")
 DEFAULT_REVIEW_QUEUE_STATUSES = ("needs_review", "approved", "new")
 DEFAULT_FEEDBACK_PENDING_HOURS = 24.0
+STALE_FEEDBACK_HELP_SIGNAL = "unclear"
 
 
 def _feedback_pending_hours() -> float:
@@ -117,6 +122,53 @@ def _summarize_activation_feedback(activations: list[dict[str, Any]]) -> dict[st
                 feedback_summary["missing"] += 1
     feedback_summary["pending_hours"] = pending_hours
     return feedback_summary
+
+
+def _update_activation_view_file(workspace: Path, activation: dict[str, Any]) -> None:
+    activation_view_path = memory_root_for_workspace(workspace) / "views" / f"{activation['activation_id']}.json"
+    if activation_view_path.exists():
+        save_json(activation_view_path, activation)
+
+
+def _auto_resolve_stale_activation_feedback(
+    *,
+    workspace: Path,
+    db_path: Path,
+) -> dict[str, Any]:
+    summary = {
+        "auto_resolved_count": 0,
+        "auto_resolved_activation_ids": [],
+        "resolution_help_signal": STALE_FEEDBACK_HELP_SIGNAL,
+        "pending_hours": _feedback_pending_hours(),
+    }
+    activations = list_activation_logs(db_path, workspace=str(workspace))
+    if not activations:
+        return summary
+
+    feedback_at = now_utc()
+    now = datetime.now(timezone.utc)
+    for activation in activations:
+        if activation.get("feedback", {}).get("help_signal"):
+            continue
+        if _is_pending_feedback(activation, now=now, pending_hours=summary["pending_hours"]):
+            continue
+        updated_activation = record_activation_feedback(
+            db_path,
+            activation_id=activation["activation_id"],
+            feedback={
+                "help_signal": STALE_FEEDBACK_HELP_SIGNAL,
+                "signal_source": "auto_cleanup_stale",
+                "feedback_summary": "Auto-closed after feedback window expired without explicit review.",
+                "feedback_at": feedback_at,
+                "resolution": "stale_timeout",
+            },
+        )
+        if not updated_activation:
+            continue
+        _update_activation_view_file(workspace, updated_activation)
+        summary["auto_resolved_count"] += 1
+        summary["auto_resolved_activation_ids"].append(updated_activation["activation_id"])
+    return summary
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -208,6 +260,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--include-claude",
         action="store_true",
         help="Also append an expcap block to CLAUDE.md for Claude Code users.",
+    )
+    install_project.add_argument(
+        "--project-status",
+        choices=["active", "inactive"],
+        default=DEFAULT_PROJECT_STATUS,
+        help="Whether this workspace should auto-start expcap by default. Defaults to active.",
     )
 
     sync_milvus = subparsers.add_parser(
@@ -513,8 +571,23 @@ def _handle_ingest(args: argparse.Namespace) -> int:
 
 def _handle_auto_start(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
+    project_activity = load_project_policy(workspace)
+    if not project_activity["auto_start_enabled"]:
+        _print_json(
+            {
+                "skipped": True,
+                "reason": "project_inactive",
+                "workspace": str(workspace),
+                "project_activity": project_activity,
+            }
+        )
+        return 0
     db_path = default_db_path(workspace)
     ensure_db(db_path)
+    feedback_cleanup = _auto_resolve_stale_activation_feedback(
+        workspace=workspace,
+        db_path=db_path,
+    )
     view = activate_assets(
         task=args.task,
         workspace=workspace,
@@ -536,6 +609,8 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
             "saved_to": str(output_path),
             "activation_id": view["activation_id"],
             "selected_count": len(view.get("selected_assets", [])),
+            "project_activity": project_activity,
+            "feedback_cleanup": feedback_cleanup,
             "activation_view": view,
         }
     )
@@ -557,7 +632,11 @@ def _handle_review(args: argparse.Namespace) -> int:
 
 
 def _handle_install_project(args: argparse.Namespace) -> int:
-    result = install_project_agents(Path(args.workspace), include_claude=args.include_claude)
+    result = install_project_agents(
+        Path(args.workspace),
+        include_claude=args.include_claude,
+        project_status=args.project_status,
+    )
     _print_json(result)
     return 0
 
@@ -567,6 +646,10 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
     ensure_db(db_path)
+    feedback_cleanup = _auto_resolve_stale_activation_feedback(
+        workspace=workspace,
+        db_path=db_path,
+    )
 
     trace = build_trace_bundle(
         workspace=workspace,
@@ -620,9 +703,8 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             activation_id=latest_activation["activation_id"],
             feedback=feedback,
         )
-        activation_view_path = memory_root / "views" / f"{latest_activation['activation_id']}.json"
-        if updated_activation and activation_view_path.exists():
-            save_json(activation_view_path, updated_activation)
+        if updated_activation:
+            _update_activation_view_file(workspace, updated_activation)
         if updated_activation:
             linked_asset_ids = updated_activation.get("selected_asset_ids") or [
                 item["asset_id"]
@@ -725,6 +807,7 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             "candidates": saved_candidates,
             "promoted_assets": promoted_assets,
             "activation_feedback": activation_feedback,
+            "feedback_cleanup": feedback_cleanup,
             "auto_promote_enabled": not args.no_promote,
             "promote_threshold": args.promote_threshold,
         }
@@ -876,11 +959,18 @@ def _handle_review_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_status_payload(*, workspace: Path, limit: int, deep_retrieval_check: bool) -> dict[str, Any]:
+def _build_status_payload(
+    *,
+    workspace: Path,
+    limit: int,
+    deep_retrieval_check: bool,
+    feedback_cleanup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
     ensure_db(db_path)
     backend_config = resolve_backend_config()
+    project_activity = load_project_policy(workspace)
 
     assets = list_assets(db_path, workspace=str(workspace))
     candidates = list_candidates(
@@ -985,6 +1075,14 @@ def _build_status_payload(*, workspace: Path, limit: int, deep_retrieval_check: 
         "workspace": str(workspace),
         "generated_at": now_utc(),
         "backend_configuration": backend_config,
+        "project_activity": project_activity,
+        "feedback_cleanup": feedback_cleanup
+        or {
+            "auto_resolved_count": 0,
+            "auto_resolved_activation_ids": [],
+            "resolution_help_signal": STALE_FEEDBACK_HELP_SIGNAL,
+            "pending_hours": _feedback_pending_hours(),
+        },
         "storage_layout": storage_layout_for_workspace(workspace),
         "retrieval_backends": {
             "sqlite": {
@@ -1048,11 +1146,18 @@ def _diagnostic_check(name: str, status: str, summary: str, recommendation: str 
     return payload
 
 
-def _build_doctor_payload(*, workspace: Path, limit: int, deep_retrieval_check: bool) -> dict[str, Any]:
+def _build_doctor_payload(
+    *,
+    workspace: Path,
+    limit: int,
+    deep_retrieval_check: bool,
+    feedback_cleanup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     status_payload = _build_status_payload(
         workspace=workspace,
         limit=limit,
         deep_retrieval_check=deep_retrieval_check,
+        feedback_cleanup=feedback_cleanup,
     )
     memory_root = memory_root_for_workspace(workspace)
     local_milvus_path = default_milvus_db_path(workspace)
@@ -1160,10 +1265,17 @@ def _build_doctor_payload(*, workspace: Path, limit: int, deep_retrieval_check: 
 def _handle_status(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     memory_root = memory_root_for_workspace(workspace)
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    feedback_cleanup = _auto_resolve_stale_activation_feedback(
+        workspace=workspace,
+        db_path=db_path,
+    )
     payload = _build_status_payload(
         workspace=workspace,
         limit=args.limit,
         deep_retrieval_check=args.deep_retrieval_check,
+        feedback_cleanup=feedback_cleanup,
     )
     output_path = (
         Path(args.output)
@@ -1178,10 +1290,17 @@ def _handle_status(args: argparse.Namespace) -> int:
 def _handle_doctor(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     memory_root = memory_root_for_workspace(workspace)
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    feedback_cleanup = _auto_resolve_stale_activation_feedback(
+        workspace=workspace,
+        db_path=db_path,
+    )
     payload = _build_doctor_payload(
         workspace=workspace,
         limit=args.limit,
         deep_retrieval_check=args.deep_retrieval_check,
+        feedback_cleanup=feedback_cleanup,
     )
     output_path = (
         Path(args.output)

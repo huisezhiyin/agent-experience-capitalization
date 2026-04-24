@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,12 +18,16 @@ class InstallProjectTests(unittest.TestCase):
 
             agents_text = agents_path.read_text(encoding="utf-8")
             sidecar_text = (workspace / "AGENTS.expcap.md").read_text(encoding="utf-8")
+            policy_text = json.loads((workspace / ".expcap-project.json").read_text(encoding="utf-8"))
             gitignore_text = (workspace / ".gitignore").read_text(encoding="utf-8")
 
             self.assertIn("原有规则。", agents_text)
             self.assertIn("<!-- EXPCAP START -->", agents_text)
             self.assertIn("AGENTS.expcap.md", agents_text)
+            self.assertIn("只有 `active` 项目默认自动执行 `auto-start`", sidecar_text)
             self.assertIn("默认先做 get", sidecar_text)
+            self.assertEqual(policy_text["project_status"], "active")
+            self.assertEqual(result["project_status"], "active")
             self.assertIn(".agent-memory/", gitignore_text)
             self.assertEqual(result["created_agents"], False)
             self.assertEqual(result["updated_agents"], True)
@@ -39,12 +44,16 @@ class InstallProjectTests(unittest.TestCase):
             install_project_agents(workspace)
             once = agents_path.read_text(encoding="utf-8")
             gitignore_once = (workspace / ".gitignore").read_text(encoding="utf-8")
+            policy_once = (workspace / ".expcap-project.json").read_text(encoding="utf-8")
             install_project_agents(workspace)
             twice = agents_path.read_text(encoding="utf-8")
             gitignore_twice = (workspace / ".gitignore").read_text(encoding="utf-8")
+            policy_twice = (workspace / ".expcap-project.json").read_text(encoding="utf-8")
 
             self.assertEqual(once, twice)
             self.assertEqual(gitignore_once, gitignore_twice)
+            self.assertEqual(json.loads(policy_once)["project_status"], "active")
+            self.assertEqual(json.loads(policy_twice)["project_status"], "active")
             self.assertEqual(once.count("<!-- EXPCAP START -->"), 1)
             self.assertEqual(gitignore_once.count(".agent-memory/"), 1)
 
@@ -87,6 +96,20 @@ class InstallProjectTests(unittest.TestCase):
 
             install_project_agents(workspace, include_claude=True)
             self.assertEqual(claude_path.read_text(encoding="utf-8").count("<!-- EXPCAP START -->"), 1)
+
+    def test_install_project_can_mark_workspace_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            result = install_project_agents(workspace, project_status="inactive")
+
+            sidecar_text = (workspace / "AGENTS.expcap.md").read_text(encoding="utf-8")
+            policy_text = json.loads((workspace / ".expcap-project.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["project_status"], "inactive")
+            self.assertEqual(policy_text["project_status"], "inactive")
+            self.assertIn("当前项目状态：`inactive`", sidecar_text)
 
 
 if __name__ == "__main__":

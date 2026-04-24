@@ -14,6 +14,8 @@ Environment:
   EXPCAP_INCLUDE_CLAUDE=0  Skip CLAUDE.md integration.
   EXPCAP_INSTALL_CODEX_SKILL=0
                             Skip installing the Codex skill entrypoint.
+  EXPCAP_PROJECT_STATUS=inactive
+                            Mark the target workspace as inactive so auto-start stays off by default.
   EXPCAP_WITH_MILVUS=1     Install Milvus Lite extras and sync indexes.
 
 This bootstraps expcap for a project by installing the local CLI package and
@@ -43,6 +45,7 @@ if [[ "${EXPCAP_INSTALL_CODEX_SKILL:-1}" != "0" ]]; then
 fi
 
 INSTALL_ARGS=(install-project --workspace "$WORKSPACE")
+INSTALL_ARGS+=(--project-status "${EXPCAP_PROJECT_STATUS:-active}")
 if [[ "${EXPCAP_INCLUDE_CLAUDE:-1}" != "0" ]]; then
   INSTALL_ARGS+=(--include-claude)
 fi

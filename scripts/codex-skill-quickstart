@@ -20,6 +20,7 @@ One-command setup for Codex users:
 Environment:
   EXPCAP_HOME                 Defaults to $HOME/.expcap.
   EXPCAP_STORAGE_PROFILE      Defaults to user-cache.
+  EXPCAP_PROJECT_STATUS       Defaults to active. Use inactive to install without auto-start.
   EXPCAP_INCLUDE_CLAUDE=1     Also add CLAUDE.md instructions.
   EXPCAP_SKIP_MILVUS_SYNC=1   Skip Milvus index sync.
 USAGE
@@ -39,7 +40,7 @@ fi
 
 scripts/install-codex-skill
 
-INSTALL_ARGS=(install-project --workspace "$TARGET_WORKSPACE")
+INSTALL_ARGS=(install-project --workspace "$TARGET_WORKSPACE" --project-status "${EXPCAP_PROJECT_STATUS:-active}")
 if [[ "${EXPCAP_INCLUDE_CLAUDE:-0}" == "1" ]]; then
   INSTALL_ARGS+=(--include-claude)
 fi

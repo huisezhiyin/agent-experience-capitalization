@@ -313,6 +313,107 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["activation_feedback_summary"]["pending"], 1)
             self.assertEqual(payload["activation_feedback_summary"]["missing"], 0)
             self.assertEqual(payload["activation_feedback_summary"]["pending_hours"], 24.0)
+            self.assertEqual(payload["feedback_cleanup"]["auto_resolved_count"], 0)
+
+    def test_cli_status_auto_resolves_stale_unresolved_activation_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            asset_path = workspace / ".agent-memory" / "assets" / "patterns" / "pattern_stale_001.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_stale_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "stale feedback support pattern",
+                        "content": "support explicit stale feedback cleanup testing.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": ["ep_stale_001"],
+                        "source_candidate_ids": ["cand_stale_001"],
+                        "confidence": 0.82,
+                        "status": "active",
+                        "last_used_at": None,
+                        "created_at": "2026-04-13T00:00:00+00:00",
+                        "updated_at": "2026-04-13T00:00:00+00:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            started = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "inspect stale feedback cleanup",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            activation_id = json.loads(started.stdout)["activation_id"]
+            db_path = workspace / ".agent-memory" / "index.sqlite3"
+
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM activation_logs WHERE activation_id = ?",
+                    (activation_id,),
+                ).fetchone()
+                payload = json.loads(row[0])
+                payload["created_at"] = "2026-04-10T00:00:00+00:00"
+                conn.execute(
+                    "UPDATE activation_logs SET created_at = ?, payload_json = ? WHERE activation_id = ?",
+                    (
+                        payload["created_at"],
+                        json.dumps(payload, ensure_ascii=False),
+                        activation_id,
+                    ),
+                )
+
+            activation_path = workspace / ".agent-memory" / "views" / f"{activation_id}.json"
+            activation_view = json.loads(activation_path.read_text(encoding="utf-8"))
+            activation_view["created_at"] = "2026-04-10T00:00:00+00:00"
+            activation_path.write_text(
+                json.dumps(activation_view, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["status"]
+            self.assertEqual(payload["feedback_cleanup"]["auto_resolved_count"], 1)
+            self.assertEqual(payload["activation_feedback_summary"]["unclear"], 1)
+            self.assertEqual(payload["activation_feedback_summary"]["missing_total"], 0)
+            self.assertEqual(payload["activation_feedback_summary"]["pending"], 0)
+            self.assertEqual(payload["recent_activations"][0]["help_signal"], "unclear")
 
     def test_cli_doctor_reports_workspace_health_and_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -365,6 +466,70 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("local_milvus", check_names)
             self.assertIn("milvus_locks", doctor)
             self.assertEqual(doctor["status"]["activation_feedback_summary"]["pending"], 1)
+            self.assertIn("project_activity", doctor["status"])
+
+    def test_cli_auto_start_skips_inactive_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "install-project",
+                    "--workspace",
+                    str(workspace),
+                    "--project-status",
+                    "inactive",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            started = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "should skip inactive workspace",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(started.stdout)
+
+            self.assertTrue(payload["skipped"])
+            self.assertEqual(payload["reason"], "project_inactive")
+            self.assertEqual(payload["project_activity"]["project_status"], "inactive")
+
+            status = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            status_payload = json.loads(status.stdout)["status"]
+            self.assertEqual(status_payload["project_activity"]["project_status"], "inactive")
+            self.assertFalse(status_payload["project_activity"]["auto_start_enabled"])
+            self.assertEqual(status_payload["counts"]["activation_logs"], 0)
 
     def test_cli_auto_finish_records_activation_help_feedback_for_later_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

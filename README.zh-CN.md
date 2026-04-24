@@ -25,6 +25,10 @@ scripts/codex-skill-quickstart
 
 它会把 skill 安装到 `~/.codex/skills/expcap`，安装带 Milvus Lite 的 runtime，接入当前项目，并运行 `doctor` 让你立刻确认是否可用。
 
+默认会把接入的项目标记为 `active`，也就是 agent 工作流会自动执行
+`expcap auto-start`。如果项目已经休眠、归档或只是偶尔查看，可以用
+`EXPCAP_PROJECT_STATUS=inactive` 接入，这样仍保留 skill 和存储契约，但默认不自动启动。
+
 ## 为什么
 
 个人记忆解决的是“一个 agent 记住一个用户”。团队需要的是另一种东西：能跟随代码库流转的工程经验。
@@ -134,6 +138,15 @@ expcap auto-finish --task "your task" --workspace "$PWD" --verification-status p
 
 如果需要手动调试，底层流程仍然可用：`ingest -> review -> extract -> promote -> activate`。
 
+活跃项目控制：
+
+```bash
+scripts/expcap install-project --workspace /path/to/project --project-status active
+scripts/expcap install-project --workspace /path/to/project --project-status inactive
+```
+
+只有 `active` 项目会默认自动执行 `auto-start`。`inactive` 项目会保留项目记忆配置，但不会默认自动启动，直到重新激活。
+
 ## 核心概念
 
 - `trace`：原始任务证据。
@@ -221,9 +234,11 @@ expcap doctor --workspace "$PWD"
 重点观察：
 
 - `activation_feedback_summary`：经验是否帮忙、是否 pending、是否 stale missing。
+- `feedback_cleanup`：过期未处理 activation 是否已被自动收敛为 `unclear`，避免指标长期失真。
 - `candidate_review_queue`：是否有需要人工审核的候选。
 - `asset_effectiveness_summary`：资产热度和健康状态。
 - `retrieval_backends`：Milvus 核心召回是否可用，以及 SQLite 轻量索引是否健康。
+- `project_activity`：当前项目是 `active` 还是 `inactive`，是否默认自动启动。
 - `backend_configuration`：当前是本地模式还是共享模式。
 
 Milvus 是核心召回能力。如果 Milvus Lite 被锁住或不可用，runtime 应该降级到 JSON/SQLite 以保证工作不中断，但 `doctor` 必须清楚暴露该降级，因为召回质量会下降。`doctor` 也会报告 Milvus lock 元数据和安全恢复建议。

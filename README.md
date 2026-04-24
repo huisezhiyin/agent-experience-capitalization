@@ -28,6 +28,11 @@ This installs the skill into `~/.codex/skills/expcap`, installs the runtime with
 Milvus Lite support, enables the current project, and runs `doctor` so you can
 verify the setup immediately.
 
+By default the installed project is marked `active`, which means agent
+workflows will auto-run `expcap auto-start`. For dormant or archived projects,
+install with `EXPCAP_PROJECT_STATUS=inactive` so the project keeps the skill and
+storage contract but does not auto-start by default.
+
 ## Why
 
 Personal memory helps one agent remember one user. Teams need something
@@ -146,6 +151,16 @@ expcap auto-finish --task "your task" --workspace "$PWD" --verification-status p
 For manual debugging, the lower-level pipeline is still available:
 `ingest -> review -> extract -> promote -> activate`.
 
+Active-project control:
+
+```bash
+scripts/expcap install-project --workspace /path/to/project --project-status active
+scripts/expcap install-project --workspace /path/to/project --project-status inactive
+```
+
+Only `active` projects auto-run `auto-start`. `inactive` projects keep the
+project memory configuration but skip automatic startup until reactivated.
+
 ## Core Concepts
 
 - `trace`: raw task evidence.
@@ -241,10 +256,14 @@ expcap doctor --workspace "$PWD"
 Watch these fields:
 
 - `activation_feedback_summary`: helped, pending, or stale missing feedback.
+- `feedback_cleanup`: stale unresolved activations that were auto-closed as
+  `unclear` so metrics stay usable.
 - `candidate_review_queue`: candidates that need human review.
 - `asset_effectiveness_summary`: asset temperature and review health.
 - `retrieval_backends`: Milvus core retrieval readiness and SQLite lightweight
   index health.
+- `project_activity`: whether the workspace is `active` or `inactive` for
+  default auto-start behavior.
 - `backend_configuration`: active local/shareable backend profile.
 
 Milvus is the core retrieval capability. If Milvus Lite is locked or

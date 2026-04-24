@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from runtime.core.project_policy import DEFAULT_PROJECT_STATUS, write_project_policy
+
 
 EXPCAP_BLOCK_START = "<!-- EXPCAP START -->"
 EXPCAP_BLOCK_END = "<!-- EXPCAP END -->"
 EXPCAP_GITIGNORE_ENTRY = ".agent-memory/"
 
 
-def _sidecar_content(workspace: Path) -> str:
+def _sidecar_content(workspace: Path, *, project_status: str) -> str:
     workspace_path = str(workspace.resolve())
     return f"""# AGENTS.expcap.md
 
@@ -27,9 +29,21 @@ def _sidecar_content(workspace: Path) -> str:
 
 ## 默认行为
 
+### 0. 项目活跃状态
+
+- 当前项目状态：`{project_status}`
+- 只有 `active` 项目默认自动执行 `auto-start`
+- 如果项目暂停维护、只读或已归档，改成 `inactive` 后就不再默认自动启动
+- 需要切换状态时，可重新执行：
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap install-project --workspace "{workspace_path}" --project-status active
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap install-project --workspace "{workspace_path}" --project-status inactive
+```
+
 ### 1. 任务开始前默认先做 get
 
-在开始实质性分析、改代码、跑命令之前，优先执行：
+当项目状态为 `active` 时，在开始实质性分析、改代码、跑命令之前，优先执行：
 
 ```bash
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap auto-start --task "<当前任务摘要>" --workspace "{workspace_path}"
@@ -82,7 +96,7 @@ def _managed_block(sidecar_name: str = "AGENTS.expcap.md") -> str:
 
 - 本项目额外启用经验资本化工作流，详细规则见 `{sidecar_name}`
 - 不替换本项目原有 agent 约束，只补充经验 `get/save` 行为
-- 任务开始前优先执行集中存储模式的 `expcap auto-start`
+- 仅 active 项目在任务开始前优先执行集中存储模式的 `expcap auto-start`
 - 任务收敛后优先执行集中存储模式的 `expcap auto-finish`
 - 高置信经验再继续 `promote`
 
@@ -138,10 +152,16 @@ def _ensure_gitignore_entry(workspace: Path) -> tuple[Path, bool, bool]:
     return gitignore_path, False, True
 
 
-def install_project_agents(workspace: Path, *, include_claude: bool = False) -> dict[str, str | bool]:
+def install_project_agents(
+    workspace: Path,
+    *,
+    include_claude: bool = False,
+    project_status: str = DEFAULT_PROJECT_STATUS,
+) -> dict[str, str | bool]:
     workspace = workspace.resolve()
     sidecar_path = workspace / "AGENTS.expcap.md"
-    sidecar_path.write_text(_sidecar_content(workspace), encoding="utf-8")
+    policy_path = write_project_policy(workspace, project_status=project_status)
+    sidecar_path.write_text(_sidecar_content(workspace, project_status=project_status), encoding="utf-8")
     gitignore_path, created_gitignore, updated_gitignore = _ensure_gitignore_entry(workspace)
 
     agents_path = workspace / "AGENTS.md"
@@ -167,6 +187,8 @@ def install_project_agents(workspace: Path, *, include_claude: bool = False) -> 
         "workspace": str(workspace),
         "agents_path": str(agents_path),
         "sidecar_path": str(sidecar_path),
+        "policy_path": str(policy_path),
+        "project_status": project_status,
         "gitignore_path": str(gitignore_path),
         "claude_path": str(claude_path) if include_claude else "",
         "created_agents": created_agents,

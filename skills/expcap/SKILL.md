@@ -27,8 +27,8 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap"
 - SQLite is a lightweight state index, activation log, and fallback path.
 - Activation returns sourced candidates; the current agent decides whether each
   asset applies to the task.
-- Only `active` projects should auto-run `expcap auto-start`; dormant projects
-  can stay installed but marked `inactive`.
+- New chat should still run `expcap auto-start` even for projects marked
+  `inactive`; the label is mainly for reporting and coverage analysis.
 
 ## When To Use
 
@@ -78,8 +78,8 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap install-pro
 ## Operating Rules
 
 - Run `auto-start` before substantive analysis, edits, or verification.
-- Skip default `auto-start` when the project is marked `inactive`; that keeps
-  dormant repositories from generating noisy activation logs.
+- Treat `active / inactive` as a reporting label. If a new chat starts in the
+  project, `auto-start` should still run by default.
 - If experience is activated, summarize what matched, why it matched, and how
   it affects the current strategy.
 - Run `auto-finish` after a coherent task is complete or a stable lesson has
@@ -107,7 +107,7 @@ Watch these status fields:
 - `retrieval_backends`: Milvus core retrieval readiness and SQLite lightweight
   index health.
 - `project_activity`: whether the current workspace is active for default
-  auto-start behavior.
+  reporting and coverage analysis.
 - `backend_configuration`: active `local`, `user-cache`, `shared`, or `hybrid`
   profile.
 

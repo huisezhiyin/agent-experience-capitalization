@@ -468,7 +468,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(doctor["status"]["activation_feedback_summary"]["pending"], 1)
             self.assertIn("project_activity", doctor["status"])
 
-    def test_cli_auto_start_skips_inactive_project(self) -> None:
+    def test_cli_auto_start_still_runs_for_inactive_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"
             workspace.mkdir(parents=True, exist_ok=True)
@@ -499,7 +499,7 @@ class CliFlowTests(unittest.TestCase):
                     "--workspace",
                     str(workspace),
                     "--task",
-                    "should skip inactive workspace",
+                    "inactive workspace still activates on new chat",
                 ],
                 cwd=REPO_ROOT,
                 check=True,
@@ -508,9 +508,9 @@ class CliFlowTests(unittest.TestCase):
             )
             payload = json.loads(started.stdout)
 
-            self.assertTrue(payload["skipped"])
-            self.assertEqual(payload["reason"], "project_inactive")
             self.assertEqual(payload["project_activity"]["project_status"], "inactive")
+            self.assertEqual(payload["project_activity"]["auto_start_mode"], "always_on_new_chat")
+            self.assertEqual(payload["selected_count"], 0)
 
             status = subprocess.run(
                 [
@@ -528,8 +528,9 @@ class CliFlowTests(unittest.TestCase):
             )
             status_payload = json.loads(status.stdout)["status"]
             self.assertEqual(status_payload["project_activity"]["project_status"], "inactive")
-            self.assertFalse(status_payload["project_activity"]["auto_start_enabled"])
-            self.assertEqual(status_payload["counts"]["activation_logs"], 0)
+            self.assertTrue(status_payload["project_activity"]["auto_start_enabled"])
+            self.assertEqual(status_payload["project_activity"]["auto_start_mode"], "always_on_new_chat")
+            self.assertEqual(status_payload["counts"]["activation_logs"], 1)
 
     def test_cli_auto_finish_records_activation_help_feedback_for_later_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

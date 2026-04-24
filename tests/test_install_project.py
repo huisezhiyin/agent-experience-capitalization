@@ -24,7 +24,7 @@ class InstallProjectTests(unittest.TestCase):
             self.assertIn("原有规则。", agents_text)
             self.assertIn("<!-- EXPCAP START -->", agents_text)
             self.assertIn("AGENTS.expcap.md", agents_text)
-            self.assertIn("只有 `active` 项目默认自动执行 `auto-start`", sidecar_text)
+            self.assertIn("只要这个项目里真的开了新 chat，默认仍然会执行 `auto-start`", sidecar_text)
             self.assertIn("默认先做 get", sidecar_text)
             self.assertEqual(policy_text["project_status"], "active")
             self.assertEqual(result["project_status"], "active")
@@ -110,6 +110,7 @@ class InstallProjectTests(unittest.TestCase):
             self.assertEqual(result["project_status"], "inactive")
             self.assertEqual(policy_text["project_status"], "inactive")
             self.assertIn("当前项目状态：`inactive`", sidecar_text)
+            self.assertIn("不用于阻断新 chat 激活", sidecar_text)
 
 
 if __name__ == "__main__":

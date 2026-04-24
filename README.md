@@ -29,9 +29,10 @@ Milvus Lite support, enables the current project, and runs `doctor` so you can
 verify the setup immediately.
 
 By default the installed project is marked `active`, which means agent
-workflows will auto-run `expcap auto-start`. For dormant or archived projects,
-install with `EXPCAP_PROJECT_STATUS=inactive` so the project keeps the skill and
-storage contract but does not auto-start by default.
+workflows treat it as an active project in reporting. For dormant or archived
+projects, install with `EXPCAP_PROJECT_STATUS=inactive` so the project keeps the
+skill and storage contract but is counted separately in reporting and coverage
+analysis.
 
 ## Why
 
@@ -158,8 +159,9 @@ scripts/expcap install-project --workspace /path/to/project --project-status act
 scripts/expcap install-project --workspace /path/to/project --project-status inactive
 ```
 
-Only `active` projects auto-run `auto-start`. `inactive` projects keep the
-project memory configuration but skip automatic startup until reactivated.
+New chat still runs `auto-start` in both cases. `active` and `inactive` are
+reporting labels so coverage and daily review can focus on genuinely active
+projects instead of every installed repository.
 
 ## Core Concepts
 
@@ -263,7 +265,7 @@ Watch these fields:
 - `retrieval_backends`: Milvus core retrieval readiness and SQLite lightweight
   index health.
 - `project_activity`: whether the workspace is `active` or `inactive` for
-  default auto-start behavior.
+  reporting and coverage analysis.
 - `backend_configuration`: active local/shareable backend profile.
 
 Milvus is the core retrieval capability. If Milvus Lite is locked or

@@ -15,7 +15,7 @@ Environment:
   EXPCAP_INSTALL_CODEX_SKILL=0
                             Skip installing the Codex skill entrypoint.
   EXPCAP_PROJECT_STATUS=inactive
-                            Mark the target workspace as inactive so auto-start stays off by default.
+                            Mark the target workspace as inactive for reporting while keeping new-chat auto-start.
   EXPCAP_WITH_MILVUS=1     Install Milvus Lite extras and sync indexes.
 
 This bootstraps expcap for a project by installing the local CLI package and

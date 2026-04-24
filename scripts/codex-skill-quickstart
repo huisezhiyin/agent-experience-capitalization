@@ -20,7 +20,7 @@ One-command setup for Codex users:
 Environment:
   EXPCAP_HOME                 Defaults to $HOME/.expcap.
   EXPCAP_STORAGE_PROFILE      Defaults to user-cache.
-  EXPCAP_PROJECT_STATUS       Defaults to active. Use inactive to install without auto-start.
+  EXPCAP_PROJECT_STATUS       Defaults to active. Use inactive to keep reporting separate for dormant projects.
   EXPCAP_INCLUDE_CLAUDE=1     Also add CLAUDE.md instructions.
   EXPCAP_SKIP_MILVUS_SYNC=1   Skip Milvus index sync.
 USAGE

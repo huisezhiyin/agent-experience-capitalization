@@ -26,8 +26,8 @@ scripts/codex-skill-quickstart
 它会把 skill 安装到 `~/.codex/skills/expcap`，安装带 Milvus Lite 的 runtime，接入当前项目，并运行 `doctor` 让你立刻确认是否可用。
 
 默认会把接入的项目标记为 `active`，也就是 agent 工作流会自动执行
-`expcap auto-start`。如果项目已经休眠、归档或只是偶尔查看，可以用
-`EXPCAP_PROJECT_STATUS=inactive` 接入，这样仍保留 skill 和存储契约，但默认不自动启动。
+`expcap auto-start` 的默认口径会把它当作活跃项目统计。如果项目已经休眠、归档或只是偶尔查看，可以用
+`EXPCAP_PROJECT_STATUS=inactive` 接入，这样仍保留 skill 和存储契约，但会在报表和覆盖率分析里单独归类。
 
 ## 为什么
 
@@ -145,7 +145,7 @@ scripts/expcap install-project --workspace /path/to/project --project-status act
 scripts/expcap install-project --workspace /path/to/project --project-status inactive
 ```
 
-只有 `active` 项目会默认自动执行 `auto-start`。`inactive` 项目会保留项目记忆配置，但不会默认自动启动，直到重新激活。
+两种状态下，只要真的开了新 chat，仍然都会执行 `auto-start`。`active / inactive` 更主要是统计标签，让日报和覆盖率分析聚焦真正活跃的项目，而不是所有已接入仓库。
 
 ## 核心概念
 
@@ -238,7 +238,7 @@ expcap doctor --workspace "$PWD"
 - `candidate_review_queue`：是否有需要人工审核的候选。
 - `asset_effectiveness_summary`：资产热度和健康状态。
 - `retrieval_backends`：Milvus 核心召回是否可用，以及 SQLite 轻量索引是否健康。
-- `project_activity`：当前项目是 `active` 还是 `inactive`，是否默认自动启动。
+- `project_activity`：当前项目是 `active` 还是 `inactive`，用于报表和覆盖率口径。
 - `backend_configuration`：当前是本地模式还是共享模式。
 
 Milvus 是核心召回能力。如果 Milvus Lite 被锁住或不可用，runtime 应该降级到 JSON/SQLite 以保证工作不中断，但 `doctor` 必须清楚暴露该降级，因为召回质量会下降。`doctor` 也会报告 Milvus lock 元数据和安全恢复建议。

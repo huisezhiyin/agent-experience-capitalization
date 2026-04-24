@@ -572,16 +572,6 @@ def _handle_ingest(args: argparse.Namespace) -> int:
 def _handle_auto_start(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     project_activity = load_project_policy(workspace)
-    if not project_activity["auto_start_enabled"]:
-        _print_json(
-            {
-                "skipped": True,
-                "reason": "project_inactive",
-                "workspace": str(workspace),
-                "project_activity": project_activity,
-            }
-        )
-        return 0
     db_path = default_db_path(workspace)
     ensure_db(db_path)
     feedback_cleanup = _auto_resolve_stale_activation_feedback(

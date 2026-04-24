@@ -32,8 +32,9 @@ def _sidecar_content(workspace: Path, *, project_status: str) -> str:
 ### 0. 项目活跃状态
 
 - 当前项目状态：`{project_status}`
-- 只有 `active` 项目默认自动执行 `auto-start`
-- 如果项目暂停维护、只读或已归档，改成 `inactive` 后就不再默认自动启动
+- 只要这个项目里真的开了新 chat，默认仍然会执行 `auto-start`
+- `active / inactive` 主要用于统计、审阅和覆盖率口径，不用于阻断新 chat 激活
+- 如果项目暂停维护、只读或已归档，可以标成 `inactive`，这样日报和横向分析时更容易把它和活跃项目区分开
 - 需要切换状态时，可重新执行：
 
 ```bash
@@ -43,7 +44,7 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap install-pro
 
 ### 1. 任务开始前默认先做 get
 
-当项目状态为 `active` 时，在开始实质性分析、改代码、跑命令之前，优先执行：
+在开始实质性分析、改代码、跑命令之前，优先执行：
 
 ```bash
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap auto-start --task "<当前任务摘要>" --workspace "{workspace_path}"
@@ -96,7 +97,7 @@ def _managed_block(sidecar_name: str = "AGENTS.expcap.md") -> str:
 
 - 本项目额外启用经验资本化工作流，详细规则见 `{sidecar_name}`
 - 不替换本项目原有 agent 约束，只补充经验 `get/save` 行为
-- 仅 active 项目在任务开始前优先执行集中存储模式的 `expcap auto-start`
+- 只要进入新 chat，就优先执行集中存储模式的 `expcap auto-start`
 - 任务收敛后优先执行集中存储模式的 `expcap auto-finish`
 - 高置信经验再继续 `promote`
 

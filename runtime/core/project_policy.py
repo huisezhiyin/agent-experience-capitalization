@@ -31,7 +31,7 @@ def load_project_policy(workspace: Path) -> dict[str, Any]:
     policy = {
         "project_status": DEFAULT_PROJECT_STATUS,
         "auto_start_enabled": True,
-        "auto_start_mode": "active_only",
+        "auto_start_mode": "always_on_new_chat",
         "policy_source": "default",
         "policy_path": str(path),
     }
@@ -47,8 +47,8 @@ def load_project_policy(workspace: Path) -> dict[str, Any]:
     policy.update(
         {
             "project_status": project_status,
-            "auto_start_enabled": project_status == "active",
-            "auto_start_mode": "active_only",
+            "auto_start_enabled": True,
+            "auto_start_mode": "always_on_new_chat",
             "updated_at": payload.get("updated_at"),
             "policy_source": "file",
         }
@@ -61,7 +61,7 @@ def write_project_policy(workspace: Path, *, project_status: str = DEFAULT_PROJE
     path = project_policy_path(workspace)
     payload = {
         "project_status": normalize_project_status(project_status),
-        "auto_start_mode": "active_only",
+        "auto_start_mode": "always_on_new_chat",
         "updated_at": _now_utc(),
     }
     path.write_text(

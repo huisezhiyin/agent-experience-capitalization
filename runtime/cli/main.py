@@ -124,6 +124,72 @@ def _summarize_activation_feedback(activations: list[dict[str, Any]]) -> dict[st
     return feedback_summary
 
 
+def _build_unresolved_activation_items(
+    activations: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    pending_hours = _feedback_pending_hours()
+    now = datetime.now(timezone.utc)
+    items: list[dict[str, Any]] = []
+    for activation in activations:
+        help_signal = activation.get("feedback", {}).get("help_signal")
+        if help_signal in {"supported_strong", "supported_weak", "unclear"}:
+            continue
+        created_at = _parse_datetime(activation.get("created_at"))
+        age_hours = None
+        if created_at is not None:
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            age_hours = round((now - created_at).total_seconds() / 3600, 2)
+        state = (
+            "pending"
+            if _is_pending_feedback(activation, now=now, pending_hours=pending_hours)
+            else "missing"
+        )
+        items.append(
+            {
+                "activation_id": activation.get("activation_id"),
+                "task_query": activation.get("task_query"),
+                "state": state,
+                "created_at": activation.get("created_at"),
+                "age_hours": age_hours,
+                "selected_count": len(activation.get("selected_assets", [])),
+            }
+        )
+
+    state_priority = {"missing": 0, "pending": 1}
+    items.sort(
+        key=lambda item: (
+            state_priority.get(str(item.get("state")), 99),
+            -(item.get("age_hours") or 0.0),
+            item.get("created_at") or "",
+        )
+    )
+    return items[:limit]
+
+
+def _build_asset_review_backlog(
+    review_status_summary: dict[str, int],
+    *,
+    total_assets: int,
+) -> dict[str, Any]:
+    unproven_count = int(review_status_summary.get("unproven", 0) or 0)
+    healthy_count = int(review_status_summary.get("healthy", 0) or 0)
+    watch_count = int(review_status_summary.get("watch", 0) or 0)
+    needs_review_count = int(review_status_summary.get("needs_review", 0) or 0)
+    denominator = total_assets if total_assets > 0 else 1
+    return {
+        "total_assets": total_assets,
+        "healthy_count": healthy_count,
+        "watch_count": watch_count,
+        "needs_review_count": needs_review_count,
+        "unproven_count": unproven_count,
+        "healthy_ratio": round(healthy_count / denominator, 4) if total_assets else 0.0,
+        "unproven_ratio": round(unproven_count / denominator, 4) if total_assets else 0.0,
+    }
+
+
 def _update_activation_view_file(workspace: Path, activation: dict[str, Any]) -> None:
     activation_view_path = memory_root_for_workspace(workspace) / "views" / f"{activation['activation_id']}.json"
     if activation_view_path.exists():
@@ -973,6 +1039,7 @@ def _build_status_payload(
     episodes = list(iter_json_objects(memory_root / "episodes"))
 
     feedback_summary = _summarize_activation_feedback(activations)
+    unresolved_activations = _build_unresolved_activation_items(activations, limit=limit)
 
     temperature_summary = {"hot": 0, "warm": 0, "neutral": 0, "cool": 0}
     review_status_summary = {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}
@@ -983,6 +1050,10 @@ def _build_status_payload(
         review_status_summary[asset.get("review_status", "unproven")] = (
             review_status_summary.get(asset.get("review_status", "unproven"), 0) + 1
         )
+    asset_review_backlog = _build_asset_review_backlog(
+        review_status_summary,
+        total_assets=len(assets),
+    )
 
     candidate_status_summary = {status: 0 for status in ALL_CANDIDATE_STATUSES}
     for candidate in candidates:
@@ -1109,10 +1180,12 @@ def _build_status_payload(
             "activation_logs": len(activations),
         },
         "activation_feedback_summary": feedback_summary,
+        "unresolved_activations": unresolved_activations,
         "asset_effectiveness_summary": {
             "temperature": temperature_summary,
             "review_status": review_status_summary,
         },
+        "asset_review_backlog": asset_review_backlog,
         "candidate_status_summary": candidate_status_summary,
         "candidate_review_queue": {
             "candidate_count": review_queue["candidate_count"],
@@ -1160,8 +1233,10 @@ def _build_doctor_payload(
     sqlite_backend = status_payload["retrieval_backends"]["sqlite"]
     milvus_backend = status_payload["retrieval_backends"]["milvus"]
     feedback = status_payload["activation_feedback_summary"]
+    unresolved_activations = status_payload["unresolved_activations"]
     queue = status_payload["candidate_review_queue"]
     asset_health = status_payload["asset_effectiveness_summary"]["review_status"]
+    asset_backlog = status_payload["asset_review_backlog"]
 
     checks.append(
         _diagnostic_check(
@@ -1187,13 +1262,33 @@ def _build_doctor_payload(
             None if asset_health.get("needs_review", 0) == 0 else "Review needs_review assets before allowing them to dominate activation.",
         )
     )
+    unproven_count = int(asset_backlog.get("unproven_count", 0) or 0)
+    unproven_ratio = float(asset_backlog.get("unproven_ratio", 0.0) or 0.0)
+    unproven_warn = unproven_count >= 10 and unproven_ratio >= 0.4
+    checks.append(
+        _diagnostic_check(
+            "asset_proof_coverage",
+            "warn" if unproven_warn else "pass",
+            f"Asset proof coverage: {asset_backlog.get('healthy_count', 0)}/{asset_backlog.get('total_assets', 0)} healthy, {unproven_count} unproven ({unproven_ratio:.0%}).",
+            None
+            if not unproven_warn
+            else "Promote proof for recurring hot assets or prune low-value unproven assets so review coverage stays credible.",
+        )
+    )
     missing = int(feedback.get("missing", 0) or 0)
     pending = int(feedback.get("pending", 0) or 0)
+    oldest_unresolved = unresolved_activations[0] if unresolved_activations else None
+    oldest_unresolved_hint = ""
+    if oldest_unresolved:
+        oldest_unresolved_hint = (
+            f" Oldest unresolved: {oldest_unresolved.get('activation_id')} "
+            f"({oldest_unresolved.get('state')}, age_hours={oldest_unresolved.get('age_hours')})."
+        )
     checks.append(
         _diagnostic_check(
             "activation_feedback",
             "pass" if missing == 0 else "warn",
-            f"Activation feedback: strong={feedback.get('supported_strong', 0)}, weak={feedback.get('supported_weak', 0)}, pending={pending}, stale_missing={missing}.",
+            f"Activation feedback: strong={feedback.get('supported_strong', 0)}, weak={feedback.get('supported_weak', 0)}, pending={pending}, stale_missing={missing}.{oldest_unresolved_hint}",
             None if missing == 0 else "Finish or annotate older unresolved activations so help-rate metrics stay meaningful.",
         )
     )

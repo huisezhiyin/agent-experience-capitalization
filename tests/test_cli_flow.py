@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from runtime.storage.sqlite_store import upsert_asset
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -303,6 +305,7 @@ class CliFlowTests(unittest.TestCase):
                     "3",
                 ],
                 cwd=REPO_ROOT,
+                env={**os.environ, "EXPCAP_STORAGE_PROFILE": "local"},
                 check=True,
                 capture_output=True,
                 text=True,
@@ -314,6 +317,11 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["activation_feedback_summary"]["missing"], 0)
             self.assertEqual(payload["activation_feedback_summary"]["pending_hours"], 24.0)
             self.assertEqual(payload["feedback_cleanup"]["auto_resolved_count"], 0)
+            self.assertEqual(payload["unresolved_activations"][0]["state"], "pending")
+            self.assertEqual(
+                payload["unresolved_activations"][0]["task_query"],
+                "inspect current logging quality",
+            )
 
     def test_cli_status_auto_resolves_stale_unresolved_activation_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -414,6 +422,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["activation_feedback_summary"]["missing_total"], 0)
             self.assertEqual(payload["activation_feedback_summary"]["pending"], 0)
             self.assertEqual(payload["recent_activations"][0]["help_signal"], "unclear")
+            self.assertEqual(payload["unresolved_activations"], [])
 
     def test_cli_doctor_reports_workspace_health_and_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -463,10 +472,66 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn(doctor["overall_status"], {"pass", "warn", "fail"})
             self.assertIn("sqlite_index", check_names)
             self.assertIn("activation_feedback", check_names)
+            self.assertIn("asset_proof_coverage", check_names)
             self.assertIn("local_milvus", check_names)
             self.assertIn("milvus_locks", doctor)
             self.assertEqual(doctor["status"]["activation_feedback_summary"]["pending"], 1)
+            self.assertEqual(doctor["status"]["unresolved_activations"][0]["state"], "pending")
             self.assertIn("project_activity", doctor["status"])
+
+    def test_cli_doctor_warns_when_unproven_assets_dominate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = workspace / ".agent-memory" / "index.sqlite3"
+            for index in range(10):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": f"pattern_unproven_{index:03d}",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": f"unproven pattern {index}",
+                        "content": "newly promoted asset without enough usage feedback yet.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": [f"ep_unproven_{index:03d}"],
+                        "source_candidate_ids": [f"cand_unproven_{index:03d}"],
+                        "confidence": 0.7,
+                        "status": "active",
+                        "review_status": "unproven",
+                        "temperature": "neutral",
+                        "created_at": "2026-04-13T00:00:00+00:00",
+                        "updated_at": "2026-04-13T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "doctor",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            doctor = json.loads(completed.stdout)["doctor"]
+            proof_check = next(
+                item for item in doctor["checks"] if item["name"] == "asset_proof_coverage"
+            )
+            self.assertEqual(proof_check["status"], "warn")
+            self.assertIn("10 unproven", proof_check["summary"])
+            self.assertIn("Promote proof", proof_check["recommendation"])
 
     def test_cli_auto_start_still_runs_for_inactive_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

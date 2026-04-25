@@ -18,7 +18,7 @@ class MilvusStoreLockTests(unittest.TestCase):
         milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_EX)
         return lock_file
 
-    def test_backend_summary_reports_degraded_when_db_is_locked(self) -> None:
+    def test_backend_summary_deep_check_reports_degraded_when_db_is_locked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "milvus.db"
             lock_file = self._hold_lock(db_path)
@@ -28,14 +28,37 @@ class MilvusStoreLockTests(unittest.TestCase):
                     "milvus_runtime_available",
                     return_value=True,
                 ):
-                    summary = milvus_store.milvus_backend_summary(db_path)
+                    summary = milvus_store.milvus_backend_summary(db_path, deep_check=True)
             finally:
                 milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
                 lock_file.close()
 
             self.assertEqual(summary["status"], "degraded")
             self.assertEqual(summary["degraded_reason"], "locked_by_another_process")
-            self.assertIsNone(summary["collection_exists"])
+            self.assertFalse(summary["collection_exists"])
+
+    def test_backend_summary_lightweight_does_not_block_on_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            db_path.touch()
+            lock_file = self._hold_lock(db_path)
+            try:
+                with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                    milvus_store,
+                    "milvus_runtime_available",
+                    return_value=True,
+                ), patch.object(
+                    milvus_store,
+                    "_safe_client_unlocked",
+                    side_effect=AssertionError("lightweight summary should not open a Milvus client"),
+                ):
+                    summary = milvus_store.milvus_backend_summary(db_path)
+            finally:
+                milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
+                lock_file.close()
+
+            self.assertEqual(summary["status"], "ready")
+            self.assertIsNone(summary["degraded_reason"])
 
     def test_backend_summary_waits_for_transient_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -150,7 +173,7 @@ class MilvusStoreLockTests(unittest.TestCase):
                 "milvus_runtime_available",
                 return_value=True,
             ), patch.object(Path, "open", side_effect=PermissionError("denied")):
-                summary = milvus_store.milvus_backend_summary(db_path)
+                summary = milvus_store.milvus_backend_summary(db_path, deep_check=True)
 
             self.assertEqual(summary["status"], "degraded")
             self.assertTrue(summary["degraded_reason"].startswith("lock_unavailable"))

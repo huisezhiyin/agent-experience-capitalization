@@ -235,12 +235,13 @@ def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[s
     if not summary["runtime_available"]:
         return summary
 
+    if not deep_check:
+        return summary
+
     with _milvus_db_lock(db_path) as lock_error:
         if lock_error:
             summary["status"] = "degraded"
             summary["degraded_reason"] = lock_error
-            return summary
-        if not deep_check:
             return summary
         client = _safe_client_unlocked(db_path)
         if client is None:

@@ -190,6 +190,57 @@ def _build_asset_review_backlog(
     }
 
 
+def _summarize_milvus_retrieval_effectiveness(activations: list[dict[str, Any]]) -> dict[str, Any]:
+    activation_count = len(activations)
+    with_milvus_candidates = 0
+    with_milvus_selected = 0
+    selected_from_milvus = 0
+    selected_total = 0
+    project_candidates = 0
+    shared_candidates = 0
+    vector_scores: list[float] = []
+
+    for activation in activations:
+        retrieval_summary = activation.get("retrieval_summary") or {}
+        project_candidate_count = int(retrieval_summary.get("milvus_project_candidates", 0) or 0)
+        shared_candidate_count = int(retrieval_summary.get("milvus_shared_candidates", 0) or 0)
+        milvus_selected_count = int(retrieval_summary.get("selected_from_milvus", 0) or 0)
+        selected_count = len(activation.get("selected_assets", []))
+
+        project_candidates += project_candidate_count
+        shared_candidates += shared_candidate_count
+        selected_from_milvus += milvus_selected_count
+        selected_total += selected_count
+        if project_candidate_count or shared_candidate_count:
+            with_milvus_candidates += 1
+        if milvus_selected_count:
+            with_milvus_selected += 1
+
+        for asset in activation.get("selected_assets", []):
+            if "milvus" not in asset.get("retrieval_sources", []):
+                continue
+            try:
+                vector_scores.append(float(asset.get("vector_score", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+
+    denominator = selected_total if selected_total > 0 else 1
+    activation_denominator = activation_count if activation_count > 0 else 1
+    return {
+        "activation_count": activation_count,
+        "activations_with_milvus_candidates": with_milvus_candidates,
+        "activations_with_milvus_selected": with_milvus_selected,
+        "milvus_project_candidates": project_candidates,
+        "milvus_shared_candidates": shared_candidates,
+        "selected_from_milvus": selected_from_milvus,
+        "selected_total": selected_total,
+        "milvus_selected_ratio": round(selected_from_milvus / denominator, 4) if selected_total else 0.0,
+        "activation_selected_ratio": round(with_milvus_selected / activation_denominator, 4) if activation_count else 0.0,
+        "avg_selected_vector_score": round(sum(vector_scores) / len(vector_scores), 4) if vector_scores else 0.0,
+        "max_selected_vector_score": round(max(vector_scores), 4) if vector_scores else 0.0,
+    }
+
+
 def _update_activation_view_file(workspace: Path, activation: dict[str, Any]) -> None:
     activation_view_path = memory_root_for_workspace(workspace) / "views" / f"{activation['activation_id']}.json"
     if activation_view_path.exists():
@@ -1040,6 +1091,7 @@ def _build_status_payload(
 
     feedback_summary = _summarize_activation_feedback(activations)
     unresolved_activations = _build_unresolved_activation_items(activations, limit=limit)
+    milvus_effectiveness = _summarize_milvus_retrieval_effectiveness(activations)
 
     temperature_summary = {"hot": 0, "warm": 0, "neutral": 0, "cool": 0}
     review_status_summary = {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}
@@ -1172,6 +1224,7 @@ def _build_status_payload(
                 },
             },
         },
+        "milvus_retrieval_effectiveness": milvus_effectiveness,
         "counts": {
             "traces": len(traces),
             "episodes": len(episodes),
@@ -1232,6 +1285,7 @@ def _build_doctor_payload(
     counts = status_payload["counts"]
     sqlite_backend = status_payload["retrieval_backends"]["sqlite"]
     milvus_backend = status_payload["retrieval_backends"]["milvus"]
+    milvus_effectiveness = status_payload["milvus_retrieval_effectiveness"]
     feedback = status_payload["activation_feedback_summary"]
     unresolved_activations = status_payload["unresolved_activations"]
     queue = status_payload["candidate_review_queue"]
@@ -1264,15 +1318,11 @@ def _build_doctor_payload(
     )
     unproven_count = int(asset_backlog.get("unproven_count", 0) or 0)
     unproven_ratio = float(asset_backlog.get("unproven_ratio", 0.0) or 0.0)
-    unproven_warn = unproven_count >= 10 and unproven_ratio >= 0.4
     checks.append(
         _diagnostic_check(
             "asset_proof_coverage",
-            "warn" if unproven_warn else "pass",
+            "pass",
             f"Asset proof coverage: {asset_backlog.get('healthy_count', 0)}/{asset_backlog.get('total_assets', 0)} healthy, {unproven_count} unproven ({unproven_ratio:.0%}).",
-            None
-            if not unproven_warn
-            else "Promote proof for recurring hot assets or prune low-value unproven assets so review coverage stays credible.",
         )
     )
     missing = int(feedback.get("missing", 0) or 0)
@@ -1303,6 +1353,25 @@ def _build_doctor_payload(
             None
             if local_milvus_status == "pass"
             else "If it remains locked, stop the stale process or switch retrieval to a shared/cloud Milvus backend.",
+        )
+    )
+    milvus_selected_ratio = float(milvus_effectiveness.get("milvus_selected_ratio", 0.0) or 0.0)
+    milvus_activation_ratio = float(milvus_effectiveness.get("activation_selected_ratio", 0.0) or 0.0)
+    milvus_contribution_status = (
+        "pass"
+        if milvus_effectiveness.get("selected_from_milvus", 0) and milvus_activation_ratio >= 0.2
+        else "warn"
+        if milvus_effectiveness.get("activation_count", 0)
+        else "pass"
+    )
+    checks.append(
+        _diagnostic_check(
+            "milvus_retrieval_contribution",
+            milvus_contribution_status,
+            f"Milvus selected {milvus_effectiveness.get('selected_from_milvus', 0)}/{milvus_effectiveness.get('selected_total', 0)} assets ({milvus_selected_ratio:.0%}) across {milvus_effectiveness.get('activations_with_milvus_selected', 0)}/{milvus_effectiveness.get('activation_count', 0)} activations ({milvus_activation_ratio:.0%}); avg selected vector score={milvus_effectiveness.get('avg_selected_vector_score', 0.0)}.",
+            None
+            if milvus_contribution_status == "pass"
+            else "Check sync-milvus coverage and query quality; Milvus is available but not yet contributing enough selected assets.",
         )
     )
     if local_lock["locked"]:

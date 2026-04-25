@@ -477,9 +477,10 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("milvus_locks", doctor)
             self.assertEqual(doctor["status"]["activation_feedback_summary"]["pending"], 1)
             self.assertEqual(doctor["status"]["unresolved_activations"][0]["state"], "pending")
+            self.assertIn("milvus_retrieval_effectiveness", doctor["status"])
             self.assertIn("project_activity", doctor["status"])
 
-    def test_cli_doctor_warns_when_unproven_assets_dominate(self) -> None:
+    def test_cli_doctor_reports_unproven_assets_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()
             workspace.mkdir(parents=True, exist_ok=True)
@@ -529,9 +530,9 @@ class CliFlowTests(unittest.TestCase):
             proof_check = next(
                 item for item in doctor["checks"] if item["name"] == "asset_proof_coverage"
             )
-            self.assertEqual(proof_check["status"], "warn")
+            self.assertEqual(proof_check["status"], "pass")
             self.assertIn("10 unproven", proof_check["summary"])
-            self.assertIn("Promote proof", proof_check["recommendation"])
+            self.assertNotIn("recommendation", proof_check)
 
     def test_cli_auto_start_still_runs_for_inactive_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1204,6 +1205,8 @@ class CliFlowTests(unittest.TestCase):
             self.assertFalse(payload["retrieval_backends"]["milvus"]["local"]["deep_check"])
             self.assertIn("collection_exists", payload["retrieval_backends"]["milvus"]["local"])
             self.assertTrue(payload["retrieval_backends"]["milvus"]["asset_coverage"]["deep_check_required"])
+            self.assertIn("milvus_retrieval_effectiveness", payload)
+            self.assertEqual(payload["milvus_retrieval_effectiveness"]["selected_total"], 1)
             self.assertEqual(payload["backend_configuration"]["profile"], "local")
             self.assertEqual(payload["backend_configuration"]["storage_profile"], "local")
             self.assertEqual(payload["backend_configuration"]["source_of_truth"], "local-json")

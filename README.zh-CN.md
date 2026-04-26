@@ -97,6 +97,9 @@ export EXPCAP_OPENAI_EMBEDDING_DIM=128
 
 如果没有 API key，expcap 会自动回落到 `hash`，并在 `status` / `doctor` 中暴露 fallback 状态。
 
+Milvus Lite index 会按 embedding profile 隔离，例如 `hash-token-sha256-signhash-128` 或
+`openai-text-embedding-3-small-128`，不同 provider 和不同维度不会共用同一个本地 DB 文件。
+
 任务开始前激活相关经验：
 
 ```bash

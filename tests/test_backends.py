@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from runtime.backends import resolve_backend_config
-from runtime.storage.fs_store import memory_root_for_workspace, storage_layout_for_workspace
+from runtime.storage.fs_store import default_milvus_db_path, memory_root_for_workspace, storage_layout_for_workspace
 
 
 class BackendConfigTests(unittest.TestCase):
@@ -118,6 +118,35 @@ class BackendConfigTests(unittest.TestCase):
             self.assertEqual(layout["data_source_mode"], "user-cache")
             self.assertTrue(layout["project_owned_assets"])
             self.assertFalse(layout["local_runtime_data_in_project"])
+            self.assertEqual(layout["retrieval_index_profile"], "hash-token-sha256-signhash-128")
+            self.assertTrue(layout["retrieval_index_path"].endswith("milvus.hash-token-sha25-a1e82f9f.db"))
+            self.assertTrue(layout["legacy_retrieval_index_path"].endswith("milvus.db"))
+
+    def test_milvus_path_is_namespaced_by_embedding_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir()
+
+            with patch.dict(os.environ, {"EXPCAP_EMBEDDING_PROVIDER": "hash"}, clear=False):
+                hash_path = default_milvus_db_path(workspace)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "EXPCAP_EMBEDDING_PROVIDER": "openai",
+                    "EXPCAP_OPENAI_API_KEY": "test-key",
+                    "EXPCAP_OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
+                    "EXPCAP_OPENAI_EMBEDDING_DIM": "128",
+                },
+                clear=False,
+            ):
+                openai_path = default_milvus_db_path(workspace)
+
+            self.assertNotEqual(hash_path, openai_path)
+            self.assertLess(len(hash_path.name), 36)
+            self.assertLess(len(openai_path.name), 36)
+            self.assertTrue(hash_path.name.startswith("milvus.hash-token-sha25-"))
+            self.assertTrue(openai_path.name.startswith("milvus.openai-text-embe-"))
 
 
 if __name__ == "__main__":

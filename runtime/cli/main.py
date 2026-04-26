@@ -28,6 +28,8 @@ from runtime.storage.fs_store import (
     default_activation_view_path,
     default_db_path,
     default_milvus_db_path,
+    legacy_milvus_db_path,
+    legacy_shared_milvus_db_path,
     default_trace_bundle_path,
     iter_json_objects,
     load_json,
@@ -1020,8 +1022,11 @@ def _handle_sync_milvus(args: argparse.Namespace) -> int:
             "shared_synced": shared_report["synced"],
             "shared_pruned": shared_report["pruned"],
             "prune": args.prune,
+            "embedding_profile": embedding_provider_config()["profile"],
             "local_milvus_db": str(default_milvus_db_path(workspace)),
+            "local_legacy_milvus_db": str(legacy_milvus_db_path(workspace)),
             "shared_milvus_db": str(shared_milvus_db_path()) if args.include_shared else None,
+            "shared_legacy_milvus_db": str(legacy_shared_milvus_db_path()) if args.include_shared else None,
         }
     )
     return 0
@@ -1441,6 +1446,10 @@ def _build_status_payload(
                 "core_retrieval": backend_config["retrieval"] in {"milvus-lite", "milvus"},
                 "available": milvus_available(),
                 "embedding": embedding_provider_config(),
+                "legacy_local_path": str(legacy_milvus_db_path(workspace)),
+                "legacy_local_exists": legacy_milvus_db_path(workspace).exists(),
+                "legacy_shared_path": str(legacy_shared_milvus_db_path()),
+                "legacy_shared_exists": legacy_shared_milvus_db_path().exists(),
                 "local": local_milvus,
                 "shared": shared_milvus,
                 "asset_coverage": {

@@ -175,7 +175,28 @@ def embedding_provider_config() -> dict[str, object]:
         "status": status,
         "fallback_reason": fallback_reason,
         "api_key_present": bool(_openai_api_key()) if requested_provider == "openai" else None,
+        "profile": embedding_profile_slug(provider=provider, requested_provider=requested_provider),
     }
+
+
+def embedding_profile_slug(*, provider: EmbeddingProvider | None = None, requested_provider: str | None = None) -> str:
+    provider = provider or current_embedding_provider()
+    requested_provider = requested_provider or os.environ.get("EXPCAP_EMBEDDING_PROVIDER", provider.name)
+    provider_part = _slugify_profile_part(provider.name)
+    if requested_provider == "openai" and provider.name != "openai":
+        provider_part = "openai-fallback-hash"
+    model_part = _slugify_profile_part(provider.model)
+    return f"{provider_part}-{model_part}-{provider.dim}"
+
+
+def _slugify_profile_part(value: str) -> str:
+    cleaned: list[str] = []
+    for char in str(value).lower():
+        if char.isalnum():
+            cleaned.append(char)
+        elif cleaned and cleaned[-1] != "-":
+            cleaned.append("-")
+    return "".join(cleaned).strip("-") or "unknown"
 
 
 def embedding_metadata() -> dict[str, object]:
@@ -187,6 +208,7 @@ def embedding_metadata() -> dict[str, object]:
         "embedding_dim": config["dim"],
         "embedding_version": config["version"],
         "embedding_status": config["status"],
+        "embedding_profile": config["profile"],
     }
 
 

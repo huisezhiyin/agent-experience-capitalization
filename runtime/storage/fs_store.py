@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from runtime.backends import resolve_backend_config
+from runtime.storage.embeddings import embedding_provider_config
 
 
 def _slugify_path_part(value: str) -> str:
@@ -57,6 +58,10 @@ def storage_layout_for_workspace(workspace: Path) -> dict[str, Any]:
     config = resolve_backend_config()
     memory_root = memory_root_for_workspace(workspace)
     shared_root = shared_memory_root()
+    active_milvus_path = default_milvus_db_path(workspace)
+    active_shared_milvus_path = shared_milvus_db_path()
+    legacy_milvus_path = memory_root / "milvus.db"
+    legacy_shared_milvus_path = shared_root / "milvus.db"
     return {
         "storage_profile": config["storage_profile"],
         "data_source_mode": config["data_source_mode"],
@@ -66,11 +71,16 @@ def storage_layout_for_workspace(workspace: Path) -> dict[str, Any]:
         "memory_root": str(memory_root),
         "asset_root": str(memory_root / "assets"),
         "state_index_path": str(memory_root / "index.sqlite3"),
-        "retrieval_index_path": str(memory_root / "milvus.db"),
+        "retrieval_index_path": str(active_milvus_path),
+        "retrieval_index_profile": embedding_provider_config()["profile"],
+        "legacy_retrieval_index_path": str(legacy_milvus_path),
+        "legacy_retrieval_index_exists": legacy_milvus_path.exists(),
         "shared_memory_root": str(shared_root),
         "shared_asset_root": str(shared_root / "assets"),
         "shared_state_index_path": str(shared_root / "index.sqlite3"),
-        "shared_retrieval_index_path": str(shared_root / "milvus.db"),
+        "shared_retrieval_index_path": str(active_shared_milvus_path),
+        "shared_legacy_retrieval_index_path": str(legacy_shared_milvus_path),
+        "shared_legacy_retrieval_index_exists": legacy_shared_milvus_path.exists(),
         "remote_uris": config["backend_uris"],
     }
 
@@ -83,11 +93,29 @@ def shared_db_path() -> Path:
     return shared_memory_root() / "index.sqlite3"
 
 
+def _milvus_db_filename() -> str:
+    profile = str(embedding_provider_config()["profile"])
+    filename = f"milvus.{profile}.db"
+    if len(filename) < 36:
+        return filename
+    digest = hashlib.sha1(profile.encode("utf-8")).hexdigest()[:8]
+    compact_profile = profile[:16].rstrip("-")
+    return f"milvus.{compact_profile}-{digest}.db"
+
+
 def default_milvus_db_path(workspace: Path) -> Path:
-    return memory_root_for_workspace(workspace) / "milvus.db"
+    return memory_root_for_workspace(workspace) / _milvus_db_filename()
 
 
 def shared_milvus_db_path() -> Path:
+    return shared_memory_root() / _milvus_db_filename()
+
+
+def legacy_milvus_db_path(workspace: Path) -> Path:
+    return memory_root_for_workspace(workspace) / "milvus.db"
+
+
+def legacy_shared_milvus_db_path() -> Path:
     return shared_memory_root() / "milvus.db"
 
 

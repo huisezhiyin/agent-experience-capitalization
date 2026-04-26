@@ -1209,6 +1209,16 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["retrieval_backends"]["milvus"]["embedding"]["provider"], "hash")
             self.assertEqual(payload["retrieval_backends"]["milvus"]["embedding"]["dim"], 128)
             self.assertEqual(payload["retrieval_backends"]["milvus"]["embedding"]["version"], "1")
+            self.assertEqual(
+                payload["retrieval_backends"]["milvus"]["embedding"]["profile"],
+                "hash-token-sha256-signhash-128",
+            )
+            self.assertTrue(
+                payload["retrieval_backends"]["milvus"]["local"]["db_path"].endswith(
+                    "milvus.hash-token-sha25-a1e82f9f.db"
+                )
+            )
+            self.assertTrue(payload["retrieval_backends"]["milvus"]["legacy_local_path"].endswith("milvus.db"))
             self.assertFalse(payload["retrieval_backends"]["milvus"]["local"]["deep_check"])
             self.assertIn("collection_exists", payload["retrieval_backends"]["milvus"]["local"])
             self.assertTrue(payload["retrieval_backends"]["milvus"]["asset_coverage"]["deep_check_required"])
@@ -1223,6 +1233,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["backend_configuration"]["retrieval_role"], "core-semantic-retrieval")
             self.assertEqual(payload["backend_configuration"]["asset_portability"], "local-deliverable")
             self.assertEqual(payload["storage_layout"]["storage_profile"], "local")
+            self.assertEqual(payload["storage_layout"]["retrieval_index_profile"], "hash-token-sha256-signhash-128")
             self.assertTrue(payload["storage_layout"]["local_runtime_data_in_project"])
 
     def test_milvus_benchmark_uses_recent_activation_queries(self) -> None:

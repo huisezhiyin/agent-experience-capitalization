@@ -83,6 +83,9 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" EXPCAP_EMBEDDING_P
 If the OpenAI API key is missing, expcap should fall back to `hash` and expose
 that fallback in `retrieval_backends.milvus.embedding`.
 
+Milvus Lite DB files are namespaced by embedding profile so provider/dimension
+changes do not mix vectors in one local index.
+
 Install into another project:
 
 ```bash

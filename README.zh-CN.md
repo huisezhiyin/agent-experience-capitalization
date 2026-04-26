@@ -124,7 +124,22 @@ expcap auto-finish \
 ```bash
 expcap status --workspace "$PWD"
 expcap doctor --workspace "$PWD"
+expcap dashboard --workspace "$PWD"
 ```
+
+在 macOS 上生成并直接打开本地后台：
+
+```bash
+DASHBOARD_PATH="$(
+  EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" \
+    expcap dashboard --workspace "$PWD" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["saved_to"])'
+)"
+open "$DASHBOARD_PATH"
+```
+
+Linux 可以把最后一行换成 `xdg-open "$DASHBOARD_PATH"`。这个后台只是一个本地静态
+HTML 文件，不需要启动常驻 web server。
 
 推荐 `user-cache` profile 会把运行数据写入 `$EXPCAP_HOME`。如果显式使用项目本地模式，`.agent-memory/`
 仍应排除在源码提交之外。
@@ -230,7 +245,21 @@ export EXPCAP_RETRIEVAL_INDEX_URI=https://milvus.example.com
 export EXPCAP_SHARED_ASSET_STORE_URI=s3://bucket/expcap/shared
 ```
 
-当前实现重点是本地 runtime 和可迁移资产契约。云端后端应通过配置启用，而不是改变产品模型。
+托管 Milvus 现在已经可以接入。设置 `EXPCAP_RETRIEVAL_BACKEND=milvus` 和
+`EXPCAP_RETRIEVAL_INDEX_URI` 后，expcap 会使用远端 Milvus endpoint，而不是本地
+Milvus Lite DB：
+
+```bash
+export EXPCAP_RETRIEVAL_BACKEND=milvus
+export EXPCAP_RETRIEVAL_INDEX_URI=https://milvus.example.com
+export EXPCAP_RETRIEVAL_INDEX_TOKEN="..."
+export EXPCAP_MILVUS_DB_NAME=expcap
+export EXPCAP_MILVUS_COLLECTION=experience_assets
+```
+
+`EXPCAP_RETRIEVAL_INDEX_TOKEN`、`EXPCAP_MILVUS_DB_NAME` 和
+`EXPCAP_MILVUS_COLLECTION` 都是可选项。对象存储和 cloud SQL 目前仍是后端契约字段，
+等待 adapter 落地；这些 adapter 增加时不会改变产品模型。
 
 ## 状态指标
 
@@ -246,6 +275,17 @@ expcap status --workspace "$PWD"
 expcap doctor --workspace "$PWD"
 expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
 ```
+
+想直接看本地后台时使用 `dashboard`：
+
+```bash
+expcap dashboard --workspace "$PWD"
+```
+
+它会生成只读的 `dashboard.html` 和 JSON 侧车文件，展示资产列表、activation
+帮助反馈、Milvus 召回贡献、candidate review queue 和写入频率。推荐的
+`user-cache` profile 会把文件写到 `$EXPCAP_HOME` 下，而不是项目目录。可以把命令输出里的
+`saved_to` 路径复制到浏览器打开，也可以使用快速开始里的 macOS 一键打开命令。
 
 `benchmark-milvus` 会先同步当前 embedding profile 对应的 Milvus index，再执行
 查询，避免 profile 切换被误判成召回失败。

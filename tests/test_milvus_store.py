@@ -1,7 +1,9 @@
 import json
 import os
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -374,6 +376,202 @@ class MilvusStoreLockTests(unittest.TestCase):
             self.assertEqual(report, {"synced": 1, "pruned": 1})
             self.assertEqual(client.upserted_ids, ["asset_live"])
             self.assertEqual(client.deleted_ids, ["asset_stale"])
+
+
+class MilvusRemoteStoreTests(unittest.TestCase):
+    def test_remote_milvus_summary_is_configured_without_deep_check(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXPCAP_RETRIEVAL_BACKEND": "milvus",
+                "EXPCAP_RETRIEVAL_INDEX_URI": "https://user:secret@milvus.example.com/path?token=secret",
+            },
+            clear=False,
+        ), patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+            milvus_store,
+            "milvus_runtime_available",
+            side_effect=AssertionError("remote Milvus should not need Milvus Lite runtime probe"),
+        ):
+            summary = milvus_store.milvus_backend_summary(Path("/tmp/missing-local.db"))
+
+        self.assertEqual(summary["backend"], "milvus")
+        self.assertEqual(summary["mode"], "remote")
+        self.assertEqual(summary["status"], "configured")
+        self.assertEqual(summary["remote_uri"], "https://milvus.example.com/path")
+        self.assertTrue(summary["remote_configured"])
+        self.assertIsNone(summary["db_path"])
+        self.assertIsNone(summary["db_exists"])
+
+    def test_remote_milvus_summary_reports_missing_uri(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXPCAP_RETRIEVAL_BACKEND": "milvus",
+                "EXPCAP_RETRIEVAL_INDEX_URI": "",
+            },
+            clear=False,
+        ), patch.object(milvus_store, "milvus_available", return_value=True):
+            summary = milvus_store.milvus_backend_summary(Path("/tmp/missing-local.db"))
+
+        self.assertEqual(summary["backend"], "milvus")
+        self.assertEqual(summary["mode"], "remote")
+        self.assertEqual(summary["status"], "not_configured")
+        self.assertFalse(summary["remote_configured"])
+        self.assertEqual(summary["degraded_reason"], "missing_retrieval_index_uri")
+
+    def test_remote_milvus_client_uses_uri_token_and_db_name(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeMilvusClient:
+            def __init__(self, *args, **kwargs) -> None:
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+
+        fake_pymilvus = types.SimpleNamespace(MilvusClient=FakeMilvusClient)
+        with patch.dict(sys.modules, {"pymilvus": fake_pymilvus}), patch.dict(
+            os.environ,
+            {
+                "EXPCAP_RETRIEVAL_BACKEND": "milvus",
+                "EXPCAP_RETRIEVAL_INDEX_URI": "https://milvus.example.com",
+                "EXPCAP_RETRIEVAL_INDEX_TOKEN": "token-value",
+                "EXPCAP_MILVUS_DB_NAME": "expcap",
+            },
+            clear=False,
+        ):
+            milvus_store._client(Path("/tmp/ignored.db"))
+
+        self.assertEqual(captured["args"], ())
+        self.assertEqual(
+            captured["kwargs"],
+            {
+                "uri": "https://milvus.example.com",
+                "token": "token-value",
+                "db_name": "expcap",
+            },
+        )
+
+    def test_remote_asset_document_uses_project_id_as_index_workspace(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXPCAP_RETRIEVAL_BACKEND": "milvus",
+                "EXPCAP_RETRIEVAL_INDEX_URI": "https://milvus.example.com",
+                "EXPCAP_PROJECT_ID": "github:org/repo",
+            },
+            clear=False,
+        ):
+            document = milvus_store.prepare_asset_document(
+                {
+                    "asset_id": "asset_remote",
+                    "workspace": "/Users/alice/repo",
+                    "title": "Remote project identity",
+                    "content": "Use stable project identity in remote vector filters.",
+                }
+            )
+
+        self.assertEqual(document["workspace"], "github:org/repo")
+        self.assertEqual(document["source_workspace"], "/Users/alice/repo")
+
+    def test_remote_search_does_not_require_local_db_file(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.filter = None
+
+            def has_collection(self, collection_name: str) -> bool:
+                return True
+
+            def search(self, collection_name: str, data: list[list[float]], filter: str, limit: int, output_fields: list[str]):
+                self.filter = filter
+                return [
+                    [
+                        {
+                            "id": "asset_remote",
+                            "distance": 0.82,
+                            "entity": {
+                                "asset_id": "asset_remote",
+                                "knowledge_scope": "project",
+                                "knowledge_kind": "pattern",
+                                "title": "Remote Milvus asset",
+                                "content": "Cloud retrieval is reachable.",
+                            },
+                        }
+                    ]
+                ]
+
+        fake_client = FakeClient()
+        with patch.dict(
+            os.environ,
+            {
+                "EXPCAP_RETRIEVAL_BACKEND": "milvus",
+                "EXPCAP_RETRIEVAL_INDEX_URI": "https://milvus.example.com",
+                "EXPCAP_PROJECT_ID": 'github:org/re"po',
+            },
+            clear=False,
+        ), patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+            milvus_store,
+            "_safe_client_unlocked",
+            return_value=fake_client,
+        ):
+            results = milvus_store.search_asset_vectors(
+                Path("/tmp/does-not-exist.db"),
+                query_text="cloud retrieval",
+                limit=3,
+                knowledge_scope="project",
+                workspace="/Users/alice/repo",
+            )
+
+        self.assertEqual(results[0]["asset_id"], "asset_remote")
+        self.assertEqual(results[0]["vector_score"], 0.82)
+        self.assertEqual(fake_client.filter, 'knowledge_scope == "project" and workspace == "github:org/re\\"po"')
+
+    def test_remote_prune_is_disabled_to_avoid_cross_team_deletes(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.deleted_ids: list[str] = []
+
+            def has_collection(self, collection_name: str) -> bool:
+                return True
+
+            def upsert(self, collection_name: str, data: list[dict]) -> None:
+                return None
+
+            def query(self, collection_name: str, filter: str, output_fields: list[str], limit: int) -> list[dict]:
+                return [{"asset_id": "other_team_asset"}]
+
+            def delete(self, collection_name: str, ids: list[str]) -> dict:
+                self.deleted_ids.extend(ids)
+                return {"delete_count": len(ids)}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assets_dir = Path(tmpdir) / "assets" / "patterns"
+            assets_dir.mkdir(parents=True)
+            (assets_dir / "asset_live.json").write_text(
+                json.dumps({"asset_id": "asset_live", "title": "Live", "content": "Current team asset"}),
+                encoding="utf-8",
+            )
+            fake_client = FakeClient()
+            with patch.dict(
+                os.environ,
+                {
+                    "EXPCAP_RETRIEVAL_BACKEND": "milvus",
+                    "EXPCAP_RETRIEVAL_INDEX_URI": "https://milvus.example.com",
+                },
+                clear=False,
+            ), patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "_safe_client_unlocked",
+                return_value=fake_client,
+            ):
+                report = milvus_store.sync_assets_directory_with_report(
+                    Path("/tmp/does-not-exist.db"),
+                    Path(tmpdir) / "assets",
+                    prune=True,
+                )
+
+        self.assertEqual(report["synced"], 1)
+        self.assertEqual(report["pruned"], 0)
+        self.assertEqual(report["prune_skipped_reason"], "remote_prune_disabled")
+        self.assertEqual(fake_client.deleted_ids, [])
 
 
 if __name__ == "__main__":

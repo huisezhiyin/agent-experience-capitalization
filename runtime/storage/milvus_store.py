@@ -9,7 +9,9 @@ import time
 import warnings
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
+from runtime.backends import resolve_backend_config
 from runtime.storage.embeddings import (
     DEFAULT_HASH_EMBEDDING_DIM,
     asset_embedding_text,
@@ -49,6 +51,76 @@ def milvus_available() -> bool:
 
 def _compact_error(error: Exception) -> str:
     return " ".join(str(error).split())[:240] or error.__class__.__name__
+
+
+def _milvus_collection_name() -> str:
+    return os.environ.get("EXPCAP_MILVUS_COLLECTION", COLLECTION_NAME).strip() or COLLECTION_NAME
+
+
+def _remote_milvus_requested() -> bool:
+    config = resolve_backend_config()
+    return config.get("retrieval") == "milvus"
+
+
+def _remote_milvus_uri() -> str | None:
+    if not _remote_milvus_requested():
+        return None
+    uri = os.environ.get("EXPCAP_RETRIEVAL_INDEX_URI", "").strip()
+    return uri or None
+
+
+def _redact_uri(uri: str | None) -> str | None:
+    if not uri:
+        return None
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return uri
+    if not parts.username and not parts.password:
+        return uri
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+def _remote_project_id() -> str | None:
+    config = resolve_backend_config()
+    project_identity = config.get("project_identity", {})
+    if not isinstance(project_identity, dict):
+        return None
+    project_id = str(project_identity.get("project_id") or "").strip()
+    return project_id or None
+
+
+def _indexed_workspace_value(workspace: str | None) -> str | None:
+    if _remote_milvus_requested():
+        return _remote_project_id() or workspace
+    return workspace
+
+
+def _escape_filter_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _remote_milvus_client_kwargs() -> dict[str, str]:
+    kwargs: dict[str, str] = {}
+    token = (
+        os.environ.get("EXPCAP_RETRIEVAL_INDEX_TOKEN")
+        or os.environ.get("EXPCAP_MILVUS_TOKEN")
+        or ""
+    ).strip()
+    user = os.environ.get("EXPCAP_MILVUS_USER", "").strip()
+    password = os.environ.get("EXPCAP_MILVUS_PASSWORD", "").strip()
+    db_name = os.environ.get("EXPCAP_MILVUS_DB_NAME", "").strip()
+    if token:
+        kwargs["token"] = token
+    elif user or password:
+        kwargs["user"] = user
+        kwargs["password"] = password
+    if db_name:
+        kwargs["db_name"] = db_name
+    return kwargs
 
 
 def _milvus_lock_wait_seconds() -> float:
@@ -211,11 +283,25 @@ def _milvus_db_lock(db_path: Path):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def _milvus_connection_lock(db_path: Path):
+    if _remote_milvus_requested():
+        yield None
+        return
+    with _milvus_db_lock(db_path) as lock_error:
+        yield lock_error
+
+
 def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[str, Any]:
+    remote_uri = _remote_milvus_uri()
+    if _remote_milvus_requested():
+        return _remote_milvus_backend_summary(remote_uri, deep_check=deep_check)
+
     available = milvus_available()
     runtime_available = milvus_runtime_available() if available else False
     summary = {
         "backend": "milvus-lite",
+        "mode": "local",
         "embedding": embedding_provider_config(),
         "available": available,
         "runtime_available": runtime_available,
@@ -231,7 +317,9 @@ def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[s
         "last_error": None,
         "db_path": str(db_path),
         "db_exists": db_path.exists(),
-        "collection_name": COLLECTION_NAME,
+        "remote_uri": None,
+        "remote_configured": False,
+        "collection_name": _milvus_collection_name(),
         "collection_exists": None if not deep_check else False,
         "indexed_entities": None,
     }
@@ -256,9 +344,39 @@ def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[s
         return _populate_backend_summary(client, summary)
 
 
+def _remote_milvus_backend_summary(remote_uri: str | None, *, deep_check: bool = False) -> dict[str, Any]:
+    available = milvus_available()
+    summary = {
+        "backend": "milvus",
+        "mode": "remote",
+        "embedding": embedding_provider_config(),
+        "available": available,
+        "runtime_available": True,
+        "status": "configured" if available and remote_uri else "not_configured" if available else "unavailable",
+        "deep_check": deep_check,
+        "degraded_reason": None if remote_uri else "missing_retrieval_index_uri",
+        "last_error": None,
+        "db_path": None,
+        "db_exists": None,
+        "remote_uri": _redact_uri(remote_uri),
+        "remote_configured": bool(remote_uri),
+        "collection_name": _milvus_collection_name(),
+        "collection_exists": None if not deep_check else False,
+        "indexed_entities": None,
+    }
+    if not summary["available"] or not remote_uri or not deep_check:
+        return summary
+    client = _safe_client_unlocked(Path("."))
+    if client is None:
+        summary["status"] = "degraded"
+        summary["degraded_reason"] = "client_unavailable"
+        return summary
+    return _populate_backend_summary(client, summary)
+
+
 def _populate_backend_summary(client: Any, summary: dict[str, Any]) -> dict[str, Any]:
     try:
-        summary["collection_exists"] = bool(client.has_collection(collection_name=COLLECTION_NAME))
+        summary["collection_exists"] = bool(client.has_collection(collection_name=_milvus_collection_name()))
     except Exception as error:
         summary["status"] = "degraded"
         summary["degraded_reason"] = "collection_check_failed"
@@ -266,10 +384,12 @@ def _populate_backend_summary(client: Any, summary: dict[str, Any]) -> dict[str,
         return summary
 
     if not summary["collection_exists"]:
+        summary["status"] = "not_initialized"
         return summary
 
+    summary["status"] = "ready"
     try:
-        stats = client.get_collection_stats(collection_name=COLLECTION_NAME)
+        stats = client.get_collection_stats(collection_name=_milvus_collection_name())
     except Exception as error:
         summary["status"] = "degraded"
         summary["degraded_reason"] = "stats_failed"
@@ -289,7 +409,7 @@ def _populate_backend_summary(client: Any, summary: dict[str, Any]) -> dict[str,
     if summary["indexed_entities"] is None:
         try:
             rows = client.query(
-                collection_name=COLLECTION_NAME,
+                collection_name=_milvus_collection_name(),
                 filter='asset_id != ""',
                 output_fields=["asset_id"],
                 limit=16384,
@@ -307,12 +427,20 @@ def _populate_backend_summary(client: Any, summary: dict[str, Any]) -> dict[str,
 def _client(db_path: Path) -> Any:
     from pymilvus import MilvusClient
 
+    remote_uri = _remote_milvus_uri()
+    if _remote_milvus_requested():
+        if not remote_uri:
+            raise ValueError("EXPCAP_RETRIEVAL_INDEX_URI is required when EXPCAP_RETRIEVAL_BACKEND=milvus")
+        return MilvusClient(uri=remote_uri, **_remote_milvus_client_kwargs())
+
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return MilvusClient(str(db_path))
 
 
 def _safe_client_unlocked(db_path: Path) -> Any | None:
-    if not milvus_available() or not milvus_runtime_available():
+    if not milvus_available():
+        return None
+    if not _remote_milvus_requested() and not milvus_runtime_available():
         return None
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -330,7 +458,7 @@ def _upsert_asset_vector_unlocked(client: Any, asset: dict[str, Any]) -> bool:
     try:
         _ensure_collection(client)
         client.upsert(
-            collection_name=COLLECTION_NAME,
+            collection_name=_milvus_collection_name(),
             data=[prepare_asset_document(asset)],
         )
         return True
@@ -339,11 +467,12 @@ def _upsert_asset_vector_unlocked(client: Any, asset: dict[str, Any]) -> bool:
 
 
 def _ensure_collection(client: Any) -> None:
-    if client.has_collection(collection_name=COLLECTION_NAME):
+    collection_name = _milvus_collection_name()
+    if client.has_collection(collection_name=collection_name):
         return
     embedding_dim = int(embedding_provider_config().get("dim") or EMBEDDING_DIM)
     client.create_collection(
-        collection_name=COLLECTION_NAME,
+        collection_name=collection_name,
         dimension=embedding_dim,
         primary_field_name="asset_id",
         id_type="string",
@@ -357,11 +486,14 @@ def _ensure_collection(client: Any) -> None:
 
 def prepare_asset_document(asset: dict[str, Any]) -> dict[str, Any]:
     scope = asset.get("scope", {})
+    raw_workspace = asset.get("workspace")
+    source_workspace = asset.get("source_workspace") or raw_workspace
+    indexed_workspace = _indexed_workspace_value(str(raw_workspace) if raw_workspace else None)
     document = {
         "asset_id": asset["asset_id"],
         "vector": embed_text(asset_embedding_text(asset)),
-        "workspace": asset.get("workspace"),
-        "source_workspace": asset.get("source_workspace") or asset.get("workspace"),
+        "workspace": indexed_workspace,
+        "source_workspace": source_workspace,
         "knowledge_scope": asset.get("knowledge_scope", "project"),
         "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
         "asset_type": asset.get("asset_type", "pattern"),
@@ -378,7 +510,7 @@ def prepare_asset_document(asset: dict[str, Any]) -> dict[str, Any]:
 
 
 def upsert_asset_vector(db_path: Path, asset: dict[str, Any]) -> bool:
-    with _milvus_db_lock(db_path) as lock_error:
+    with _milvus_connection_lock(db_path) as lock_error:
         if lock_error:
             return False
         client = _safe_client_unlocked(db_path)
@@ -395,7 +527,7 @@ def sync_assets_directory_with_report(db_path: Path, assets_dir: Path, *, prune:
     report = {"synced": 0, "pruned": 0}
     if not assets_dir.exists():
         return report
-    with _milvus_db_lock(db_path) as lock_error:
+    with _milvus_connection_lock(db_path) as lock_error:
         if lock_error:
             return report
         client = _safe_client_unlocked(db_path)
@@ -413,7 +545,9 @@ def sync_assets_directory_with_report(db_path: Path, assets_dir: Path, *, prune:
             expected_asset_ids.add(str(asset_id))
             if _upsert_asset_vector_unlocked(client, asset):
                 report["synced"] += 1
-        if prune:
+        if prune and _remote_milvus_requested():
+            report["prune_skipped_reason"] = "remote_prune_disabled"
+        elif prune:
             report["pruned"] = _prune_stale_asset_vectors_unlocked(client, expected_asset_ids)
         return report
 
@@ -421,7 +555,7 @@ def sync_assets_directory_with_report(db_path: Path, assets_dir: Path, *, prune:
 def _prune_stale_asset_vectors_unlocked(client: Any, expected_asset_ids: set[str]) -> int:
     try:
         rows = client.query(
-            collection_name=COLLECTION_NAME,
+            collection_name=_milvus_collection_name(),
             filter='asset_id != ""',
             output_fields=["asset_id"],
             limit=16384,
@@ -439,7 +573,7 @@ def _prune_stale_asset_vectors_unlocked(client: Any, expected_asset_ids: set[str
     if not stale_asset_ids:
         return 0
     try:
-        result = client.delete(collection_name=COLLECTION_NAME, ids=stale_asset_ids)
+        result = client.delete(collection_name=_milvus_collection_name(), ids=stale_asset_ids)
     except Exception:
         return 0
     if isinstance(result, dict):
@@ -460,9 +594,11 @@ def _build_filter(
 ) -> str:
     clauses: list[str] = []
     if knowledge_scope:
-        clauses.append(f'knowledge_scope == "{knowledge_scope}"')
+        clauses.append(f'knowledge_scope == "{_escape_filter_value(knowledge_scope)}"')
     if workspace:
-        clauses.append(f'workspace == "{workspace}"')
+        indexed_workspace = _indexed_workspace_value(workspace)
+        if indexed_workspace:
+            clauses.append(f'workspace == "{_escape_filter_value(indexed_workspace)}"')
     return " and ".join(clauses)
 
 
@@ -474,17 +610,17 @@ def search_asset_vectors(
     knowledge_scope: str | None = None,
     workspace: str | None = None,
 ) -> list[dict[str, Any]]:
-    if not db_path.exists():
+    if not _remote_milvus_requested() and not db_path.exists():
         return []
 
-    with _milvus_db_lock(db_path) as lock_error:
+    with _milvus_connection_lock(db_path) as lock_error:
         if lock_error:
             return []
         client = _safe_client_unlocked(db_path)
         if client is None:
             return []
         try:
-            if not client.has_collection(collection_name=COLLECTION_NAME):
+            if not client.has_collection(collection_name=_milvus_collection_name()):
                 return []
         except Exception:
             return []
@@ -513,7 +649,7 @@ def search_asset_vectors(
         filter_expr = _build_filter(knowledge_scope=knowledge_scope, workspace=workspace)
         try:
             result = client.search(
-                collection_name=COLLECTION_NAME,
+                collection_name=_milvus_collection_name(),
                 data=[embed_text(query_text)],
                 filter=filter_expr,
                 limit=limit,

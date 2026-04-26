@@ -60,6 +60,7 @@ Check runtime health:
 ```bash
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap status --workspace "$PWD"
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap doctor --workspace "$PWD"
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap dashboard --workspace "$PWD"
 ```
 
 Sync the Milvus retrieval index:
@@ -88,6 +89,15 @@ that fallback in `retrieval_backends.milvus.embedding`.
 
 Milvus Lite DB files are namespaced by embedding profile so provider/dimension
 changes do not mix vectors in one local index.
+
+Hosted Milvus can be used by setting:
+
+```bash
+EXPCAP_RETRIEVAL_BACKEND=milvus EXPCAP_RETRIEVAL_INDEX_URI=https://milvus.example.com EXPCAP_RETRIEVAL_INDEX_TOKEN="..." expcap doctor --workspace "$PWD" --deep-retrieval-check
+```
+
+Use `EXPCAP_MILVUS_DB_NAME` and `EXPCAP_MILVUS_COLLECTION` when the hosted
+Milvus deployment requires a specific database or collection name.
 
 Install into another project:
 
@@ -127,6 +137,8 @@ Watch these status fields:
 - `asset_effectiveness_summary`: asset temperature and review status.
 - `retrieval_backends`: Milvus core retrieval readiness and SQLite lightweight
   index health.
+- `dashboard`: local read-only HTML view of assets, retrieval contribution,
+  quality signals, write frequency, and candidate review queues.
 - `project_activity`: whether the current workspace is active for default
   reporting and coverage analysis.
 - `backend_configuration`: active `local`, `user-cache`, `shared`, or `hybrid`

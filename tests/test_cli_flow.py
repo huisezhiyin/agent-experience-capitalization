@@ -484,6 +484,99 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("milvus_retrieval_effectiveness", doctor["status"])
             self.assertIn("project_activity", doctor["status"])
 
+    def test_cli_dashboard_generates_local_html_and_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}):
+                db_path = default_db_path(workspace)
+                ensure_db(db_path)
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": "pattern_dashboard_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "dashboard support pattern",
+                        "content": "use a local dashboard to review asset quality and retrieval effectiveness.",
+                        "scope": {"level": "workspace", "value": "dashboard-test"},
+                        "source_episode_ids": ["ep_dashboard_001"],
+                        "source_candidate_ids": ["cand_dashboard_001"],
+                        "confidence": 0.86,
+                        "status": "active",
+                        "review_status": "healthy",
+                        "temperature": "warm",
+                        "created_at": "2026-04-26T00:00:00+00:00",
+                        "updated_at": "2026-04-26T00:00:00+00:00",
+                    },
+                )
+                log_activation(
+                    db_path,
+                    {
+                        "activation_id": "act_dashboard_001",
+                        "workspace": str(workspace),
+                        "task_query": "inspect dashboard effectiveness",
+                        "selected_asset_ids": ["pattern_dashboard_001"],
+                        "selected_assets": [
+                            {
+                                "asset_id": "pattern_dashboard_001",
+                                "title": "dashboard support pattern",
+                                "retrieval_sources": ["milvus", "sqlite"],
+                                "vector_score": 0.82,
+                            }
+                        ],
+                        "retrieval_summary": {
+                            "milvus_project_candidates": 1,
+                            "milvus_shared_candidates": 0,
+                            "selected_from_milvus": 1,
+                        },
+                        "feedback": {"help_signal": "supported_strong"},
+                        "created_at": "2026-04-26T00:30:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "dashboard",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "10",
+                    "--days",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            html_path = Path(payload["saved_to"])
+            json_path = Path(payload["data_saved_to"])
+            html = html_path.read_text(encoding="utf-8")
+            dashboard = json.loads(json_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(html_path.exists())
+            self.assertTrue(json_path.exists())
+            self.assertIn("dashboard support pattern", html)
+            self.assertIn("Retrieval Effectiveness", html)
+            self.assertIn("Write Frequency", html)
+            self.assertIn("Effectiveness Snapshot", html)
+            self.assertEqual(payload["dashboard"]["cards"]["assets"], 1)
+            self.assertIn("effectiveness_snapshot", payload["dashboard"])
+            self.assertEqual(dashboard["cards"]["healthy_assets"], 1)
+            self.assertEqual(dashboard["effectiveness_snapshot"]["verdict"], "healthy")
+            self.assertEqual(dashboard["retrieval"]["effectiveness"]["selected_from_milvus"], 1)
+            self.assertEqual(dashboard["activations"][0]["help_signal"], "supported_strong")
+
     def test_cli_doctor_reports_unproven_assets_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()

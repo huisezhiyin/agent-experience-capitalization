@@ -64,6 +64,20 @@ class BackendConfigTests(unittest.TestCase):
         self.assertEqual(config["backend_uris"]["retrieval_index"], "https://milvus.example.com")
         self.assertEqual(config["backend_uris"]["shared_asset_store"], "oss://bucket/expcap/shared")
 
+    def test_resolve_backend_config_redacts_uri_credentials_in_public_output(self) -> None:
+        config = resolve_backend_config(
+            {
+                "EXPCAP_RETRIEVAL_BACKEND": "milvus",
+                "EXPCAP_RETRIEVAL_INDEX_URI": "https://user:secret@milvus.example.com/path?token=secret",
+                "EXPCAP_STATE_INDEX_URI": "postgres://user:secret@db.example.com/expcap?sslmode=require",
+            }
+        )
+
+        self.assertEqual(config["backend_uris"]["retrieval_index"], "https://milvus.example.com/path")
+        self.assertEqual(config["backend_uris"]["state_index"], "postgres://db.example.com/expcap")
+        self.assertEqual(config["env_overrides"]["EXPCAP_RETRIEVAL_INDEX_URI"], "https://milvus.example.com/path")
+        self.assertEqual(config["env_overrides"]["EXPCAP_STATE_INDEX_URI"], "postgres://db.example.com/expcap")
+
     def test_resolve_backend_config_falls_back_for_unknown_values(self) -> None:
         config = resolve_backend_config(
             {

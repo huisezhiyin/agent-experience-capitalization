@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 import json
 import os
 from pathlib import Path
@@ -435,6 +436,30 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Also query the shared cross-project Milvus index.",
     )
     benchmark_milvus.add_argument("--output", help="Optional output JSON path.")
+
+    dashboard = subparsers.add_parser(
+        "dashboard",
+        help="Generate a local read-only HTML dashboard for assets, retrieval, and write activity.",
+    )
+    dashboard.add_argument("--workspace", required=True, help="Workspace path to summarize.")
+    dashboard.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="How many recent rows to include in dashboard tables. Defaults to 50.",
+    )
+    dashboard.add_argument(
+        "--days",
+        type=int,
+        default=14,
+        help="How many recent days to include in write-frequency charts. Defaults to 14.",
+    )
+    dashboard.add_argument(
+        "--deep-retrieval-check",
+        action="store_true",
+        help="Open retrieval backends for deeper health checks. Defaults to lightweight checks only.",
+    )
+    dashboard.add_argument("--output", help="Optional output HTML path.")
 
     review = subparsers.add_parser("review", help="Generate an episode from a trace bundle.")
     review.add_argument("--input", required=True, help="Path to a trace bundle JSON file.")
@@ -1596,14 +1621,20 @@ def _build_doctor_payload(
 
     local_milvus = milvus_backend["local"]
     local_milvus_status = "pass" if local_milvus["status"] == "ready" else "warn"
+    milvus_backend_label = "Hosted Milvus" if local_milvus.get("mode") == "remote" else "Local Milvus Lite"
+    milvus_recommendation = (
+        "Set EXPCAP_RETRIEVAL_INDEX_URI or switch EXPCAP_RETRIEVAL_BACKEND back to milvus-lite."
+        if local_milvus.get("degraded_reason") == "missing_retrieval_index_uri"
+        else "If it remains locked, stop the stale process or switch retrieval to a shared/cloud Milvus backend."
+    )
     checks.append(
         _diagnostic_check(
             "local_milvus",
             local_milvus_status,
-            f"Local Milvus Lite is {local_milvus['status']} ({local_milvus.get('degraded_reason') or 'no degraded reason'}).",
+            f"{milvus_backend_label} is {local_milvus['status']} ({local_milvus.get('degraded_reason') or 'no degraded reason'}).",
             None
             if local_milvus_status == "pass"
-            else "If it remains locked, stop the stale process or switch retrieval to a shared/cloud Milvus backend.",
+            else milvus_recommendation,
         )
     )
     milvus_selected_ratio = float(milvus_effectiveness.get("milvus_selected_ratio", 0.0) or 0.0)
@@ -1665,6 +1696,547 @@ def _build_doctor_payload(
         "shared_milvus_db": str(shared_milvus_path),
         "counts": counts,
     }
+
+
+def _safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return html_escape(str(value), quote=True)
+
+
+def _date_bucket(value: Any) -> str | None:
+    parsed = _parse_datetime(str(value)) if value else None
+    if parsed is None:
+        return None
+    return parsed.date().isoformat()
+
+
+def _count_items_by_day(
+    items: list[dict[str, Any]],
+    *,
+    timestamp_keys: tuple[str, ...],
+    days: int,
+) -> dict[str, int]:
+    bounded_days = max(days, 1)
+    today = datetime.now(timezone.utc).date()
+    buckets = {
+        (today - timedelta(days=offset)).isoformat(): 0
+        for offset in range(bounded_days - 1, -1, -1)
+    }
+    for item in items:
+        bucket = None
+        for key in timestamp_keys:
+            bucket = _date_bucket(item.get(key))
+            if bucket:
+                break
+        if bucket in buckets:
+            buckets[bucket] += 1
+    return buckets
+
+
+def _dashboard_item_rows(items: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    return items[: max(limit, 0)]
+
+
+def _clamp_ratio(value: float) -> float:
+    return max(0.0, min(value, 1.0))
+
+
+def _build_dashboard_payload(
+    *,
+    workspace: Path,
+    limit: int,
+    days: int,
+    deep_retrieval_check: bool,
+) -> dict[str, Any]:
+    workspace = workspace.resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    bounded_limit = max(limit, 1)
+    bounded_days = max(days, 1)
+    status_payload = _build_status_payload(
+        workspace=workspace,
+        limit=bounded_limit,
+        deep_retrieval_check=deep_retrieval_check,
+    )
+
+    assets = sorted(
+        list_assets(db_path, workspace=str(workspace)),
+        key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+        reverse=True,
+    )
+    candidates = sorted(
+        list_candidates(db_path, workspace=str(workspace), statuses=ALL_CANDIDATE_STATUSES),
+        key=lambda item: item.get("updated_at") or item.get("created_at") or "",
+        reverse=True,
+    )
+    activations = list_activation_logs(db_path, workspace=str(workspace))
+
+    asset_rows = [
+        {
+            "asset_id": asset.get("asset_id"),
+            "title": asset.get("title"),
+            "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
+            "knowledge_scope": asset.get("knowledge_scope", "project"),
+            "temperature": asset.get("temperature", "neutral"),
+            "review_status": asset.get("review_status", "unproven"),
+            "confidence": asset.get("confidence"),
+            "last_used_at": asset.get("last_used_at"),
+            "updated_at": asset.get("updated_at") or asset.get("created_at"),
+        }
+        for asset in _dashboard_item_rows(assets, limit=bounded_limit)
+    ]
+    candidate_rows = [
+        {
+            "candidate_id": candidate.get("candidate_id"),
+            "title": candidate.get("title"),
+            "status": candidate.get("status"),
+            "promotion_readiness": candidate.get("promotion_readiness"),
+            "help_signal": candidate.get("promotion_feedback", {}).get("help_signal"),
+            "updated_at": candidate.get("updated_at") or candidate.get("created_at"),
+        }
+        for candidate in _dashboard_item_rows(candidates, limit=bounded_limit)
+    ]
+    activation_rows = [
+        {
+            "activation_id": activation.get("activation_id"),
+            "task_query": activation.get("task_query"),
+            "selected_count": len(activation.get("selected_assets", [])),
+            "help_signal": activation.get("feedback", {}).get("help_signal"),
+            "selected_from_milvus": activation.get("retrieval_summary", {}).get("selected_from_milvus", 0),
+            "milvus_project_candidates": activation.get("retrieval_summary", {}).get("milvus_project_candidates", 0),
+            "milvus_shared_candidates": activation.get("retrieval_summary", {}).get("milvus_shared_candidates", 0),
+            "created_at": activation.get("created_at"),
+        }
+        for activation in _dashboard_item_rows(activations, limit=bounded_limit)
+    ]
+
+    asset_writes = _count_items_by_day(
+        assets,
+        timestamp_keys=("created_at", "updated_at"),
+        days=bounded_days,
+    )
+    candidate_writes = _count_items_by_day(
+        candidates,
+        timestamp_keys=("created_at", "updated_at"),
+        days=bounded_days,
+    )
+    activation_writes = _count_items_by_day(
+        activations,
+        timestamp_keys=("created_at",),
+        days=bounded_days,
+    )
+    write_frequency = [
+        {
+            "date": day,
+            "assets": asset_writes.get(day, 0),
+            "candidates": candidate_writes.get(day, 0),
+            "activations": activation_writes.get(day, 0),
+        }
+        for day in asset_writes
+    ]
+    feedback_summary = status_payload["activation_feedback_summary"]
+    supported_count = int(feedback_summary.get("supported_strong", 0) or 0) + int(
+        feedback_summary.get("supported_weak", 0) or 0
+    )
+    resolved_feedback_count = supported_count + int(feedback_summary.get("unclear", 0) or 0) + int(
+        feedback_summary.get("missing", 0) or 0
+    )
+    total_assets = int(status_payload["counts"]["assets"] or 0)
+    healthy_assets = int(status_payload["asset_review_backlog"]["healthy_count"] or 0)
+    recent_writes = sum(item["assets"] + item["candidates"] + item["activations"] for item in write_frequency)
+    asset_quality_ratio = _clamp_ratio(healthy_assets / total_assets) if total_assets else 0.0
+    help_rate = _clamp_ratio(supported_count / resolved_feedback_count) if resolved_feedback_count else 0.0
+    milvus_contribution_ratio = _clamp_ratio(
+        float(status_payload["milvus_retrieval_effectiveness"]["activation_selected_ratio"] or 0.0)
+    )
+    write_activity_ratio = _clamp_ratio(recent_writes / max(bounded_days, 1) / 5.0)
+    overall_score = round(
+        (
+            asset_quality_ratio * 0.30
+            + help_rate * 0.30
+            + milvus_contribution_ratio * 0.25
+            + write_activity_ratio * 0.15
+        )
+        * 100
+    )
+    if overall_score >= 70:
+        verdict = "healthy"
+    elif overall_score >= 45:
+        verdict = "watch"
+    else:
+        verdict = "early"
+
+    return {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "limit": bounded_limit,
+        "days": bounded_days,
+        "status": status_payload,
+        "cards": {
+            "assets": status_payload["counts"]["assets"],
+            "candidates": status_payload["counts"]["candidates"],
+            "activation_logs": status_payload["counts"]["activation_logs"],
+            "healthy_assets": status_payload["asset_review_backlog"]["healthy_count"],
+            "unproven_assets": status_payload["asset_review_backlog"]["unproven_count"],
+            "milvus_selected_ratio": status_payload["milvus_retrieval_effectiveness"]["milvus_selected_ratio"],
+            "activation_selected_ratio": status_payload["milvus_retrieval_effectiveness"]["activation_selected_ratio"],
+            "stale_missing_feedback": status_payload["activation_feedback_summary"]["missing"],
+        },
+        "effectiveness_snapshot": {
+            "overall_score": overall_score,
+            "verdict": verdict,
+            "asset_quality_ratio": round(asset_quality_ratio, 4),
+            "help_rate": round(help_rate, 4),
+            "milvus_contribution_ratio": round(milvus_contribution_ratio, 4),
+            "write_activity_ratio": round(write_activity_ratio, 4),
+            "recent_writes": recent_writes,
+            "days": bounded_days,
+            "signals": [
+                {
+                    "label": "Asset quality",
+                    "ratio": round(asset_quality_ratio, 4),
+                    "value": f"{healthy_assets}/{total_assets} healthy",
+                },
+                {
+                    "label": "Activation help",
+                    "ratio": round(help_rate, 4),
+                    "value": f"{supported_count}/{resolved_feedback_count} helpful",
+                },
+                {
+                    "label": "Milvus contribution",
+                    "ratio": round(milvus_contribution_ratio, 4),
+                    "value": f"{milvus_contribution_ratio:.0%} activations",
+                },
+                {
+                    "label": "Write activity",
+                    "ratio": round(write_activity_ratio, 4),
+                    "value": f"{recent_writes} writes / {bounded_days}d",
+                },
+            ],
+        },
+        "write_frequency": write_frequency,
+        "assets": asset_rows,
+        "candidates": candidate_rows,
+        "activations": activation_rows,
+        "review_queue": status_payload["candidate_review_queue"],
+        "retrieval": {
+            "milvus": status_payload["retrieval_backends"]["milvus"],
+            "effectiveness": status_payload["milvus_retrieval_effectiveness"],
+        },
+        "quality": {
+            "asset_effectiveness_summary": status_payload["asset_effectiveness_summary"],
+            "asset_review_backlog": status_payload["asset_review_backlog"],
+            "activation_feedback_summary": status_payload["activation_feedback_summary"],
+        },
+    }
+
+
+def _render_count_cards(payload: dict[str, Any]) -> str:
+    cards = payload["cards"]
+    items = [
+        ("Assets", cards["assets"], "project-owned reusable knowledge"),
+        ("Activations", cards["activation_logs"], "recent get attempts"),
+        ("Healthy", cards["healthy_assets"], "assets with positive proof"),
+        ("Unproven", cards["unproven_assets"], "assets still needing evidence"),
+        ("Milvus Selected", f"{cards['milvus_selected_ratio']:.0%}", "selected assets from semantic retrieval"),
+        ("Feedback Missing", cards["stale_missing_feedback"], "stale activations without help signal"),
+    ]
+    return "\n".join(
+        f"""
+        <section class="card">
+          <div class="card-label">{_safe_text(label)}</div>
+          <div class="card-value">{_safe_text(value)}</div>
+          <div class="card-hint">{_safe_text(hint)}</div>
+        </section>
+        """
+        for label, value, hint in items
+    )
+
+
+def _render_dashboard_table(headers: list[str], rows: list[list[Any]]) -> str:
+    header_html = "".join(f"<th>{_safe_text(header)}</th>" for header in headers)
+    if not rows:
+        body_html = f"<tr><td colspan=\"{len(headers)}\" class=\"empty\">No rows yet.</td></tr>"
+    else:
+        body_html = "\n".join(
+            "<tr>" + "".join(f"<td>{_safe_text(cell)}</td>" for cell in row) + "</tr>"
+            for row in rows
+        )
+    return f"<table><thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody></table>"
+
+
+def _render_effectiveness_snapshot(payload: dict[str, Any]) -> str:
+    snapshot = payload["effectiveness_snapshot"]
+    signals = snapshot["signals"]
+    score = int(snapshot["overall_score"])
+    gauge_width = max(0, min(score, 100)) * 3.6
+    signal_rows = []
+    for index, signal in enumerate(signals):
+        y = 40 + index * 54
+        ratio = _clamp_ratio(float(signal.get("ratio", 0.0) or 0.0))
+        width = round(ratio * 310, 2)
+        signal_rows.append(
+            f"""
+            <g>
+              <text x="420" y="{y}" class="snapshot-label">{_safe_text(signal["label"])}</text>
+              <text x="720" y="{y}" class="snapshot-value">{_safe_text(signal["value"])}</text>
+              <rect x="420" y="{y + 14}" width="310" height="14" rx="7" class="snapshot-track" />
+              <rect x="420" y="{y + 14}" width="{width}" height="14" rx="7" class="snapshot-bar snapshot-bar-{index}" />
+            </g>
+            """
+        )
+    return f"""
+    <section class="panel snapshot-panel">
+      <h2>Effectiveness Snapshot</h2>
+      <svg class="snapshot-svg" viewBox="0 0 780 270" role="img" aria-label="expcap effectiveness snapshot">
+        <defs>
+          <linearGradient id="snapshotGauge" x1="0" x2="1" y1="0" y2="0">
+            <stop offset="0%" stop-color="#b95f35" />
+            <stop offset="55%" stop-color="#d7a742" />
+            <stop offset="100%" stop-color="#0d6b57" />
+          </linearGradient>
+        </defs>
+        <text x="32" y="42" class="snapshot-label">Overall</text>
+        <text x="32" y="118" class="snapshot-score">{score}</text>
+        <text x="158" y="112" class="snapshot-verdict">{_safe_text(snapshot["verdict"])}</text>
+        <rect x="32" y="150" width="360" height="22" rx="11" class="snapshot-track" />
+        <rect x="32" y="150" width="{gauge_width}" height="22" rx="11" fill="url(#snapshotGauge)" />
+        <text x="32" y="204" class="snapshot-note">One-glance read: quality, actual help, Milvus contribution, and write activity.</text>
+        {''.join(signal_rows)}
+      </svg>
+    </section>
+    """
+
+
+def _render_dashboard_html(payload: dict[str, Any]) -> str:
+    retrieval = payload["retrieval"]["effectiveness"]
+    quality = payload["quality"]
+    raw_json = html_escape(json.dumps(payload, ensure_ascii=False, indent=2), quote=False)
+    write_rows = [
+        [item["date"], item["assets"], item["candidates"], item["activations"]]
+        for item in payload["write_frequency"]
+    ]
+    asset_rows = [
+        [
+            item["title"],
+            item["knowledge_kind"],
+            item["knowledge_scope"],
+            item["temperature"],
+            item["review_status"],
+            item["confidence"],
+            item["updated_at"],
+        ]
+        for item in payload["assets"]
+    ]
+    activation_rows = [
+        [
+            item["task_query"],
+            item["selected_count"],
+            item["selected_from_milvus"],
+            item["milvus_project_candidates"],
+            item["milvus_shared_candidates"],
+            item["help_signal"] or "pending",
+            item["created_at"],
+        ]
+        for item in payload["activations"]
+    ]
+    candidate_rows = [
+        [
+            item["title"],
+            item["status"],
+            item["promotion_readiness"],
+            item["help_signal"],
+            item["updated_at"],
+        ]
+        for item in payload["candidates"]
+    ]
+    queue_items = payload["review_queue"].get("top_items", [])
+    queue_rows = [
+        [
+            item.get("title"),
+            item.get("status"),
+            item.get("promotion_readiness"),
+            item.get("priority_score"),
+            item.get("candidate_id"),
+        ]
+        for item in queue_items
+    ]
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>expcap local dashboard</title>
+  <style>
+    :root {{
+      --bg: #f5f1e8;
+      --panel: #fffdf7;
+      --ink: #1d241f;
+      --muted: #667062;
+      --line: #ddd3bf;
+      --accent: #0d6b57;
+      --accent-soft: #d7eee6;
+      --warn: #9a5b00;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(13, 107, 87, 0.16), transparent 32rem),
+        linear-gradient(135deg, #f5f1e8 0%, #ebe1cf 100%);
+      color: var(--ink);
+      font: 15px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{ max-width: 1180px; margin: 0 auto; padding: 36px 22px 60px; }}
+    header {{ margin-bottom: 28px; }}
+    h1 {{ margin: 0 0 8px; font-size: clamp(2rem, 5vw, 4.2rem); line-height: 0.95; letter-spacing: -0.06em; }}
+    h2 {{ margin: 28px 0 12px; font-size: 1.2rem; }}
+    .meta {{ color: var(--muted); max-width: 900px; }}
+    .cards {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }}
+    .card, .panel {{
+      background: rgba(255, 253, 247, 0.86);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: 0 18px 50px rgba(50, 43, 31, 0.08);
+    }}
+    .card {{ padding: 16px; }}
+    .card-label {{ color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; }}
+    .card-value {{ margin-top: 8px; font-size: 2rem; font-weight: 760; letter-spacing: -0.04em; }}
+    .card-hint {{ color: var(--muted); font-size: 0.86rem; }}
+    .panel {{ padding: 18px; overflow: hidden; }}
+    .split {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+    .metric-line {{ display: flex; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); padding: 8px 0; }}
+    .metric-line:last-child {{ border-bottom: 0; }}
+    .metric-line strong {{ color: var(--accent); }}
+    .snapshot-panel {{ margin: 16px 0; }}
+    .snapshot-svg {{ display: block; width: 100%; height: auto; }}
+    .snapshot-label {{ fill: var(--muted); font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; }}
+    .snapshot-score {{ fill: var(--ink); font-size: 88px; font-weight: 820; letter-spacing: -0.07em; }}
+    .snapshot-verdict {{ fill: var(--accent); font-size: 26px; font-weight: 760; text-transform: uppercase; letter-spacing: 0.04em; }}
+    .snapshot-note {{ fill: var(--muted); font-size: 15px; }}
+    .snapshot-value {{ fill: var(--ink); font-size: 15px; font-weight: 700; text-anchor: end; }}
+    .snapshot-track {{ fill: rgba(13, 107, 87, 0.12); }}
+    .snapshot-bar-0 {{ fill: #0d6b57; }}
+    .snapshot-bar-1 {{ fill: #337b9b; }}
+    .snapshot-bar-2 {{ fill: #d7a742; }}
+    .snapshot-bar-3 {{ fill: #b95f35; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.92rem; }}
+    th, td {{ border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left; vertical-align: top; }}
+    th {{ color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; }}
+    tr:hover td {{ background: rgba(13, 107, 87, 0.05); }}
+    .empty {{ color: var(--muted); text-align: center; }}
+    code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    details {{ margin-top: 24px; }}
+    summary {{ cursor: pointer; color: var(--accent); font-weight: 700; }}
+    pre {{ white-space: pre-wrap; background: #18211d; color: #ecf6ee; padding: 16px; border-radius: 14px; overflow: auto; }}
+    @media (max-width: 980px) {{
+      .cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .split {{ grid-template-columns: 1fr; }}
+    }}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>expcap local dashboard</h1>
+    <div class="meta">
+      Workspace: <code>{_safe_text(payload["workspace"])}</code><br>
+      Generated: {_safe_text(payload["generated_at"])}.
+      This dashboard is read-only and uses the same status metrics as the CLI.
+    </div>
+  </header>
+
+  <section class="cards">
+    {_render_count_cards(payload)}
+  </section>
+
+  {_render_effectiveness_snapshot(payload)}
+
+  <section class="split">
+    <div class="panel">
+      <h2>Retrieval Effectiveness</h2>
+      <div class="metric-line"><span>Milvus selected assets</span><strong>{_safe_text(retrieval.get("selected_from_milvus"))}/{_safe_text(retrieval.get("selected_total"))}</strong></div>
+      <div class="metric-line"><span>Milvus selected ratio</span><strong>{_safe_text(f"{float(retrieval.get('milvus_selected_ratio', 0.0) or 0.0):.0%}")}</strong></div>
+      <div class="metric-line"><span>Activation selected ratio</span><strong>{_safe_text(f"{float(retrieval.get('activation_selected_ratio', 0.0) or 0.0):.0%}")}</strong></div>
+      <div class="metric-line"><span>Average selected vector score</span><strong>{_safe_text(retrieval.get("avg_selected_vector_score"))}</strong></div>
+    </div>
+    <div class="panel">
+      <h2>Quality Signals</h2>
+      <div class="metric-line"><span>Review status</span><strong>{_safe_text(quality["asset_effectiveness_summary"]["review_status"])}</strong></div>
+      <div class="metric-line"><span>Temperature</span><strong>{_safe_text(quality["asset_effectiveness_summary"]["temperature"])}</strong></div>
+      <div class="metric-line"><span>Activation feedback</span><strong>{_safe_text(quality["activation_feedback_summary"])}</strong></div>
+      <div class="metric-line"><span>Candidate queue</span><strong>{_safe_text(payload["review_queue"].get("candidate_count"))}</strong></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Write Frequency</h2>
+    {_render_dashboard_table(["Date", "Assets", "Candidates", "Activations"], write_rows)}
+  </section>
+
+  <section class="panel">
+    <h2>Assets</h2>
+    {_render_dashboard_table(["Title", "Kind", "Scope", "Temp", "Review", "Confidence", "Updated"], asset_rows)}
+  </section>
+
+  <section class="panel">
+    <h2>Recent Activations</h2>
+    {_render_dashboard_table(["Task", "Selected", "Milvus selected", "Milvus project", "Milvus shared", "Help", "Created"], activation_rows)}
+  </section>
+
+  <section class="panel">
+    <h2>Candidate Review Queue</h2>
+    {_render_dashboard_table(["Title", "Status", "Readiness", "Priority", "Candidate ID"], queue_rows)}
+  </section>
+
+  <section class="panel">
+    <h2>Recent Candidates</h2>
+    {_render_dashboard_table(["Title", "Status", "Readiness", "Help", "Updated"], candidate_rows)}
+  </section>
+
+  <details>
+    <summary>Raw dashboard JSON</summary>
+    <pre>{raw_json}</pre>
+  </details>
+</main>
+</body>
+</html>
+"""
+
+
+def _handle_dashboard(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    payload = _build_dashboard_payload(
+        workspace=workspace,
+        limit=args.limit,
+        days=args.days,
+        deep_retrieval_check=args.deep_retrieval_check,
+    )
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "dashboard.html"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(_render_dashboard_html(payload), encoding="utf-8")
+    data_output_path = output_path.with_suffix(".json")
+    save_json(data_output_path, payload)
+    _print_json(
+        {
+            "saved_to": str(output_path),
+            "data_saved_to": str(data_output_path),
+            "dashboard": {
+                "workspace": payload["workspace"],
+                "generated_at": payload["generated_at"],
+                "cards": payload["cards"],
+                "effectiveness_snapshot": payload["effectiveness_snapshot"],
+                "review_queue_count": payload["review_queue"]["candidate_count"],
+            },
+        }
+    )
+    return 0
 
 
 def _handle_status(args: argparse.Namespace) -> int:
@@ -1733,6 +2305,8 @@ def main() -> int:
         return _handle_sync_milvus(args)
     if args.command == "benchmark-milvus":
         return _handle_benchmark_milvus(args)
+    if args.command == "dashboard":
+        return _handle_dashboard(args)
     if args.command == "review":
         return _handle_review(args)
     if args.command == "extract":

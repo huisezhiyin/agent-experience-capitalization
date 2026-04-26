@@ -139,7 +139,22 @@ Check the loop:
 ```bash
 expcap status --workspace "$PWD"
 expcap doctor --workspace "$PWD"
+expcap dashboard --workspace "$PWD"
 ```
+
+Open the local dashboard in a browser on macOS:
+
+```bash
+DASHBOARD_PATH="$(
+  EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" \
+    expcap dashboard --workspace "$PWD" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["saved_to"])'
+)"
+open "$DASHBOARD_PATH"
+```
+
+On Linux, use `xdg-open "$DASHBOARD_PATH"` instead of `open`. The dashboard is
+a static local HTML file; no background web server is required.
 
 Runtime data is written to `$EXPCAP_HOME` with the recommended `user-cache`
 profile. Keep `.agent-memory/` out of source control for explicit project-local
@@ -256,9 +271,22 @@ export EXPCAP_RETRIEVAL_INDEX_URI=https://milvus.example.com
 export EXPCAP_SHARED_ASSET_STORE_URI=s3://bucket/expcap/shared
 ```
 
-The current implementation focuses on the local runtime and the portable asset
-contract. Cloud backends are intended to be enabled by backend configuration,
-not by changing the product model.
+Hosted Milvus is connectable today. When `EXPCAP_RETRIEVAL_BACKEND=milvus` and
+`EXPCAP_RETRIEVAL_INDEX_URI` are set, expcap uses that remote Milvus endpoint
+instead of a local Milvus Lite DB:
+
+```bash
+export EXPCAP_RETRIEVAL_BACKEND=milvus
+export EXPCAP_RETRIEVAL_INDEX_URI=https://milvus.example.com
+export EXPCAP_RETRIEVAL_INDEX_TOKEN="..."
+export EXPCAP_MILVUS_DB_NAME=expcap
+export EXPCAP_MILVUS_COLLECTION=experience_assets
+```
+
+`EXPCAP_RETRIEVAL_INDEX_TOKEN`, `EXPCAP_MILVUS_DB_NAME`, and
+`EXPCAP_MILVUS_COLLECTION` are optional. Object storage and cloud SQL remain
+backend-contract fields until their adapters are implemented; the product model
+does not change when those adapters are added.
 
 ## Status Signals
 
@@ -274,6 +302,19 @@ Use `doctor` when you need actionable diagnostics:
 expcap doctor --workspace "$PWD"
 expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
 ```
+
+Use `dashboard` when you want a local read-only view of assets, activation
+quality, retrieval contribution, candidate review queues, and write frequency:
+
+```bash
+expcap dashboard --workspace "$PWD"
+```
+
+The command writes `dashboard.html` plus a JSON sidecar under the workspace
+review directory for the active storage profile. With the recommended
+`user-cache` profile this lives under `$EXPCAP_HOME`, not inside the project.
+Copy the printed `saved_to` path into a browser, or use the macOS one-liner in
+Quickstart to generate and open it directly.
 
 `benchmark-milvus` pre-syncs the active embedding-profile Milvus index before
 querying, so profile switches do not look like retrieval failures.

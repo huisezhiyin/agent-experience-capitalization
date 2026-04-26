@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 
 STORAGE_PROFILES = {"local", "user-cache", "shared", "hybrid"}
@@ -54,6 +55,22 @@ def _normalize_choice(
 def _optional_value(value: str | None) -> str | None:
     normalized = (value or "").strip()
     return normalized or None
+
+
+def _safe_uri_value(value: str | None) -> str | None:
+    uri = _optional_value(value)
+    if not uri:
+        return None
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return "<invalid-uri>"
+    if not parts.scheme:
+        return uri
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
 def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, object]:
@@ -109,10 +126,10 @@ def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, ob
     project_id = _optional_value(env_map.get("EXPCAP_PROJECT_ID"))
     owning_team = _optional_value(env_map.get("EXPCAP_OWNING_TEAM"))
     backend_uris = {
-        "asset_store": _optional_value(env_map.get("EXPCAP_ASSET_STORE_URI")),
-        "state_index": _optional_value(env_map.get("EXPCAP_STATE_INDEX_URI")),
-        "retrieval_index": _optional_value(env_map.get("EXPCAP_RETRIEVAL_INDEX_URI")),
-        "shared_asset_store": _optional_value(env_map.get("EXPCAP_SHARED_ASSET_STORE_URI")),
+        "asset_store": _safe_uri_value(env_map.get("EXPCAP_ASSET_STORE_URI")),
+        "state_index": _safe_uri_value(env_map.get("EXPCAP_STATE_INDEX_URI")),
+        "retrieval_index": _safe_uri_value(env_map.get("EXPCAP_RETRIEVAL_INDEX_URI")),
+        "shared_asset_store": _safe_uri_value(env_map.get("EXPCAP_SHARED_ASSET_STORE_URI")),
     }
 
     return {
@@ -160,9 +177,9 @@ def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, ob
             "EXPCAP_SHARING_BACKEND": env_map.get("EXPCAP_SHARING_BACKEND"),
             "EXPCAP_PROJECT_ID": env_map.get("EXPCAP_PROJECT_ID"),
             "EXPCAP_OWNING_TEAM": env_map.get("EXPCAP_OWNING_TEAM"),
-            "EXPCAP_ASSET_STORE_URI": env_map.get("EXPCAP_ASSET_STORE_URI"),
-            "EXPCAP_STATE_INDEX_URI": env_map.get("EXPCAP_STATE_INDEX_URI"),
-            "EXPCAP_RETRIEVAL_INDEX_URI": env_map.get("EXPCAP_RETRIEVAL_INDEX_URI"),
-            "EXPCAP_SHARED_ASSET_STORE_URI": env_map.get("EXPCAP_SHARED_ASSET_STORE_URI"),
+            "EXPCAP_ASSET_STORE_URI": _safe_uri_value(env_map.get("EXPCAP_ASSET_STORE_URI")),
+            "EXPCAP_STATE_INDEX_URI": _safe_uri_value(env_map.get("EXPCAP_STATE_INDEX_URI")),
+            "EXPCAP_RETRIEVAL_INDEX_URI": _safe_uri_value(env_map.get("EXPCAP_RETRIEVAL_INDEX_URI")),
+            "EXPCAP_SHARED_ASSET_STORE_URI": _safe_uri_value(env_map.get("EXPCAP_SHARED_ASSET_STORE_URI")),
         },
     }

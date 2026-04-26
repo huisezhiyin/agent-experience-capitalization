@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from runtime.storage import embeddings
 from runtime.storage import milvus_store
 
 
@@ -152,8 +153,30 @@ class MilvusStoreLockTests(unittest.TestCase):
         self.assertEqual(document["embedding_version"], "1")
         self.assertEqual(document["embedding_status"], "ready")
 
+    def test_openai_embedding_provider_without_key_falls_back_to_hash(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "EXPCAP_EMBEDDING_PROVIDER": "openai",
+                "OPENAI_API_KEY": "",
+                "EXPCAP_OPENAI_API_KEY": "",
+            },
+            clear=False,
+        ):
+            document = milvus_store.prepare_asset_document(
+                {
+                    "asset_id": "asset_1",
+                    "title": "Fallback embedding",
+                    "content": "Missing API keys should not break local tests.",
+                }
+            )
+
+        self.assertEqual(document["embedding_provider"], "hash")
+        self.assertEqual(document["embedding_requested_provider"], "openai")
+        self.assertEqual(document["embedding_status"], "fallback")
+
     def test_unsupported_embedding_provider_falls_back_to_hash(self) -> None:
-        with patch.dict(os.environ, {"EXPCAP_EMBEDDING_PROVIDER": "openai"}, clear=False):
+        with patch.dict(os.environ, {"EXPCAP_EMBEDDING_PROVIDER": "unknown"}, clear=False):
             document = milvus_store.prepare_asset_document(
                 {
                     "asset_id": "asset_1",
@@ -163,8 +186,59 @@ class MilvusStoreLockTests(unittest.TestCase):
             )
 
         self.assertEqual(document["embedding_provider"], "hash")
-        self.assertEqual(document["embedding_requested_provider"], "openai")
+        self.assertEqual(document["embedding_requested_provider"], "unknown")
         self.assertEqual(document["embedding_status"], "fallback")
+
+    def test_openai_embedding_provider_uses_embeddings_api(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps({"data": [{"embedding": [0.1, 0.2, -0.3, 0.4]}]}).encode("utf-8")
+
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["authorization"] = request.headers.get("Authorization")
+            return FakeResponse()
+
+        with patch.dict(
+            os.environ,
+            {
+                "EXPCAP_EMBEDDING_PROVIDER": "openai",
+                "EXPCAP_OPENAI_API_KEY": "test-key",
+                "EXPCAP_OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
+                "EXPCAP_OPENAI_EMBEDDING_DIM": "4",
+                "EXPCAP_OPENAI_BASE_URL": "https://example.test",
+                "EXPCAP_OPENAI_TIMEOUT_SECONDS": "7",
+            },
+            clear=False,
+        ), patch.object(embeddings.urllib.request, "urlopen", side_effect=fake_urlopen):
+            vector = embeddings.embed_text("semantic retrieval")
+            config = embeddings.embedding_provider_config()
+
+        self.assertEqual(vector, [0.1, 0.2, -0.3, 0.4])
+        self.assertEqual(captured["url"], "https://example.test/v1/embeddings")
+        self.assertEqual(captured["timeout"], 7.0)
+        self.assertEqual(captured["authorization"], "Bearer test-key")
+        self.assertEqual(
+            captured["body"],
+            {
+                "model": "text-embedding-3-small",
+                "input": "semantic retrieval",
+                "dimensions": 4,
+            },
+        )
+        self.assertEqual(config["provider"], "openai")
+        self.assertEqual(config["dim"], 4)
+        self.assertEqual(config["status"], "ready")
 
     def test_backend_summary_deep_check_opens_client(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

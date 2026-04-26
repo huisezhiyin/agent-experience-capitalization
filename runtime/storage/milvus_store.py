@@ -341,9 +341,10 @@ def _upsert_asset_vector_unlocked(client: Any, asset: dict[str, Any]) -> bool:
 def _ensure_collection(client: Any) -> None:
     if client.has_collection(collection_name=COLLECTION_NAME):
         return
+    embedding_dim = int(embedding_provider_config().get("dim") or EMBEDDING_DIM)
     client.create_collection(
         collection_name=COLLECTION_NAME,
-        dimension=EMBEDDING_DIM,
+        dimension=embedding_dim,
         primary_field_name="asset_id",
         id_type="string",
         vector_field_name="vector",

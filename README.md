@@ -97,6 +97,20 @@ export EXPCAP_STORAGE_PROFILE=user-cache
 export EXPCAP_HOME="$HOME/.expcap"
 ```
 
+The default embedding provider is zero-config `hash`. To test real OpenAI
+embeddings while keeping the current Milvus Lite collection compatible, start
+with 128 dimensions:
+
+```bash
+export EXPCAP_EMBEDDING_PROVIDER=openai
+export OPENAI_API_KEY="..."
+export EXPCAP_OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+export EXPCAP_OPENAI_EMBEDDING_DIM=128
+```
+
+If no API key is present, expcap falls back to `hash` and reports that fallback
+in `status` / `doctor`.
+
 Start a task by activating relevant experience:
 
 ```bash

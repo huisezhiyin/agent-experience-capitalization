@@ -74,6 +74,15 @@ Benchmark Milvus retrieval quality:
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
 ```
 
+Optional real embedding provider:
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" EXPCAP_EMBEDDING_PROVIDER=openai OPENAI_API_KEY="..." EXPCAP_OPENAI_EMBEDDING_MODEL=text-embedding-3-small EXPCAP_OPENAI_EMBEDDING_DIM=128 expcap benchmark-milvus --workspace "$PWD"
+```
+
+If the OpenAI API key is missing, expcap should fall back to `hash` and expose
+that fallback in `retrieval_backends.milvus.embedding`.
+
 Install into another project:
 
 ```bash

@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from functools import lru_cache
-import hashlib
-import math
 import os
-import re
 import socket
 import tempfile
 import time
@@ -13,6 +10,13 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+from runtime.storage.embeddings import (
+    DEFAULT_HASH_EMBEDDING_DIM,
+    asset_embedding_text,
+    embed_text,
+    embedding_metadata,
+    embedding_provider_config,
+)
 from runtime.storage.fs_store import iter_json_objects
 
 try:
@@ -22,7 +26,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback.
 
 
 COLLECTION_NAME = "experience_assets"
-EMBEDDING_DIM = 128
+EMBEDDING_DIM = DEFAULT_HASH_EMBEDDING_DIM
 
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 os.environ.setdefault("GLOG_minloglevel", "2")
@@ -212,6 +216,7 @@ def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[s
     runtime_available = milvus_runtime_available() if available else False
     summary = {
         "backend": "milvus-lite",
+        "embedding": embedding_provider_config(),
         "available": available,
         "runtime_available": runtime_available,
         "status": "ready"
@@ -349,45 +354,9 @@ def _ensure_collection(client: Any) -> None:
     )
 
 
-def _tokenize(text: str) -> list[str]:
-    tokens = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", text.lower())
-    return [token for token in tokens if token.strip()]
-
-
-def embed_text(text: str, *, dim: int = EMBEDDING_DIM) -> list[float]:
-    vector = [0.0] * dim
-    tokens = _tokenize(text)
-    if not tokens:
-        return vector
-    for token in tokens:
-        digest = hashlib.sha256(token.encode("utf-8")).digest()
-        bucket = int.from_bytes(digest[:2], "big") % dim
-        sign = 1.0 if digest[2] % 2 == 0 else -1.0
-        weight = 1.0 + (len(token) / 24.0)
-        vector[bucket] += sign * weight
-    norm = math.sqrt(sum(value * value for value in vector))
-    if norm == 0:
-        return vector
-    return [round(value / norm, 8) for value in vector]
-
-
-def asset_embedding_text(asset: dict[str, Any]) -> str:
-    fragments = [
-        asset.get("title", ""),
-        asset.get("content", ""),
-        asset.get("asset_type", ""),
-        asset.get("knowledge_kind", ""),
-        asset.get("knowledge_scope", ""),
-    ]
-    scope = asset.get("scope", {})
-    fragments.append(scope.get("value", ""))
-    fragments.append(scope.get("level", ""))
-    return " ".join(fragment for fragment in fragments if fragment)
-
-
 def prepare_asset_document(asset: dict[str, Any]) -> dict[str, Any]:
     scope = asset.get("scope", {})
-    return {
+    document = {
         "asset_id": asset["asset_id"],
         "vector": embed_text(asset_embedding_text(asset)),
         "workspace": asset.get("workspace"),
@@ -403,6 +372,8 @@ def prepare_asset_document(asset: dict[str, Any]) -> dict[str, Any]:
         "updated_at": asset.get("updated_at"),
         "created_at": asset.get("created_at"),
     }
+    document.update(embedding_metadata())
+    return document
 
 
 def upsert_asset_vector(db_path: Path, asset: dict[str, Any]) -> bool:
@@ -531,6 +502,12 @@ def search_asset_vectors(
             "confidence",
             "updated_at",
             "created_at",
+            "embedding_provider",
+            "embedding_requested_provider",
+            "embedding_model",
+            "embedding_dim",
+            "embedding_version",
+            "embedding_status",
         ]
         filter_expr = _build_filter(knowledge_scope=knowledge_scope, workspace=workspace)
         try:
@@ -575,6 +552,14 @@ def _normalize_search_results(result: Any) -> list[dict[str, Any]]:
                     "confidence": float(entity.get("confidence", 0.0)),
                     "updated_at": entity.get("updated_at"),
                     "created_at": entity.get("created_at"),
+                    "embedding": {
+                        "provider": entity.get("embedding_provider"),
+                        "requested_provider": entity.get("embedding_requested_provider"),
+                        "model": entity.get("embedding_model"),
+                        "dim": entity.get("embedding_dim"),
+                        "version": entity.get("embedding_version"),
+                        "status": entity.get("embedding_status"),
+                    },
                     "vector_score": float(item.get("distance", item.get("score", 0.0))),
                     "status": "active",
                 }

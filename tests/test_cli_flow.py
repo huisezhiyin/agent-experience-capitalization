@@ -6,8 +6,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from runtime.cli import main as cli_main
+from runtime.storage.fs_store import default_db_path
 from runtime.storage.sqlite_store import upsert_asset
+from runtime.storage.sqlite_store import ensure_db, log_activation
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -60,7 +64,7 @@ def _write_candidate(
 class CliFlowTests(unittest.TestCase):
     def test_cli_ingest_review_extract_promote_activate_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir) / "workspace"
+            workspace = (Path(tmpdir) / "workspace").resolve()
             workspace.mkdir(parents=True, exist_ok=True)
 
             commands = [
@@ -1202,6 +1206,9 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue(payload["retrieval_backends"]["milvus"]["core_retrieval"])
             self.assertEqual(payload["retrieval_backends"]["milvus"]["local"]["backend"], "milvus-lite")
             self.assertIn("available", payload["retrieval_backends"]["milvus"])
+            self.assertEqual(payload["retrieval_backends"]["milvus"]["embedding"]["provider"], "hash")
+            self.assertEqual(payload["retrieval_backends"]["milvus"]["embedding"]["dim"], 128)
+            self.assertEqual(payload["retrieval_backends"]["milvus"]["embedding"]["version"], "1")
             self.assertFalse(payload["retrieval_backends"]["milvus"]["local"]["deep_check"])
             self.assertIn("collection_exists", payload["retrieval_backends"]["milvus"]["local"])
             self.assertTrue(payload["retrieval_backends"]["milvus"]["asset_coverage"]["deep_check_required"])
@@ -1217,6 +1224,57 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["backend_configuration"]["asset_portability"], "local-deliverable")
             self.assertEqual(payload["storage_layout"]["storage_profile"], "local")
             self.assertTrue(payload["storage_layout"]["local_runtime_data_in_project"])
+
+    def test_milvus_benchmark_uses_recent_activation_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            log_activation(
+                db_path,
+                {
+                    "activation_id": "act_benchmark_1",
+                    "workspace": str(workspace),
+                    "task_query": "milvus embedding benchmark",
+                    "selected_assets": [{"asset_id": "asset_hit"}],
+                    "created_at": "2026-04-26T00:00:00+00:00",
+                },
+            )
+
+            def fake_search(*args, **kwargs):
+                self.assertEqual(kwargs["query_text"], "milvus embedding benchmark")
+                return [
+                    {
+                        "asset_id": "asset_hit",
+                        "title": "Milvus benchmark asset",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "vector_score": 0.73,
+                        "embedding": {"provider": "hash", "model": "token-sha256-signhash"},
+                    }
+                ]
+
+            with patch.object(cli_main, "search_asset_vectors", side_effect=fake_search), patch.object(
+                cli_main,
+                "milvus_available",
+                return_value=True,
+            ):
+                payload = cli_main._build_milvus_benchmark_payload(
+                    workspace=workspace,
+                    queries=[],
+                    sample_size=5,
+                    limit=3,
+                    include_shared=False,
+                )
+
+            self.assertEqual(payload["sample_count"], 1)
+            self.assertEqual(payload["summary"]["queries_with_results"], 1)
+            self.assertEqual(payload["summary"]["comparable_queries"], 1)
+            self.assertEqual(payload["summary"]["queries_with_expected_hit"], 1)
+            self.assertEqual(payload["summary"]["expected_hit_rate"], 1.0)
+            self.assertEqual(payload["samples"][0]["hit_asset_ids"], ["asset_hit"])
+            self.assertEqual(payload["samples"][0]["results"][0]["embedding"]["provider"], "hash")
 
     def test_cli_auto_finish_persists_asset_effectiveness_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -71,6 +71,7 @@ scripts/expcap --help
 
 ```bash
 scripts/expcap sync-milvus --workspace "$PWD" --include-shared
+scripts/expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3
 ```
 
 ## 快速开始
@@ -229,6 +230,7 @@ expcap status --workspace "$PWD"
 
 ```bash
 expcap doctor --workspace "$PWD"
+expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
 ```
 
 重点观察：
@@ -238,6 +240,7 @@ expcap doctor --workspace "$PWD"
 - `candidate_review_queue`：是否有需要人工审核的候选。
 - `asset_effectiveness_summary`：资产热度和健康状态。
 - `retrieval_backends`：Milvus 核心召回是否可用，以及 SQLite 轻量索引是否健康。
+- `milvus_benchmark`：抽样检查 Milvus 召回质量，包括 provider 元数据、top score 和历史选中资产命中率。
 - `project_activity`：当前项目是 `active` 还是 `inactive`，用于报表和覆盖率口径。
 - `backend_configuration`：当前是本地模式还是共享模式。
 

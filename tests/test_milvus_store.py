@@ -126,6 +126,45 @@ class MilvusStoreLockTests(unittest.TestCase):
             self.assertTrue(summary["db_exists"])
             self.assertIsNone(summary["collection_exists"])
             self.assertIsNone(summary["indexed_entities"])
+            self.assertEqual(summary["embedding"]["provider"], "hash")
+            self.assertEqual(summary["embedding"]["model"], "token-sha256-signhash")
+            self.assertEqual(summary["embedding"]["dim"], 128)
+            self.assertEqual(summary["embedding"]["version"], "1")
+
+    def test_prepare_asset_document_includes_embedding_metadata(self) -> None:
+        document = milvus_store.prepare_asset_document(
+            {
+                "asset_id": "asset_1",
+                "asset_type": "pattern",
+                "knowledge_kind": "pattern",
+                "knowledge_scope": "project",
+                "title": "Milvus embedding provider",
+                "content": "Store provider metadata with vectors.",
+                "scope": {"level": "workspace", "value": "demo"},
+            }
+        )
+
+        self.assertEqual(len(document["vector"]), 128)
+        self.assertEqual(document["embedding_provider"], "hash")
+        self.assertEqual(document["embedding_requested_provider"], "hash")
+        self.assertEqual(document["embedding_model"], "token-sha256-signhash")
+        self.assertEqual(document["embedding_dim"], 128)
+        self.assertEqual(document["embedding_version"], "1")
+        self.assertEqual(document["embedding_status"], "ready")
+
+    def test_unsupported_embedding_provider_falls_back_to_hash(self) -> None:
+        with patch.dict(os.environ, {"EXPCAP_EMBEDDING_PROVIDER": "openai"}, clear=False):
+            document = milvus_store.prepare_asset_document(
+                {
+                    "asset_id": "asset_1",
+                    "title": "Fallback embedding",
+                    "content": "Unsupported providers should not break local tests.",
+                }
+            )
+
+        self.assertEqual(document["embedding_provider"], "hash")
+        self.assertEqual(document["embedding_requested_provider"], "openai")
+        self.assertEqual(document["embedding_status"], "fallback")
 
     def test_backend_summary_deep_check_opens_client(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

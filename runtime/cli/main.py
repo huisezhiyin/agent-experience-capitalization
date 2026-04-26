@@ -40,10 +40,12 @@ from runtime.storage.fs_store import (
     storage_layout_for_workspace,
     workspace_from_payload,
 )
+from runtime.storage.embeddings import embedding_provider_config
 from runtime.storage.milvus_store import (
     milvus_available,
     milvus_backend_summary,
     milvus_lock_summary,
+    search_asset_vectors,
     sync_assets_directory_with_report,
     upsert_asset_vector,
 )
@@ -400,6 +402,37 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete Milvus entities whose asset_id no longer exists in the source assets directory.",
     )
+
+    benchmark_milvus = subparsers.add_parser(
+        "benchmark-milvus",
+        help="Run a lightweight Milvus retrieval benchmark from recent activations or explicit queries.",
+    )
+    benchmark_milvus.add_argument("--workspace", required=True, help="Workspace path to benchmark.")
+    benchmark_milvus.add_argument(
+        "--query",
+        dest="queries",
+        action="append",
+        default=[],
+        help="Explicit query to benchmark. May be passed multiple times.",
+    )
+    benchmark_milvus.add_argument(
+        "--sample-size",
+        type=int,
+        default=10,
+        help="Number of recent activation queries to sample when --query is omitted.",
+    )
+    benchmark_milvus.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Milvus candidates to retrieve per query.",
+    )
+    benchmark_milvus.add_argument(
+        "--include-shared",
+        action="store_true",
+        help="Also query the shared cross-project Milvus index.",
+    )
+    benchmark_milvus.add_argument("--output", help="Optional output JSON path.")
 
     review = subparsers.add_parser("review", help="Generate an episode from a trace bundle.")
     review.add_argument("--input", required=True, help="Path to a trace bundle JSON file.")
@@ -994,6 +1027,200 @@ def _handle_sync_milvus(args: argparse.Namespace) -> int:
     return 0
 
 
+def _activation_expected_asset_ids(activation: dict[str, Any]) -> list[str]:
+    selected_ids = activation.get("selected_asset_ids", [])
+    if selected_ids:
+        return [str(asset_id) for asset_id in selected_ids if asset_id]
+    return [
+        str(item["asset_id"])
+        for item in activation.get("selected_assets", [])
+        if isinstance(item, dict) and item.get("asset_id")
+    ]
+
+
+def _benchmark_samples_from_inputs(
+    *,
+    db_path: Path,
+    workspace: Path,
+    queries: list[str],
+    sample_size: int,
+) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    seen_queries: set[str] = set()
+    for query in queries:
+        clean_query = query.strip()
+        if not clean_query or clean_query in seen_queries:
+            continue
+        seen_queries.add(clean_query)
+        samples.append(
+            {
+                "query": clean_query,
+                "source": "explicit",
+                "source_activation_id": None,
+                "expected_asset_ids": [],
+            }
+        )
+
+    if samples:
+        return samples
+
+    for activation in list_activation_logs(db_path, workspace=str(workspace), limit=max(sample_size * 3, sample_size)):
+        query = str(activation.get("task_query") or "").strip()
+        if not query or query in seen_queries:
+            continue
+        seen_queries.add(query)
+        samples.append(
+            {
+                "query": query,
+                "source": "activation_log",
+                "source_activation_id": activation.get("activation_id"),
+                "expected_asset_ids": _activation_expected_asset_ids(activation),
+            }
+        )
+        if len(samples) >= sample_size:
+            break
+    return samples
+
+
+def _score_summary(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"avg": 0.0, "max": 0.0}
+    return {
+        "avg": round(sum(values) / len(values), 4),
+        "max": round(max(values), 4),
+    }
+
+
+def _build_milvus_benchmark_payload(
+    *,
+    workspace: Path,
+    queries: list[str],
+    sample_size: int,
+    limit: int,
+    include_shared: bool,
+) -> dict[str, Any]:
+    workspace = workspace.resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    bounded_sample_size = max(sample_size, 0)
+    bounded_limit = max(limit, 1)
+    samples = _benchmark_samples_from_inputs(
+        db_path=db_path,
+        workspace=workspace,
+        queries=queries,
+        sample_size=bounded_sample_size,
+    )
+
+    benchmark_items: list[dict[str, Any]] = []
+    top_scores: list[float] = []
+    result_counts: list[int] = []
+    hit_sample_count = 0
+    comparable_sample_count = 0
+
+    for sample in samples:
+        local_results = search_asset_vectors(
+            default_milvus_db_path(workspace),
+            query_text=sample["query"],
+            limit=bounded_limit,
+            knowledge_scope="project",
+            workspace=str(workspace),
+        )
+        shared_results: list[dict[str, Any]] = []
+        if include_shared:
+            shared_results = search_asset_vectors(
+                shared_milvus_db_path(),
+                query_text=sample["query"],
+                limit=bounded_limit,
+                knowledge_scope="cross-project",
+            )
+        results = [
+            {**item, "milvus_index": "local"}
+            for item in local_results
+        ] + [
+            {**item, "milvus_index": "shared"}
+            for item in shared_results
+        ]
+        results = sorted(results, key=lambda item: float(item.get("vector_score", 0.0) or 0.0), reverse=True)[
+            :bounded_limit
+        ]
+        result_ids = [str(item.get("asset_id")) for item in results if item.get("asset_id")]
+        expected_ids = sample["expected_asset_ids"]
+        hits = [asset_id for asset_id in expected_ids if asset_id in result_ids]
+        if expected_ids:
+            comparable_sample_count += 1
+            if hits:
+                hit_sample_count += 1
+        scores = [float(item.get("vector_score", 0.0) or 0.0) for item in results]
+        if scores:
+            top_scores.append(scores[0])
+        result_counts.append(len(results))
+        benchmark_items.append(
+            {
+                **sample,
+                "result_count": len(results),
+                "top_score": round(scores[0], 4) if scores else 0.0,
+                "hit_asset_ids": hits,
+                "hit_count": len(hits),
+                "results": [
+                    {
+                        "asset_id": item.get("asset_id"),
+                        "title": item.get("title"),
+                        "knowledge_scope": item.get("knowledge_scope"),
+                        "knowledge_kind": item.get("knowledge_kind"),
+                        "milvus_index": item.get("milvus_index"),
+                        "vector_score": round(float(item.get("vector_score", 0.0) or 0.0), 4),
+                        "embedding": item.get("embedding"),
+                    }
+                    for item in results
+                ],
+            }
+        )
+
+    result_count_summary = _score_summary([float(count) for count in result_counts])
+    top_score_summary = _score_summary(top_scores)
+    return {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "milvus_available": milvus_available(),
+        "embedding": embedding_provider_config(),
+        "limit": bounded_limit,
+        "sample_size": bounded_sample_size,
+        "include_shared": include_shared,
+        "sample_count": len(benchmark_items),
+        "summary": {
+            "queries_with_results": sum(1 for item in benchmark_items if item["result_count"] > 0),
+            "comparable_queries": comparable_sample_count,
+            "queries_with_expected_hit": hit_sample_count,
+            "expected_hit_rate": round(hit_sample_count / comparable_sample_count, 4)
+            if comparable_sample_count
+            else None,
+            "avg_result_count": result_count_summary["avg"],
+            "avg_top_score": top_score_summary["avg"],
+            "max_top_score": top_score_summary["max"],
+        },
+        "samples": benchmark_items,
+    }
+
+
+def _handle_benchmark_milvus(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    payload = _build_milvus_benchmark_payload(
+        workspace=workspace,
+        queries=args.queries,
+        sample_size=args.sample_size,
+        limit=args.limit,
+        include_shared=args.include_shared,
+    )
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "milvus_benchmark.json"
+    )
+    save_json(output_path, payload)
+    _print_json({"saved_to": str(output_path), "benchmark": payload})
+    return 0
+
+
 def _handle_activate(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
@@ -1213,6 +1440,7 @@ def _build_status_payload(
                 "role": "core-semantic-retrieval",
                 "core_retrieval": backend_config["retrieval"] in {"milvus-lite", "milvus"},
                 "available": milvus_available(),
+                "embedding": embedding_provider_config(),
                 "local": local_milvus,
                 "shared": shared_milvus,
                 "asset_coverage": {
@@ -1480,6 +1708,8 @@ def main() -> int:
         return _handle_install_project(args)
     if args.command == "sync-milvus":
         return _handle_sync_milvus(args)
+    if args.command == "benchmark-milvus":
+        return _handle_benchmark_milvus(args)
     if args.command == "review":
         return _handle_review(args)
     if args.command == "extract":

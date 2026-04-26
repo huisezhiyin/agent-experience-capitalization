@@ -68,6 +68,12 @@ Sync the Milvus retrieval index:
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap sync-milvus --workspace "$PWD" --include-shared
 ```
 
+Benchmark Milvus retrieval quality:
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
+```
+
 Install into another project:
 
 ```bash

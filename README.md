@@ -81,6 +81,7 @@ retrieval layer:
 
 ```bash
 scripts/expcap sync-milvus --workspace "$PWD" --include-shared
+scripts/expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3
 ```
 
 ## Quickstart
@@ -253,6 +254,7 @@ Use `doctor` when you need actionable diagnostics:
 
 ```bash
 expcap doctor --workspace "$PWD"
+expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
 ```
 
 Watch these fields:
@@ -264,6 +266,8 @@ Watch these fields:
 - `asset_effectiveness_summary`: asset temperature and review health.
 - `retrieval_backends`: Milvus core retrieval readiness and SQLite lightweight
   index health.
+- `milvus_benchmark`: sampled Milvus retrieval quality, including provider
+  metadata, top scores, and historical selected-asset hit rate.
 - `project_activity`: whether the workspace is `active` or `inactive` for
   reporting and coverage analysis.
 - `backend_configuration`: active local/shareable backend profile.

@@ -247,6 +247,9 @@ expcap doctor --workspace "$PWD"
 expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
 ```
 
+`benchmark-milvus` 会先同步当前 embedding profile 对应的 Milvus index，再执行
+查询，避免 profile 切换被误判成召回失败。
+
 重点观察：
 
 - `activation_feedback_summary`：经验是否帮忙、是否 pending、是否 stale missing。

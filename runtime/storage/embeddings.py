@@ -181,10 +181,7 @@ def embedding_provider_config() -> dict[str, object]:
 
 def embedding_profile_slug(*, provider: EmbeddingProvider | None = None, requested_provider: str | None = None) -> str:
     provider = provider or current_embedding_provider()
-    requested_provider = requested_provider or os.environ.get("EXPCAP_EMBEDDING_PROVIDER", provider.name)
     provider_part = _slugify_profile_part(provider.name)
-    if requested_provider == "openai" and provider.name != "openai":
-        provider_part = "openai-fallback-hash"
     model_part = _slugify_profile_part(provider.model)
     return f"{provider_part}-{model_part}-{provider.dim}"
 

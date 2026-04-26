@@ -175,7 +175,7 @@ class MilvusStoreLockTests(unittest.TestCase):
         self.assertEqual(document["embedding_provider"], "hash")
         self.assertEqual(document["embedding_requested_provider"], "openai")
         self.assertEqual(document["embedding_status"], "fallback")
-        self.assertEqual(document["embedding_profile"], "openai-fallback-hash-token-sha256-signhash-128")
+        self.assertEqual(document["embedding_profile"], "hash-token-sha256-signhash-128")
 
     def test_unsupported_embedding_provider_falls_back_to_hash(self) -> None:
         with patch.dict(os.environ, {"EXPCAP_EMBEDDING_PROVIDER": "unknown"}, clear=False):

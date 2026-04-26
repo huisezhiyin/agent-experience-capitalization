@@ -148,6 +148,29 @@ class BackendConfigTests(unittest.TestCase):
             self.assertTrue(hash_path.name.startswith("milvus.hash-token-sha25-"))
             self.assertTrue(openai_path.name.startswith("milvus.openai-text-embe-"))
 
+    def test_openai_missing_key_fallback_reuses_hash_profile_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir()
+
+            with patch.dict(os.environ, {"EXPCAP_EMBEDDING_PROVIDER": "hash"}, clear=False):
+                hash_path = default_milvus_db_path(workspace)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "EXPCAP_EMBEDDING_PROVIDER": "openai",
+                    "EXPCAP_OPENAI_API_KEY": "",
+                    "OPENAI_API_KEY": "",
+                },
+                clear=False,
+            ):
+                fallback_path = default_milvus_db_path(workspace)
+                layout = storage_layout_for_workspace(workspace)
+
+            self.assertEqual(fallback_path, hash_path)
+            self.assertEqual(layout["retrieval_index_profile"], "hash-token-sha256-signhash-128")
+
 
 if __name__ == "__main__":
     unittest.main()

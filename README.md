@@ -275,6 +275,9 @@ expcap doctor --workspace "$PWD"
 expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
 ```
 
+`benchmark-milvus` pre-syncs the active embedding-profile Milvus index before
+querying, so profile switches do not look like retrieval failures.
+
 Watch these fields:
 
 - `activation_feedback_summary`: helped, pending, or stale missing feedback.

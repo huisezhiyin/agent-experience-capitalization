@@ -1287,6 +1287,41 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["samples"][0]["hit_asset_ids"], ["asset_hit"])
             self.assertEqual(payload["samples"][0]["results"][0]["embedding"]["provider"], "hash")
 
+    def test_milvus_benchmark_syncs_active_indexes_before_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            with patch.object(
+                cli_main,
+                "sync_assets_directory_with_report",
+                side_effect=[
+                    {"synced": 2, "pruned": 0},
+                    {"synced": 1, "pruned": 0},
+                ],
+            ) as sync_mock, patch.object(cli_main, "search_asset_vectors", return_value=[]), patch.object(
+                cli_main,
+                "milvus_available",
+                return_value=True,
+            ):
+                payload = cli_main._build_milvus_benchmark_payload(
+                    workspace=workspace,
+                    queries=["profile sync benchmark"],
+                    sample_size=5,
+                    limit=3,
+                    include_shared=True,
+                )
+
+            self.assertEqual(sync_mock.call_count, 2)
+            local_db_path, local_assets_dir = sync_mock.call_args_list[0].args
+            shared_db_path, shared_assets_dir = sync_mock.call_args_list[1].args
+            self.assertTrue(str(local_db_path).endswith(".db"))
+            self.assertEqual(local_assets_dir.name, "assets")
+            self.assertTrue(str(shared_db_path).endswith(".db"))
+            self.assertEqual(shared_assets_dir.name, "assets")
+            self.assertEqual(payload["preflight_sync"]["local"]["synced"], 2)
+            self.assertEqual(payload["preflight_sync"]["shared"]["synced"], 1)
+
     def test_cli_auto_finish_persists_asset_effectiveness_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"

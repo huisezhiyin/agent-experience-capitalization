@@ -74,6 +74,9 @@ Benchmark Milvus retrieval quality:
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap benchmark-milvus --workspace "$PWD" --sample-size 5 --limit 3 --include-shared
 ```
 
+`benchmark-milvus` 会先同步当前 embedding profile 对应的 Milvus index，避免
+profile 切换或 fallback 被误判成召回失败。
+
 Optional real embedding provider:
 
 ```bash

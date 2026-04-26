@@ -1109,6 +1109,16 @@ def _build_milvus_benchmark_payload(
     ensure_db(db_path)
     bounded_sample_size = max(sample_size, 0)
     bounded_limit = max(limit, 1)
+    local_sync_report = sync_assets_directory_with_report(
+        default_milvus_db_path(workspace),
+        memory_root_for_workspace(workspace) / "assets",
+    )
+    shared_sync_report = {"synced": 0, "pruned": 0}
+    if include_shared:
+        shared_sync_report = sync_assets_directory_with_report(
+            shared_milvus_db_path(),
+            shared_memory_root() / "assets",
+        )
     samples = _benchmark_samples_from_inputs(
         db_path=db_path,
         workspace=workspace,
@@ -1188,6 +1198,10 @@ def _build_milvus_benchmark_payload(
         "generated_at": now_utc(),
         "milvus_available": milvus_available(),
         "embedding": embedding_provider_config(),
+        "preflight_sync": {
+            "local": local_sync_report,
+            "shared": shared_sync_report if include_shared else None,
+        },
         "limit": bounded_limit,
         "sample_size": bounded_sample_size,
         "include_shared": include_shared,

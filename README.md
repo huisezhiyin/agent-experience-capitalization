@@ -180,8 +180,25 @@ The installer appends non-destructive instructions and creates
 
 ```bash
 expcap auto-start --task "your task" --workspace "$PWD"
+expcap progressive-recall \
+  --task "your task" \
+  --workspace "$PWD" \
+  --message "new error, file scope, or phase change"
+expcap feedback \
+  --workspace "$PWD" \
+  --activation-id "<activation id>" \
+  --help-signal supported_strong
 expcap auto-finish --task "your task" --workspace "$PWD" --verification-status passed --result-status success
 ```
+
+Use `progressive-recall` only when the conversation meaningfully changes:
+new errors, new files/modules, topic drift, or phase changes such as
+discussion -> implementation -> test -> fix. It applies a cooldown and returns
+only delta assets that were not already activated recently.
+
+Use `feedback` after validating whether an activation actually helped. It
+records the help signal on the activation and refreshes linked assets'
+temperature and review status.
 
 For manual debugging, the lower-level pipeline is still available:
 `ingest -> review -> extract -> promote -> activate`.

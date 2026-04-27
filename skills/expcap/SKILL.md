@@ -49,6 +49,18 @@ Start a task by activating experience:
 EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap auto-start --task "<task summary>" --workspace "$PWD"
 ```
 
+During a task, run event-driven delta recall only when the conversation changes:
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap progressive-recall --task "<task summary>" --workspace "$PWD" --message "<new error/file/phase/topic signal>"
+```
+
+When a real task confirms whether the activation helped, record it:
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap feedback --workspace "$PWD" --activation-id "<activation id>" --help-signal supported_strong
+```
+
 Finish a task by saving experience:
 
 ```bash
@@ -109,6 +121,10 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap install-pro
 ## Operating Rules
 
 - Run `auto-start` before substantive analysis, edits, or verification.
+- Use `progressive-recall` only for meaningful new signals: new errors, new
+  files/modules, topic drift, or phase changes. Do not run it on every turn.
+- Use `feedback` after a real validation result so linked assets can refresh
+  their temperature and review status.
 - Treat `active / inactive` as a reporting label. If a new chat starts in the
   project, `auto-start` should still run by default.
 - If experience is activated, summarize what matched, why it matched, and how

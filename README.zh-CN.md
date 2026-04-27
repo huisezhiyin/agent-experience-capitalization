@@ -163,8 +163,23 @@ scripts/expcap install-project --workspace /path/to/project --include-claude
 
 ```bash
 expcap auto-start --task "your task" --workspace "$PWD"
+expcap progressive-recall \
+  --task "your task" \
+  --workspace "$PWD" \
+  --message "new error, file scope, or phase change"
+expcap feedback \
+  --workspace "$PWD" \
+  --activation-id "<activation id>" \
+  --help-signal supported_strong
 expcap auto-finish --task "your task" --workspace "$PWD" --verification-status passed --result-status success
 ```
+
+只有当对话发生明显变化时才使用 `progressive-recall`：出现新错误、新文件/模块、
+topic drift，或从讨论进入实现、测试、修复等阶段变化。它会应用冷却时间，并且只返回
+最近没有激活过的 delta assets。
+
+当你已经验证 activation 是否真的帮到了任务时，再使用 `feedback`。它会把帮助信号写回
+activation，并同步刷新关联资产的温度和 review status。
 
 如果需要手动调试，底层流程仍然可用：`ingest -> review -> extract -> promote -> activate`。
 

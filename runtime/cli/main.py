@@ -4,6 +4,8 @@ from html import escape as html_escape
 import json
 import os
 from pathlib import Path
+import re
+import tempfile
 from typing import Any
 
 from runtime.backends import resolve_backend_config
@@ -37,6 +39,7 @@ from runtime.storage.fs_store import (
     memory_root_for_workspace,
     save_json,
     default_shared_asset_path,
+    project_storage_key,
     shared_db_path,
     shared_memory_root,
     shared_milvus_db_path,
@@ -195,6 +198,94 @@ def _build_asset_review_backlog(
     }
 
 
+def _asset_validation_priority(asset: dict[str, Any]) -> float:
+    confidence = float(asset.get("confidence", 0.0) or 0.0)
+    kind = str(asset.get("knowledge_kind", asset.get("asset_type", "pattern")) or "pattern")
+    kind_bonus = 0.08 if kind == "pattern" else 0.05 if kind == "context" else 0.0
+    updated_at = _parse_datetime(asset.get("updated_at") or asset.get("created_at"))
+    recency_bonus = 0.0
+    if updated_at:
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        age_days = max((datetime.now(timezone.utc) - updated_at).total_seconds() / 86400.0, 0.0)
+        recency_bonus = max(0.0, 0.2 - min(age_days, 30.0) * 0.01)
+    return round(confidence + kind_bonus + recency_bonus, 4)
+
+
+def _validation_tokens(*values: str) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        tokens.extend(
+            token.lower()
+            for token in re.findall(r"[A-Za-z0-9_]{3,}", value)
+            if len(token) >= 3 and not token.isdigit()
+        )
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    return ordered
+
+
+def _recent_validation_topics(activations: list[dict[str, Any]], *, limit: int = 8) -> list[str]:
+    topics: list[str] = []
+    for activation in activations[: max(limit, 0)]:
+        topics.extend(_validation_tokens(str(activation.get("task_query") or "")))
+    return topics[:24]
+
+
+def _build_unproven_validation_queue(
+    assets: list[dict[str, Any]],
+    *,
+    activations: list[dict[str, Any]],
+    limit: int,
+) -> dict[str, Any]:
+    recent_topics = _recent_validation_topics(activations)
+    queue_items: list[dict[str, Any]] = []
+    for asset in assets:
+        if asset.get("review_status", "unproven") != "unproven":
+            continue
+        title = str(asset.get("title") or "")
+        content = str(asset.get("content") or "")
+        topic_hits = [token for token in recent_topics if token in title.lower() or token in content.lower()]
+        relevance_bonus = round(min(len(topic_hits), 4) * 0.08, 4)
+        priority_score = round(_asset_validation_priority(asset) + relevance_bonus, 4)
+        queue_items.append(
+            {
+                "asset_id": asset.get("asset_id"),
+                "title": asset.get("title"),
+                "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
+                "knowledge_scope": asset.get("knowledge_scope", "project"),
+                "confidence": asset.get("confidence"),
+                "updated_at": asset.get("updated_at") or asset.get("created_at"),
+                "priority_score": priority_score,
+                "recent_topic_hits": topic_hits[:6],
+                "validation_hint": (
+                    f"Recent task overlap: {', '.join(topic_hits[:3])}."
+                    if topic_hits
+                    else "Needs first real activation with explicit help feedback."
+                ),
+            }
+        )
+    queue_items.sort(
+        key=lambda item: (
+            -(float(item.get("priority_score", 0.0) or 0.0)),
+            item.get("updated_at") or "",
+            item.get("asset_id") or "",
+        )
+    )
+    return {
+        "asset_count": len(queue_items),
+        "recent_topics": recent_topics,
+        "top_items": queue_items[:limit],
+    }
+
+
 def _summarize_milvus_retrieval_effectiveness(activations: list[dict[str, Any]]) -> dict[str, Any]:
     activation_count = len(activations)
     with_milvus_candidates = 0
@@ -331,6 +422,90 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Explicit task constraint. May be passed multiple times.",
     )
     auto_start.add_argument("--output", help="Optional path for the activation view JSON.")
+
+    feedback = subparsers.add_parser(
+        "feedback",
+        help="Record help feedback for a stored activation and refresh linked asset effectiveness.",
+    )
+    feedback.add_argument("--workspace", required=True, help="Workspace path for the activation.")
+    feedback.add_argument("--activation-id", help="Activation id to update. Defaults to the latest unresolved activation.")
+    feedback.add_argument(
+        "--help-signal",
+        required=True,
+        choices=["supported_strong", "supported_weak", "unclear"],
+        help="Help signal to record for the activation.",
+    )
+    feedback.add_argument(
+        "--feedback-summary",
+        help="Optional feedback summary. Defaults to a short summary derived from the help signal.",
+    )
+    feedback.add_argument(
+        "--feedback-at",
+        help="Optional explicit feedback timestamp. Defaults to now in UTC.",
+    )
+    feedback.add_argument(
+        "--signal-source",
+        default="manual_feedback",
+        help="Feedback source label. Defaults to manual_feedback.",
+    )
+
+    progressive_recall = subparsers.add_parser(
+        "progressive-recall",
+        help="Conditionally run event-driven delta recall during an ongoing conversation.",
+    )
+    progressive_recall.add_argument("--workspace", required=True, help="Workspace path for the task.")
+    progressive_recall.add_argument("--task", required=True, help="Current task or conversation summary.")
+    progressive_recall.add_argument(
+        "--message",
+        dest="messages",
+        action="append",
+        default=[],
+        help="New user/agent message or conversation delta. May be passed multiple times.",
+    )
+    progressive_recall.add_argument(
+        "--constraint",
+        dest="constraints",
+        action="append",
+        default=[],
+        help="Explicit task constraint. May be passed multiple times.",
+    )
+    progressive_recall.add_argument(
+        "--file",
+        dest="files",
+        action="append",
+        default=[],
+        help="Newly relevant file path or module. May be passed multiple times.",
+    )
+    progressive_recall.add_argument(
+        "--error",
+        dest="errors",
+        action="append",
+        default=[],
+        help="New error or failure signal. May be passed multiple times.",
+    )
+    progressive_recall.add_argument(
+        "--phase",
+        choices=["discussion", "implementation", "test", "fix", "review"],
+        help="Current task phase. Phase changes can trigger delta recall.",
+    )
+    progressive_recall.add_argument(
+        "--cooldown-minutes",
+        type=float,
+        default=10.0,
+        help="Minimum minutes between non-forced progressive recalls. Defaults to 10.",
+    )
+    progressive_recall.add_argument(
+        "--lookback",
+        type=int,
+        default=5,
+        help="Recent activation count used for drift detection and asset de-duplication. Defaults to 5.",
+    )
+    progressive_recall.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass trigger and cooldown checks.",
+    )
+    progressive_recall.add_argument("--output", help="Optional path for the progressive activation view JSON.")
 
     auto_finish = subparsers.add_parser(
         "auto-finish",
@@ -746,6 +921,117 @@ def _handle_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fallback_activation_view_path(workspace: Path, view: dict[str, Any]) -> Path:
+    return (
+        Path(tempfile.gettempdir())
+        / "expcap-activation-views"
+        / project_storage_key(workspace)
+        / f"{view['activation_id']}.json"
+    )
+
+
+def _save_activation_view(
+    *,
+    workspace: Path,
+    view: dict[str, Any],
+    requested_output: str | None,
+) -> tuple[Path, dict[str, Any] | None]:
+    output_path = Path(requested_output) if requested_output else default_activation_view_path(workspace, view)
+    try:
+        save_json(output_path, view)
+        return output_path, None
+    except OSError as error:
+        if requested_output:
+            raise
+        fallback_path = _fallback_activation_view_path(workspace, view)
+        save_json(fallback_path, view)
+        return fallback_path, {
+            "kind": "fallback_output",
+            "reason": "default_activation_view_unwritable",
+            "requested_path": str(output_path),
+            "fallback_path": str(fallback_path),
+            "error": str(error),
+        }
+
+
+def _activation_source_dirs(
+    workspace: Path,
+    *,
+    assets_dir: str | None = None,
+    candidates_dir: str | None = None,
+) -> tuple[Path, Path]:
+    memory_root = memory_root_for_workspace(workspace)
+    resolved_assets_dir = Path(assets_dir) if assets_dir else memory_root / "assets"
+    resolved_candidates_dir = Path(candidates_dir) if candidates_dir else memory_root / "candidates"
+    return resolved_assets_dir, resolved_candidates_dir
+
+
+def _linked_asset_ids_from_activation(updated_activation: dict[str, Any]) -> list[str]:
+    linked_asset_ids = updated_activation.get("selected_asset_ids") or [
+        item["asset_id"]
+        for item in updated_activation.get("selected_assets", [])
+        if isinstance(item, dict) and item.get("asset_id")
+    ]
+    return [str(asset_id) for asset_id in linked_asset_ids if asset_id]
+
+
+def _apply_activation_feedback(
+    *,
+    workspace: Path,
+    db_path: Path,
+    activation_id: str,
+    feedback: dict[str, Any],
+) -> dict[str, Any] | None:
+    updated_activation = record_activation_feedback(
+        db_path,
+        activation_id=activation_id,
+        feedback=feedback,
+    )
+    if not updated_activation:
+        return None
+    _update_activation_view_file(workspace, updated_activation)
+    linked_asset_ids = _linked_asset_ids_from_activation(updated_activation)
+    feedback_stats = summarize_asset_feedback(
+        db_path,
+        asset_ids=linked_asset_ids,
+    )
+    memory_root = memory_root_for_workspace(workspace)
+    for selected_asset in updated_activation.get("selected_assets", []):
+        asset_id = selected_asset.get("asset_id")
+        if not asset_id:
+            continue
+        selected_scope = selected_asset.get("knowledge_scope", "project")
+        asset_db_path = shared_db_path() if selected_scope == "cross-project" else db_path
+        asset = get_asset(asset_db_path, asset_id=asset_id)
+        asset_path = (
+            default_shared_asset_path(
+                {
+                    "asset_type": selected_asset["asset_type"],
+                    "asset_id": asset_id,
+                }
+            )
+            if selected_scope == "cross-project"
+            else memory_root / "assets" / f"{selected_asset['asset_type']}s" / f"{asset_id}.json"
+        )
+        if not asset and asset_path.exists():
+            asset = load_json(asset_path)
+        if not asset:
+            continue
+        asset = apply_asset_effectiveness(
+            asset,
+            feedback_stats.get(asset_id, {}),
+            updated_at=feedback.get("feedback_at"),
+        )
+        upsert_asset(asset_db_path, asset)
+        save_json(asset_path, asset)
+    return {
+        "activation_id": updated_activation["activation_id"],
+        "help_signal": feedback["help_signal"],
+        "linked_asset_ids": linked_asset_ids,
+        "feedback_summary": feedback.get("feedback_summary"),
+    }
+
+
 def _handle_auto_start(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     project_activity = load_project_policy(workspace)
@@ -755,30 +1041,363 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
         workspace=workspace,
         db_path=db_path,
     )
+    assets_dir, candidates_dir = _activation_source_dirs(workspace)
     view = activate_assets(
         task=args.task,
         workspace=workspace,
         constraints=args.constraints,
-        assets_dir=workspace / ".agent-memory" / "assets",
-        candidates_dir=workspace / ".agent-memory" / "candidates",
+        assets_dir=assets_dir,
+        candidates_dir=candidates_dir,
         db_path=db_path,
     )
-    output_path = Path(args.output) if args.output else default_activation_view_path(workspace, view)
-    save_json(output_path, view)
+    output_path, save_warning = _save_activation_view(
+        workspace=workspace,
+        view=view,
+        requested_output=args.output,
+    )
     log_activation(db_path, view)
     touch_assets_last_used(
         db_path,
         [item["asset_id"] for item in view.get("selected_assets", [])],
         view["created_at"],
     )
+    payload = {
+        "saved_to": str(output_path),
+        "activation_id": view["activation_id"],
+        "selected_count": len(view.get("selected_assets", [])),
+        "project_activity": project_activity,
+        "feedback_cleanup": feedback_cleanup,
+        "activation_view": view,
+    }
+    if save_warning:
+        payload["save_warning"] = save_warning
+    _print_json(payload)
+    return 0
+
+
+_PROGRESSIVE_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "from",
+    "into",
+    "what",
+    "when",
+    "where",
+    "how",
+    "why",
+    "是否",
+    "现在",
+    "继续",
+    "这个",
+    "我们",
+    "是不是",
+}
+
+
+def _progressive_tokens(*values: str) -> set[str]:
+    joined = " ".join(value for value in values if value)
+    tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_./:-]{3,}", joined)
+        if token.lower() not in _PROGRESSIVE_STOPWORDS and not token.isdigit()
+    }
+    return tokens
+
+
+def _activation_asset_ids(activation: dict[str, Any]) -> set[str]:
+    selected_ids = activation.get("selected_asset_ids")
+    if isinstance(selected_ids, list):
+        return {str(asset_id) for asset_id in selected_ids if asset_id}
+    return {
+        str(item.get("asset_id"))
+        for item in activation.get("selected_assets", [])
+        if isinstance(item, dict) and item.get("asset_id")
+    }
+
+
+def _activation_created_at(activation: dict[str, Any]) -> datetime | None:
+    parsed = _parse_datetime(activation.get("created_at"))
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _latest_progressive_phase(activations: list[dict[str, Any]]) -> str | None:
+    for activation in activations:
+        progressive = activation.get("progressive_recall") or {}
+        phase = progressive.get("phase")
+        if phase:
+            return str(phase)
+    return None
+
+
+def _progressive_trigger_decision(
+    *,
+    task: str,
+    messages: list[str],
+    files: list[str],
+    errors: list[str],
+    phase: str | None,
+    recent_activations: list[dict[str, Any]],
+    cooldown_minutes: float,
+    force: bool,
+) -> dict[str, Any]:
+    if force:
+        return {"triggered": True, "reasons": ["force"], "cooldown_active": False, "novel_tokens": []}
+
+    now = datetime.now(timezone.utc)
+    latest_activation = recent_activations[0] if recent_activations else None
+    latest_created_at = _activation_created_at(latest_activation or {})
+    minutes_since_latest = (
+        round((now - latest_created_at).total_seconds() / 60.0, 2)
+        if latest_created_at
+        else None
+    )
+    cooldown_active = (
+        minutes_since_latest is not None
+        and minutes_since_latest < max(cooldown_minutes, 0.0)
+    )
+
+    reasons: list[str] = []
+    if not recent_activations:
+        reasons.append("no_prior_activation")
+    if errors:
+        reasons.append("new_error_signal")
+    if files:
+        reasons.append("file_scope_changed")
+    if phase and phase != _latest_progressive_phase(recent_activations):
+        reasons.append("phase_changed")
+
+    baseline_text = " ".join(str(item.get("task_query") or "") for item in recent_activations)
+    incoming_tokens = _progressive_tokens(task, *messages, *files, *errors, phase or "")
+    baseline_tokens = _progressive_tokens(baseline_text)
+    novel_tokens = sorted(incoming_tokens - baseline_tokens)
+    if len(novel_tokens) >= 3:
+        reasons.append("topic_drift")
+
+    if cooldown_active and not errors:
+        return {
+            "triggered": False,
+            "reasons": reasons,
+            "skip_reason": "cooldown_active",
+            "cooldown_active": True,
+            "minutes_since_latest": minutes_since_latest,
+            "cooldown_minutes": cooldown_minutes,
+            "novel_tokens": novel_tokens[:12],
+        }
+    if not reasons:
+        return {
+            "triggered": False,
+            "reasons": [],
+            "skip_reason": "no_new_signal",
+            "cooldown_active": False,
+            "minutes_since_latest": minutes_since_latest,
+            "cooldown_minutes": cooldown_minutes,
+            "novel_tokens": novel_tokens[:12],
+        }
+    return {
+        "triggered": True,
+        "reasons": list(dict.fromkeys(reasons)),
+        "cooldown_active": False,
+        "minutes_since_latest": minutes_since_latest,
+        "cooldown_minutes": cooldown_minutes,
+        "novel_tokens": novel_tokens[:12],
+    }
+
+
+def _progressive_query_text(args: argparse.Namespace) -> str:
+    parts = [args.task]
+    parts.extend(args.messages)
+    if args.phase:
+        parts.append(f"phase:{args.phase}")
+    parts.extend(f"file:{item}" for item in args.files)
+    parts.extend(f"error:{item}" for item in args.errors)
+    return " | ".join(part for part in parts if part)
+
+
+def _progressive_delta_retrieval_summary(
+    *,
+    original_summary: dict[str, Any],
+    delta_assets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary = dict(original_summary)
+    summary["selected_from_milvus"] = sum(
+        1 for asset in delta_assets if "milvus" in asset.get("retrieval_sources", [])
+    )
+    summary["selected_from_sqlite"] = sum(
+        1 for asset in delta_assets if "sqlite" in asset.get("retrieval_sources", [])
+    )
+    summary["selected_from_json"] = sum(
+        1
+        for asset in delta_assets
+        if "json" in asset.get("retrieval_sources", [])
+        or "shared-json" in asset.get("retrieval_sources", [])
+    )
+    summary["selected_from_candidate_fallback"] = sum(
+        1 for asset in delta_assets if "candidate-fallback" in asset.get("retrieval_sources", [])
+    )
+    return summary
+
+
+def _handle_progressive_recall(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    recent_activations = list_activation_logs(
+        db_path,
+        workspace=str(workspace),
+        limit=max(args.lookback, 1),
+    )
+    decision = _progressive_trigger_decision(
+        task=args.task,
+        messages=args.messages,
+        files=args.files,
+        errors=args.errors,
+        phase=args.phase,
+        recent_activations=recent_activations,
+        cooldown_minutes=args.cooldown_minutes,
+        force=args.force,
+    )
+    if not decision["triggered"]:
+        _print_json(
+            {
+                "triggered": False,
+                "workspace": str(workspace),
+                "decision": decision,
+                "selected_count": 0,
+                "activation_view": None,
+            }
+        )
+        return 0
+
+    previously_seen_asset_ids: set[str] = set()
+    for activation in recent_activations:
+        previously_seen_asset_ids.update(_activation_asset_ids(activation))
+
+    assets_dir, candidates_dir = _activation_source_dirs(workspace)
+    view = activate_assets(
+        task=_progressive_query_text(args),
+        workspace=workspace,
+        constraints=args.constraints,
+        assets_dir=assets_dir,
+        candidates_dir=candidates_dir,
+        db_path=db_path,
+    )
+    original_selected_assets = list(view.get("selected_assets", []))
+    delta_assets = [
+        asset
+        for asset in original_selected_assets
+        if asset.get("asset_id") not in previously_seen_asset_ids
+    ]
+    view["selected_assets"] = delta_assets
+    view["selected_asset_ids"] = [
+        asset["asset_id"]
+        for asset in delta_assets
+        if isinstance(asset, dict) and asset.get("asset_id")
+    ]
+    view["retrieval_summary"] = _progressive_delta_retrieval_summary(
+        original_summary=view.get("retrieval_summary") or {},
+        delta_assets=delta_assets,
+    )
+    view["activation_id"] = f"{view['activation_id']}-progressive"
+    view["progressive_recall"] = {
+        "kind": "event_driven_delta",
+        "trigger_reasons": decision["reasons"],
+        "phase": args.phase,
+        "cooldown_minutes": args.cooldown_minutes,
+        "lookback": args.lookback,
+        "novel_tokens": decision.get("novel_tokens", []),
+        "deduped_asset_count": len(original_selected_assets) - len(delta_assets),
+        "previous_activation_count": len(recent_activations),
+    }
+    view["why_selected"] = [
+        "progressive recall only runs when new conversation signals justify a delta search",
+        "already activated assets are de-duplicated from the returned delta",
+        *view.get("why_selected", []),
+    ]
+
+    output_path, save_warning = _save_activation_view(
+        workspace=workspace,
+        view=view,
+        requested_output=args.output,
+    )
+    log_activation(db_path, view)
+    touch_assets_last_used(
+        db_path,
+        [item["asset_id"] for item in view.get("selected_assets", [])],
+        view["created_at"],
+    )
+    payload = {
+        "triggered": True,
+        "saved_to": str(output_path),
+        "activation_id": view["activation_id"],
+        "selected_count": len(delta_assets),
+        "deduped_asset_count": view["progressive_recall"]["deduped_asset_count"],
+        "decision": decision,
+        "activation_view": view,
+    }
+    if save_warning:
+        payload["save_warning"] = save_warning
+    _print_json(payload)
+    return 0
+
+
+def _handle_feedback(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    activation = None
+    activation_id = args.activation_id
+    if activation_id:
+        activation = next(
+            (
+                item
+                for item in list_activation_logs(db_path, workspace=str(workspace))
+                if item.get("activation_id") == activation_id
+            ),
+            None,
+        )
+    else:
+        activation = find_latest_activation(
+            db_path,
+            workspace=str(workspace),
+            unresolved_only=True,
+        )
+        activation_id = activation.get("activation_id") if activation else None
+    if not activation or not activation_id:
+        _print_json(
+            {
+                "updated": False,
+                "workspace": str(workspace),
+                "activation_feedback": None,
+                "reason": "activation_not_found",
+            }
+        )
+        return 0
+
+    feedback = {
+        "help_signal": args.help_signal,
+        "signal_source": args.signal_source,
+        "feedback_summary": args.feedback_summary or f"Recorded {args.help_signal} via expcap feedback command.",
+        "feedback_at": args.feedback_at or now_utc(),
+    }
+    activation_feedback = _apply_activation_feedback(
+        workspace=workspace,
+        db_path=db_path,
+        activation_id=activation_id,
+        feedback=feedback,
+    )
     _print_json(
         {
-            "saved_to": str(output_path),
-            "activation_id": view["activation_id"],
-            "selected_count": len(view.get("selected_assets", [])),
-            "project_activity": project_activity,
-            "feedback_cleanup": feedback_cleanup,
-            "activation_view": view,
+            "updated": bool(activation_feedback),
+            "workspace": str(workspace),
+            "activation_feedback": activation_feedback,
         }
     )
     return 0
@@ -865,57 +1484,12 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             "trace_id": trace["trace_id"],
             "episode_id": episode["episode_id"],
         }
-        updated_activation = record_activation_feedback(
-            db_path,
+        activation_feedback = _apply_activation_feedback(
+            workspace=workspace,
+            db_path=db_path,
             activation_id=latest_activation["activation_id"],
             feedback=feedback,
         )
-        if updated_activation:
-            _update_activation_view_file(workspace, updated_activation)
-        if updated_activation:
-            linked_asset_ids = updated_activation.get("selected_asset_ids") or [
-                item["asset_id"]
-                for item in updated_activation.get("selected_assets", [])
-                if isinstance(item, dict) and item.get("asset_id")
-            ]
-            feedback_stats = summarize_asset_feedback(
-                db_path,
-                asset_ids=linked_asset_ids,
-            )
-            for selected_asset in updated_activation.get("selected_assets", []):
-                asset_id = selected_asset.get("asset_id")
-                if not asset_id:
-                    continue
-                selected_scope = selected_asset.get("knowledge_scope", "project")
-                asset_db_path = shared_db_path() if selected_scope == "cross-project" else db_path
-                asset = get_asset(asset_db_path, asset_id=asset_id)
-                asset_path = (
-                    default_shared_asset_path(
-                        {
-                            "asset_type": selected_asset["asset_type"],
-                            "asset_id": asset_id,
-                        }
-                    )
-                    if selected_scope == "cross-project"
-                    else memory_root / "assets" / f"{selected_asset['asset_type']}s" / f"{asset_id}.json"
-                )
-                if not asset and asset_path.exists():
-                    asset = load_json(asset_path)
-                if not asset:
-                    continue
-                asset = apply_asset_effectiveness(
-                    asset,
-                    feedback_stats.get(asset_id, {}),
-                    updated_at=feedback["feedback_at"],
-                )
-                upsert_asset(asset_db_path, asset)
-                save_json(asset_path, asset)
-            activation_feedback = {
-                "activation_id": updated_activation["activation_id"],
-                "help_signal": feedback["help_signal"],
-                "linked_asset_ids": linked_asset_ids,
-                "feedback_summary": feedback["feedback_summary"],
-            }
 
     saved_candidates = []
     promoted_assets = []
@@ -1269,11 +1843,10 @@ def _handle_activate(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
     ensure_db(db_path)
-    assets_dir = Path(args.assets_dir) if args.assets_dir else workspace / ".agent-memory" / "assets"
-    candidates_dir = (
-        Path(args.candidates_dir)
-        if args.candidates_dir
-        else workspace / ".agent-memory" / "candidates"
+    assets_dir, candidates_dir = _activation_source_dirs(
+        workspace,
+        assets_dir=args.assets_dir,
+        candidates_dir=args.candidates_dir,
     )
     view = activate_assets(
         task=args.task,
@@ -1283,15 +1856,21 @@ def _handle_activate(args: argparse.Namespace) -> int:
         candidates_dir=candidates_dir,
         db_path=db_path,
     )
-    output_path = Path(args.output) if args.output else default_activation_view_path(workspace, view)
-    save_json(output_path, view)
+    output_path, save_warning = _save_activation_view(
+        workspace=workspace,
+        view=view,
+        requested_output=args.output,
+    )
     log_activation(db_path, view)
     touch_assets_last_used(
         db_path,
         [item["asset_id"] for item in view.get("selected_assets", [])],
         view["created_at"],
     )
-    _print_json({"saved_to": str(output_path), "activation_id": view["activation_id"], "activation_view": view})
+    payload = {"saved_to": str(output_path), "activation_id": view["activation_id"], "activation_view": view}
+    if save_warning:
+        payload["save_warning"] = save_warning
+    _print_json(payload)
     return 0
 
 
@@ -1376,6 +1955,11 @@ def _build_status_payload(
     asset_review_backlog = _build_asset_review_backlog(
         review_status_summary,
         total_assets=len(assets),
+    )
+    unproven_validation_queue = _build_unproven_validation_queue(
+        assets,
+        activations=activations,
+        limit=limit,
     )
 
     candidate_status_summary = {status: 0 for status in ALL_CANDIDATE_STATUSES}
@@ -1515,6 +2099,7 @@ def _build_status_payload(
             "review_status": review_status_summary,
         },
         "asset_review_backlog": asset_review_backlog,
+        "unproven_validation_queue": unproven_validation_queue,
         "candidate_status_summary": candidate_status_summary,
         "candidate_review_queue": {
             "candidate_count": review_queue["candidate_count"],
@@ -1567,6 +2152,7 @@ def _build_doctor_payload(
     queue = status_payload["candidate_review_queue"]
     asset_health = status_payload["asset_effectiveness_summary"]["review_status"]
     asset_backlog = status_payload["asset_review_backlog"]
+    unproven_validation_queue = status_payload["unproven_validation_queue"]
 
     checks.append(
         _diagnostic_check(
@@ -1601,6 +2187,16 @@ def _build_doctor_payload(
             f"Asset proof coverage: {asset_backlog.get('healthy_count', 0)}/{asset_backlog.get('total_assets', 0)} healthy, {unproven_count} unproven ({unproven_ratio:.0%}).",
         )
     )
+    if unproven_validation_queue.get("asset_count", 0):
+        top_unproven = unproven_validation_queue.get("top_items", [{}])[0]
+        checks.append(
+            _diagnostic_check(
+                "unproven_validation_queue",
+                "pass",
+                f"Top unproven validation queue has {unproven_validation_queue.get('asset_count', 0)} assets; highest-priority item is {top_unproven.get('asset_id')} ({top_unproven.get('priority_score')}).",
+                "Use the unproven validation queue in status/dashboard to pick the next assets for real-task validation.",
+            )
+        )
     missing = int(feedback.get("missing", 0) or 0)
     pending = int(feedback.get("pending", 0) or 0)
     oldest_unresolved = unresolved_activations[0] if unresolved_activations else None
@@ -1625,6 +2221,8 @@ def _build_doctor_payload(
     milvus_recommendation = (
         "Set EXPCAP_RETRIEVAL_INDEX_URI or switch EXPCAP_RETRIEVAL_BACKEND back to milvus-lite."
         if local_milvus.get("degraded_reason") == "missing_retrieval_index_uri"
+        else "Lock metadata points to a dead pid; clear the stale lock or run a reset before retrying Milvus."
+        if local_lock.get("stale_hint")
         else "If it remains locked, stop the stale process or switch retrieval to a shared/cloud Milvus backend."
     )
     checks.append(
@@ -1656,13 +2254,23 @@ def _build_doctor_payload(
             else "Check sync-milvus coverage and query quality; Milvus is available but not yet contributing enough selected assets.",
         )
     )
-    if local_lock["locked"]:
+    if local_lock["locked"] or local_lock.get("stale_hint"):
         checks.append(
             _diagnostic_check(
                 "local_milvus_lock",
                 "warn",
-                f"Local Milvus lock is held at {local_lock['lock_path']} with metadata: {local_lock['metadata_raw'] or 'empty'}.",
-                "Do not delete the lock while a live process owns it. If pid_exists is false, a future reset command can safely remove it.",
+                (
+                    f"Local Milvus lock metadata points to a stale pid at {local_lock['lock_path']}: "
+                    f"{local_lock['metadata_raw'] or 'empty'}."
+                    if local_lock.get("stale_hint")
+                    else f"Local Milvus lock is held at {local_lock['lock_path']} with metadata: "
+                    f"{local_lock['metadata_raw'] or 'empty'}."
+                ),
+                (
+                    "The recorded pid is no longer alive; safe cleanup/reset can remove this stale lock before retrying Milvus."
+                    if local_lock.get("stale_hint")
+                    else "Do not delete the lock while a live process owns it. If pid_exists is false, a future reset command can safely remove it."
+                ),
             )
         )
 
@@ -1797,6 +2405,19 @@ def _build_dashboard_payload(
         }
         for candidate in _dashboard_item_rows(candidates, limit=bounded_limit)
     ]
+    unproven_rows = [
+        {
+            "asset_id": item.get("asset_id"),
+            "title": item.get("title"),
+            "knowledge_kind": item.get("knowledge_kind"),
+            "confidence": item.get("confidence"),
+            "priority_score": item.get("priority_score"),
+            "recent_topic_hits": item.get("recent_topic_hits"),
+            "validation_hint": item.get("validation_hint"),
+            "updated_at": item.get("updated_at"),
+        }
+        for item in status_payload["unproven_validation_queue"].get("top_items", [])
+    ]
     activation_rows = [
         {
             "activation_id": activation.get("activation_id"),
@@ -1918,6 +2539,8 @@ def _build_dashboard_payload(
         "write_frequency": write_frequency,
         "assets": asset_rows,
         "candidates": candidate_rows,
+        "unproven_validation_queue": status_payload["unproven_validation_queue"],
+        "unproven_assets": unproven_rows,
         "activations": activation_rows,
         "review_queue": status_payload["candidate_review_queue"],
         "retrieval": {
@@ -2062,6 +2685,17 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
         ]
         for item in queue_items
     ]
+    unproven_rows = [
+        [
+            item.get("title"),
+            item.get("knowledge_kind"),
+            item.get("confidence"),
+            item.get("priority_score"),
+            item.get("validation_hint"),
+            item.get("updated_at"),
+        ]
+        for item in payload["unproven_assets"]
+    ]
 
     return f"""<!doctype html>
 <html lang="en">
@@ -2192,6 +2826,11 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
   </section>
 
   <section class="panel">
+    <h2>Unproven Validation Queue</h2>
+    {_render_dashboard_table(["Title", "Kind", "Confidence", "Priority", "Validation Hint", "Updated"], unproven_rows)}
+  </section>
+
+  <section class="panel">
     <h2>Recent Candidates</h2>
     {_render_dashboard_table(["Title", "Status", "Readiness", "Help", "Updated"], candidate_rows)}
   </section>
@@ -2233,6 +2872,7 @@ def _handle_dashboard(args: argparse.Namespace) -> int:
                 "cards": payload["cards"],
                 "effectiveness_snapshot": payload["effectiveness_snapshot"],
                 "review_queue_count": payload["review_queue"]["candidate_count"],
+                "unproven_validation_count": payload["unproven_validation_queue"]["asset_count"],
             },
         }
     )
@@ -2297,6 +2937,10 @@ def main() -> int:
         return _handle_ingest(args)
     if args.command == "auto-start":
         return _handle_auto_start(args)
+    if args.command == "feedback":
+        return _handle_feedback(args)
+    if args.command == "progressive-recall":
+        return _handle_progressive_recall(args)
     if args.command == "auto-finish":
         return _handle_auto_finish(args)
     if args.command == "install-project":

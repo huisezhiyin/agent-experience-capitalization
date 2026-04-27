@@ -248,7 +248,7 @@ def milvus_lock_summary(db_path: Path) -> dict[str, Any]:
         "metadata": metadata,
         "pid_exists": pid_exists,
         "age_seconds": age_seconds,
-        "stale_hint": bool(locked and pid_exists is False),
+        "stale_hint": bool(lock_path.exists() and pid_exists is False),
     }
 
 

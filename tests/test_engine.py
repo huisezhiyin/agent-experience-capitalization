@@ -586,6 +586,82 @@ class EngineTests(unittest.TestCase):
                 any("特征关键词命中" in item for item in activation["selected_assets"][0]["match_evidence"])
             )
 
+    def test_activate_assets_reserves_slot_for_strong_milvus_unproven_probe(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_dir = workspace / ".agent-memory" / "assets" / "patterns"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            for index in range(5):
+                (assets_dir / f"pattern_hot_generic_{index:03d}.json").write_text(
+                    json.dumps(
+                        {
+                            "asset_id": f"pattern_hot_generic_{index:03d}",
+                            "workspace": str(workspace),
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                            "title": f"milvus generic repair guidance {index}",
+                            "content": "milvus expcap generic guidance for stable retrieval debugging.",
+                            "scope": {"level": "workspace", "value": "general-coding-task"},
+                            "confidence": 0.95,
+                            "status": "active",
+                            "historical_help": {
+                                "activation_count": 10,
+                                "supported_count": 10,
+                                "supported_strong_count": 10,
+                                "supported_weak_count": 0,
+                                "weighted_support_score": 10.0,
+                                "support_ratio": 1.0,
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            target_asset = {
+                "asset_id": "pattern_milvus_probe_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "聚焦处理 expcap 的 Milvus 核心问题 稳定性 召回贡献 可解释性",
+                "content": "milvus core issue drill focused on stability contribution and explainability.",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.75,
+                "status": "active",
+                "review_status": "unproven",
+                "temperature": "neutral",
+                "vector_score": 0.79,
+                "source_episode_ids": ["ep_milvus_probe_001"],
+                "source_candidate_ids": ["cand_milvus_probe_001"],
+            }
+            (assets_dir / "pattern_milvus_probe_001.json").write_text(
+                json.dumps(target_asset),
+                encoding="utf-8",
+            )
+
+            with patch("runtime.core.engine.search_asset_vectors", return_value=[dict(target_asset)]):
+                activation = activate_assets(
+                    task="聚焦处理 expcap 的 Milvus 核心问题 稳定性 召回贡献 可解释性",
+                    workspace=workspace,
+                    constraints=[],
+                    assets_dir=workspace / ".agent-memory" / "assets",
+                    candidates_dir=candidates_dir,
+                    db_path=None,
+                )
+
+            selected_ids = [item["asset_id"] for item in activation["selected_assets"]]
+            self.assertIn("pattern_milvus_probe_001", selected_ids)
+            self.assertTrue(activation["selection_adjustments"])
+            self.assertTrue(any("Milvus 试用位" in item for item in activation["selection_adjustments"]))
+
     def test_explain_activation_view_mentions_top_evidence_and_risk(self) -> None:
         explained = explain_object(
             {

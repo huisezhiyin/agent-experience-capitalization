@@ -721,6 +721,9 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
             "weighted_support_score": round(float(historical_help.get("weighted_support_score", 0.0) or 0.0), 2),
             "support_ratio": round(support_ratio, 2),
         },
+        "title_hits": title_hits,
+        "content_hits": content_hits,
+        "distinctive_hits": distinctive_hits,
         "effectiveness_summary": effectiveness_summary,
         "evidence": _unique_preserve_order(evidence),
         "risk_flags": _unique_preserve_order(risk_flags),
@@ -917,7 +920,7 @@ def _select_activation_assets(
     scored_assets: list[tuple[float, dict[str, Any], dict[str, Any]]],
     *,
     workspace_str: str,
-) -> tuple[list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     selected: list[dict[str, Any]] = []
     selection_risks = _unique_preserve_order(
         [
@@ -926,6 +929,7 @@ def _select_activation_assets(
             for risk in details.get("risk_flags", [])
         ]
     )
+    selection_adjustments: list[str] = []
 
     for score, asset, details in scored_assets[:5]:
         provenance = _source_provenance(asset, workspace_str)
@@ -956,7 +960,70 @@ def _select_activation_assets(
             }
         )
 
-    return selected, selection_risks
+    selected_ids = {item["asset_id"] for item in selected}
+    strongest_milvus_probe: tuple[float, dict[str, Any], dict[str, Any]] | None = None
+    for score, asset, details in scored_assets:
+        if asset.get("asset_id") in selected_ids:
+            continue
+        if "milvus" not in asset.get("retrieval_sources", []):
+            continue
+        if details["effectiveness_summary"].get("review_status") != "unproven":
+            continue
+        vector_score = float(asset.get("vector_score", 0.0) or 0.0)
+        if vector_score < 0.7:
+            continue
+        if not details.get("title_hits"):
+            continue
+        strongest_milvus_probe = (score, asset, details)
+        break
+
+    if strongest_milvus_probe is not None and selected:
+        replacement_index = len(selected) - 1
+        for index in range(len(selected) - 1, -1, -1):
+            item = selected[index]
+            activation_count = int(item.get("historical_help", {}).get("activation_count", 0) or 0)
+            if (
+                "milvus" not in item.get("retrieval_sources", [])
+                and item.get("review_status") != "unproven"
+                and activation_count >= 3
+            ):
+                replacement_index = index
+                break
+        replaced = selected[replacement_index]
+        score, asset, details = strongest_milvus_probe
+        provenance = _source_provenance(asset, workspace_str)
+        selected[replacement_index] = {
+            "asset_id": asset["asset_id"],
+            "asset_type": asset["asset_type"],
+            "knowledge_scope": asset.get("knowledge_scope", "project"),
+            "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
+            "title": asset["title"],
+            "reason": f"候选来源已确认，匹配分数 {score:.2f}；因 Milvus 强语义命中被保留为试用位。",
+            "match_score": round(score, 2),
+            "score_breakdown": {
+                "base_score": round(details["base_score"], 2),
+                "evidence_bonus": round(details["evidence_bonus"], 2),
+                "penalty_score": round(details["penalty_score"], 2),
+            },
+            "historical_help": details["historical_help"],
+            "effectiveness_summary": details["effectiveness_summary"],
+            "temperature": details["effectiveness_summary"]["temperature"],
+            "review_status": details["effectiveness_summary"]["review_status"],
+            "retrieval_sources": asset.get("retrieval_sources", []),
+            "source_provenance": provenance,
+            "llm_use_guidance": _llm_use_guidance(asset, details, provenance),
+            "vector_score": round(float(asset.get("vector_score", 0.0)), 4),
+            "match_evidence": details["evidence"][:8],
+            "risk_flags": details["risk_flags"][:5],
+        }
+        selection_adjustments.append(
+            "保留了 1 个 Milvus 试用位：高语义命中的 unproven 资产可以进入最终 selected_assets，避免被高证据旧资产完全压制。"
+        )
+        selection_adjustments.append(
+            f"Milvus 试用位命中 {asset['asset_id']}，替换掉 {replaced['asset_id']}。"
+        )
+
+    return selected, selection_risks, selection_adjustments
 
 
 def _build_activation_why_selected(
@@ -1042,7 +1109,9 @@ def activate_assets(
         assets=retrieval["assets"],
         db_path=db_path,
     )
-    selected, selection_risks = _select_activation_assets(scored_assets, workspace_str=workspace_str)
+    selected, selection_risks, selection_adjustments = _select_activation_assets(
+        scored_assets, workspace_str=workspace_str
+    )
     rendered_context, fallback_episode_refs = _assemble_activation_context(scored_assets, constraints=constraints)
 
     return {
@@ -1052,6 +1121,7 @@ def activate_assets(
         "selected_assets": selected,
         "why_selected": _build_activation_why_selected(scope=scope, constraints=constraints, retrieval=retrieval),
         "selection_risks": selection_risks,
+        "selection_adjustments": selection_adjustments,
         "retrieval_summary": _build_retrieval_summary(selected, retrieval),
         "pipeline": {
             "kind": "experience_rag_activation",

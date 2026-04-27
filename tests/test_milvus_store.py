@@ -109,6 +109,20 @@ class MilvusStoreLockTests(unittest.TestCase):
             self.assertTrue(summary["pid_exists"])
             self.assertIsInstance(summary["age_seconds"], float)
 
+    def test_milvus_lock_summary_marks_stale_hint_when_pid_is_dead(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            lock_path = db_path.with_name(f"{db_path.name}.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path.write_text("pid=999999 acquired_at=1.0\n", encoding="utf-8")
+
+            with patch.object(milvus_store, "_process_exists", return_value=False):
+                summary = milvus_store.milvus_lock_summary(db_path)
+
+            self.assertTrue(summary["lock_exists"])
+            self.assertFalse(summary["pid_exists"])
+            self.assertTrue(summary["stale_hint"])
+
     def test_backend_summary_is_lightweight_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "milvus.db"

@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import sqlite3
@@ -11,7 +12,7 @@ from unittest.mock import patch
 from runtime.cli import main as cli_main
 from runtime.storage.fs_store import default_db_path
 from runtime.storage.sqlite_store import upsert_asset
-from runtime.storage.sqlite_store import ensure_db, log_activation
+from runtime.storage.sqlite_store import ensure_db, list_activation_logs, log_activation
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -225,6 +226,250 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(auto_start_payload["selected_count"], 1)
             self.assertEqual(activation["selected_assets"][0]["asset_id"], "pattern_20260413_auto")
             self.assertTrue(any("当前约束" in item for item in activation["rendered_context"]))
+
+    def test_cli_auto_start_falls_back_when_default_activation_view_path_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            view = {
+                "activation_id": "act_review-fallback",
+                "task_query": "review fallback handling",
+                "workspace": str(workspace),
+                "selected_assets": [],
+                "selected_asset_ids": [],
+                "retrieval_summary": {},
+                "created_at": "2026-04-27T00:00:00+00:00",
+            }
+            default_path = cli_main.default_activation_view_path(workspace, view)
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                if Path(path) == default_path:
+                    raise PermissionError("permission denied for default activation path")
+                original_save_json(path, payload)
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="review fallback handling",
+                constraints=[],
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", return_value=view), patch.object(
+                cli_main,
+                "save_json",
+                side_effect=flaky_save_json,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_auto_start(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(captured["activation_id"], "act_review-fallback")
+            self.assertIn("save_warning", captured)
+            warning = captured["save_warning"]
+            assert isinstance(warning, dict)
+            self.assertEqual(warning["reason"], "default_activation_view_unwritable")
+            self.assertEqual(warning["requested_path"], str(default_path))
+            fallback_path = Path(captured["saved_to"])
+            self.assertTrue(fallback_path.exists())
+            self.assertEqual(json.loads(fallback_path.read_text(encoding="utf-8"))["activation_id"], "act_review-fallback")
+            self.assertEqual(len(list_activation_logs(default_db_path(workspace), workspace=str(workspace))), 1)
+
+    def test_cli_activate_uses_memory_root_source_dirs_in_user_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs: object) -> dict[str, object]:
+                captured["assets_dir"] = kwargs["assets_dir"]
+                captured["candidates_dir"] = kwargs["candidates_dir"]
+                return {
+                    "activation_id": "act_memory-root-check",
+                    "task_query": "inspect memory root source dirs",
+                    "workspace": str(workspace),
+                    "selected_assets": [],
+                    "selected_asset_ids": [],
+                    "retrieval_summary": {},
+                    "created_at": "2026-04-27T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="inspect memory root source dirs",
+                constraints=[],
+                assets_dir=None,
+                candidates_dir=None,
+                output=None,
+            )
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "user-cache"}), patch.object(
+                cli_main,
+                "activate_assets",
+                side_effect=fake_activate_assets,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: None):
+                expected_memory_root = cli_main.memory_root_for_workspace(workspace)
+                result = cli_main._handle_activate(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(captured["assets_dir"], expected_memory_root / "assets")
+            self.assertEqual(captured["candidates_dir"], expected_memory_root / "candidates")
+
+    def test_cli_auto_start_uses_memory_root_source_dirs_in_user_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs: object) -> dict[str, object]:
+                captured["assets_dir"] = kwargs["assets_dir"]
+                captured["candidates_dir"] = kwargs["candidates_dir"]
+                return {
+                    "activation_id": "act_auto-start-memory-root-check",
+                    "task_query": "inspect auto-start memory root source dirs",
+                    "workspace": str(workspace),
+                    "selected_assets": [],
+                    "selected_asset_ids": [],
+                    "retrieval_summary": {},
+                    "created_at": "2026-04-27T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="inspect auto-start memory root source dirs",
+                constraints=[],
+                output=None,
+            )
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "user-cache"}), patch.object(
+                cli_main,
+                "activate_assets",
+                side_effect=fake_activate_assets,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: None):
+                expected_memory_root = cli_main.memory_root_for_workspace(workspace)
+                result = cli_main._handle_auto_start(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(captured["assets_dir"], expected_memory_root / "assets")
+            self.assertEqual(captured["candidates_dir"], expected_memory_root / "candidates")
+
+    def test_cli_progressive_recall_skips_without_new_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+            env = {**os.environ, "EXPCAP_STORAGE_PROFILE": "local"}
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "inspect dashboard quality",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "progressive-recall",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "inspect dashboard quality",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            self.assertFalse(payload["triggered"])
+            self.assertIn(payload["decision"]["skip_reason"], {"cooldown_active", "no_new_signal"})
+            self.assertEqual(payload["selected_count"], 0)
+
+    def test_cli_progressive_recall_triggers_delta_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            env = {**os.environ, "EXPCAP_STORAGE_PROFILE": "local"}
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}):
+                db_path = default_db_path(workspace)
+                ensure_db(db_path)
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": "pattern_progressive_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "progressive recall websocket repair pattern",
+                        "content": "when websocket failures appear mid-conversation, run a delta recall focused on the new error signal.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": ["ep_progressive_001"],
+                        "source_candidate_ids": ["cand_progressive_001"],
+                        "confidence": 0.84,
+                        "status": "active",
+                        "review_status": "healthy",
+                        "temperature": "warm",
+                        "created_at": "2026-04-26T00:00:00+00:00",
+                        "updated_at": "2026-04-26T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "progressive-recall",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "continue debugging chat transport",
+                    "--message",
+                    "new websocket timeout appears after switching to streaming",
+                    "--error",
+                    "WebSocketTimeoutError while reading stream",
+                    "--phase",
+                    "fix",
+                    "--cooldown-minutes",
+                    "10",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            view_path = Path(payload["saved_to"])
+            view = json.loads(view_path.read_text(encoding="utf-8"))
+            db_path = default_db_path(workspace)
+            activations = list_activation_logs(db_path, workspace=str(workspace))
+
+            self.assertTrue(payload["triggered"])
+            self.assertIn("new_error_signal", payload["decision"]["reasons"])
+            self.assertEqual(payload["selected_count"], 1)
+            self.assertEqual(view["selected_assets"][0]["asset_id"], "pattern_progressive_001")
+            self.assertEqual(view["retrieval_summary"]["selected_from_sqlite"], 1)
+            self.assertEqual(view["progressive_recall"]["kind"], "event_driven_delta")
+            self.assertEqual(activations[0]["progressive_recall"]["phase"], "fix")
 
     def test_cli_auto_finish_can_promote_cross_project_asset(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -570,12 +815,15 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("Retrieval Effectiveness", html)
             self.assertIn("Write Frequency", html)
             self.assertIn("Effectiveness Snapshot", html)
+            self.assertIn("Unproven Validation Queue", html)
             self.assertEqual(payload["dashboard"]["cards"]["assets"], 1)
             self.assertIn("effectiveness_snapshot", payload["dashboard"])
+            self.assertEqual(payload["dashboard"]["unproven_validation_count"], 0)
             self.assertEqual(dashboard["cards"]["healthy_assets"], 1)
             self.assertEqual(dashboard["effectiveness_snapshot"]["verdict"], "healthy")
             self.assertEqual(dashboard["retrieval"]["effectiveness"]["selected_from_milvus"], 1)
             self.assertEqual(dashboard["activations"][0]["help_signal"], "supported_strong")
+            self.assertEqual(dashboard["unproven_validation_queue"]["asset_count"], 0)
 
     def test_cli_doctor_reports_unproven_assets_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -630,6 +878,311 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(proof_check["status"], "pass")
             self.assertIn("10 unproven", proof_check["summary"])
             self.assertNotIn("recommendation", proof_check)
+
+    def test_cli_status_builds_unproven_validation_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = workspace / ".agent-memory" / "index.sqlite3"
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_unproven_priority",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "priority unproven pattern",
+                    "content": "needs first validation run",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.92,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-04-26T00:00:00+00:00",
+                    "updated_at": "2026-04-26T00:00:00+00:00",
+                },
+            )
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_healthy_existing",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "healthy pattern",
+                    "content": "already proven",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.85,
+                    "status": "active",
+                    "review_status": "healthy",
+                    "temperature": "warm",
+                    "created_at": "2026-04-20T00:00:00+00:00",
+                    "updated_at": "2026-04-20T00:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["status"]
+            queue = payload["unproven_validation_queue"]
+            self.assertEqual(queue["asset_count"], 1)
+            self.assertEqual(queue["top_items"][0]["asset_id"], "pattern_unproven_priority")
+            self.assertIn("Needs first real activation", queue["top_items"][0]["validation_hint"])
+
+    def test_cli_status_prioritizes_unproven_assets_relevant_to_recent_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_activation_feedback",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "activation feedback workflow",
+                    "content": "record feedback after activation validation",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.75,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-04-27T00:00:00+00:00",
+                    "updated_at": "2026-04-27T00:00:00+00:00",
+                },
+            )
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_branch_protection",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "branch protection workflow",
+                    "content": "configure repository branch protection",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.75,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-04-27T00:00:00+00:00",
+                    "updated_at": "2026-04-27T00:00:00+00:00",
+                },
+            )
+            log_activation(
+                db_path,
+                {
+                    "activation_id": "act_recent_activation_feedback",
+                    "workspace": str(workspace),
+                    "task_query": "continue improving activation feedback workflow",
+                    "selected_asset_ids": [],
+                    "selected_assets": [],
+                    "feedback": {"help_signal": "supported_strong"},
+                    "created_at": "2026-04-27T00:30:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["status"]
+            queue = payload["unproven_validation_queue"]
+            self.assertEqual(queue["top_items"][0]["asset_id"], "pattern_activation_feedback")
+            self.assertIn("activation", queue["top_items"][0]["recent_topic_hits"])
+            self.assertIn("Recent task overlap", queue["top_items"][0]["validation_hint"])
+
+    def test_cli_feedback_records_signal_and_refreshes_asset_effectiveness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_feedback_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "feedback target pattern",
+                    "content": "validate feedback command",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.8,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-04-27T00:00:00+00:00",
+                    "updated_at": "2026-04-27T00:00:00+00:00",
+                },
+            )
+            log_activation(
+                db_path,
+                {
+                    "activation_id": "act_feedback_target",
+                    "workspace": str(workspace),
+                    "task_query": "validate feedback target",
+                    "selected_asset_ids": ["pattern_feedback_target"],
+                    "selected_assets": [
+                        {
+                            "asset_id": "pattern_feedback_target",
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "title": "feedback target pattern",
+                        }
+                    ],
+                    "created_at": "2026-04-27T00:30:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "feedback",
+                    "--workspace",
+                    str(workspace),
+                    "--activation-id",
+                    "act_feedback_target",
+                    "--help-signal",
+                    "supported_strong",
+                    "--feedback-summary",
+                    "validated through direct feedback command",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            self.assertTrue(payload["updated"])
+            self.assertEqual(payload["activation_feedback"]["activation_id"], "act_feedback_target")
+            self.assertEqual(payload["activation_feedback"]["help_signal"], "supported_strong")
+            activation = list_activation_logs(db_path, workspace=str(workspace), limit=1)[0]
+            self.assertEqual(activation["feedback"]["help_signal"], "supported_strong")
+            asset = cli_main.get_asset(db_path, asset_id="pattern_feedback_target")
+            self.assertEqual(asset["review_status"], "healthy")
+            self.assertEqual(asset["temperature"], "warm")
+            self.assertEqual(asset["historical_help"]["supported_count"], 1)
+
+    def test_build_doctor_payload_surfaces_stale_milvus_lock(self) -> None:
+        status_payload = {
+            "counts": {"traces": 0, "episodes": 0, "candidates": 0, "assets": 0, "activation_logs": 1},
+            "retrieval_backends": {
+                "sqlite": {
+                    "db_exists": True,
+                    "asset_rows": 0,
+                    "candidate_rows": 0,
+                    "activation_log_rows": 1,
+                },
+                "milvus": {
+                    "local": {"status": "degraded", "mode": "local", "degraded_reason": "unix_socket_bind_unavailable"},
+                },
+            },
+            "milvus_retrieval_effectiveness": {
+                "selected_from_milvus": 0,
+                "selected_total": 0,
+                "activations_with_milvus_selected": 0,
+                "activation_count": 1,
+                "activation_selected_ratio": 0.0,
+                "avg_selected_vector_score": 0.0,
+            },
+            "activation_feedback_summary": {
+                "supported_strong": 0,
+                "supported_weak": 0,
+                "pending": 0,
+                "missing": 0,
+            },
+            "unresolved_activations": [],
+            "candidate_review_queue": {"candidate_count": 0},
+            "unproven_validation_queue": {"asset_count": 2, "top_items": [{"asset_id": "pattern_x", "priority_score": 0.91}]},
+            "asset_effectiveness_summary": {"review_status": {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}},
+            "asset_review_backlog": {
+                "healthy_count": 0,
+                "total_assets": 0,
+                "unproven_count": 0,
+                "unproven_ratio": 0.0,
+            },
+        }
+        stale_lock = {
+            "lock_path": "/tmp/local.lock",
+            "lock_exists": True,
+            "locked": None,
+            "lock_error": "operation not permitted",
+            "metadata_raw": "pid=123 acquired_at=1.0",
+            "metadata": {"pid": 123, "acquired_at": 1.0},
+            "pid_exists": False,
+            "age_seconds": 10.0,
+            "stale_hint": True,
+        }
+        shared_lock = {
+            "lock_path": "/tmp/shared.lock",
+            "lock_exists": False,
+            "locked": False,
+            "lock_error": None,
+            "metadata_raw": "",
+            "metadata": {},
+            "pid_exists": None,
+            "age_seconds": None,
+            "stale_hint": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            cli_main, "_build_status_payload", return_value=status_payload
+        ), patch.object(cli_main, "milvus_lock_summary", side_effect=[stale_lock, shared_lock]):
+            doctor = cli_main._build_doctor_payload(
+                workspace=(Path(tmpdir) / "workspace").resolve(),
+                limit=3,
+                deep_retrieval_check=False,
+            )
+
+        local_milvus_check = next(item for item in doctor["checks"] if item["name"] == "local_milvus")
+        lock_check = next(item for item in doctor["checks"] if item["name"] == "local_milvus_lock")
+        validation_check = next(item for item in doctor["checks"] if item["name"] == "unproven_validation_queue")
+        self.assertIn("dead pid", local_milvus_check["recommendation"])
+        self.assertIn("stale pid", lock_check["summary"])
+        self.assertIn("safe cleanup/reset", lock_check["recommendation"])
+        self.assertIn("2 assets", validation_check["summary"])
 
     def test_cli_auto_start_still_runs_for_inactive_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

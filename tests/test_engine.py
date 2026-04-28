@@ -586,6 +586,95 @@ class EngineTests(unittest.TestCase):
                 any("特征关键词命中" in item for item in activation["selected_assets"][0]["match_evidence"])
             )
 
+    def test_activate_assets_keeps_milvus_first_slots_over_sqlite_only_assets(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_dir = workspace / ".agent-memory" / "assets" / "patterns"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            for index in range(5):
+                (assets_dir / f"pattern_sqlite_hot_{index:03d}.json").write_text(
+                    json.dumps(
+                        {
+                            "asset_id": f"pattern_sqlite_hot_{index:03d}",
+                            "workspace": str(workspace),
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                            "title": f"default retrieval sqlite hot workflow {index}",
+                            "content": "default retrieval workflow with stable help history.",
+                            "scope": {"level": "workspace", "value": "general-coding-task"},
+                            "confidence": 0.95,
+                            "status": "active",
+                            "historical_help": {
+                                "activation_count": 10,
+                                "supported_count": 10,
+                                "supported_strong_count": 10,
+                                "supported_weak_count": 0,
+                                "weighted_support_score": 10.0,
+                                "support_ratio": 1.0,
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            vector_assets = [
+                {
+                    "asset_id": f"pattern_milvus_first_{index:03d}",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": f"milvus first semantic retrieval workflow {index}",
+                    "content": "milvus semantic retrieval should be preferred over sqlite-only history.",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.75,
+                    "status": "active",
+                    "vector_score": 0.42 - index * 0.02,
+                }
+                for index in range(3)
+            ]
+            (assets_dir / "pattern_milvus_first_000.json").write_text(
+                json.dumps(
+                    {
+                        **vector_assets[0],
+                        "title": "hydrated authoritative Milvus-first workflow",
+                        "content": "SQLite or JSON hydration keeps the freshest asset payload while Milvus supplies vector recall.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("runtime.core.engine.search_asset_vectors", side_effect=[vector_assets, []]):
+                activation = activate_assets(
+                    task="make default retrieval milvus first instead of sqlite history",
+                    workspace=workspace,
+                    constraints=[],
+                    assets_dir=workspace / ".agent-memory" / "assets",
+                    candidates_dir=candidates_dir,
+                    db_path=None,
+                )
+
+            selected_from_milvus = [
+                item for item in activation["selected_assets"] if "milvus" in item.get("retrieval_sources", [])
+            ]
+            self.assertEqual(len(selected_from_milvus), 3)
+            self.assertEqual(activation["retrieval_summary"]["used_milvus_primary"], 1)
+            self.assertEqual(activation["retrieval_summary"]["selected_from_sqlite"], 0)
+            self.assertTrue(
+                any("Milvus 语义召回来源优先" in item for item in selected_from_milvus[0]["match_evidence"])
+            )
+            hydrated_item = next(item for item in selected_from_milvus if item["asset_id"] == "pattern_milvus_first_000")
+            self.assertEqual(hydrated_item["title"], "hydrated authoritative Milvus-first workflow")
+            self.assertIn("json-hydration", hydrated_item["retrieval_sources"])
+
     def test_activate_assets_reserves_slot_for_strong_milvus_unproven_probe(self) -> None:
         import json
         import tempfile
@@ -659,8 +748,7 @@ class EngineTests(unittest.TestCase):
 
             selected_ids = [item["asset_id"] for item in activation["selected_assets"]]
             self.assertIn("pattern_milvus_probe_001", selected_ids)
-            self.assertTrue(activation["selection_adjustments"])
-            self.assertTrue(any("Milvus 试用位" in item for item in activation["selection_adjustments"]))
+            self.assertEqual(activation["retrieval_summary"]["used_milvus_primary"], 1)
 
     def test_explain_activation_view_mentions_top_evidence_and_risk(self) -> None:
         explained = explain_object(

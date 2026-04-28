@@ -275,6 +275,42 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(json.loads(fallback_path.read_text(encoding="utf-8"))["activation_id"], "act_review-fallback")
             self.assertEqual(len(list_activation_logs(default_db_path(workspace), workspace=str(workspace))), 1)
 
+    def test_cli_auto_start_warns_when_activation_log_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            view = {
+                "activation_id": "act_log-fallback",
+                "task_query": "review log fallback handling",
+                "workspace": str(workspace),
+                "selected_assets": [],
+                "selected_asset_ids": [],
+                "retrieval_summary": {},
+                "created_at": "2026-04-28T00:00:00+00:00",
+            }
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="review log fallback handling",
+                constraints=[],
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", return_value=view), patch.object(
+                cli_main,
+                "log_activation",
+                side_effect=sqlite3.OperationalError("attempt to write a readonly database"),
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_auto_start(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(captured["activation_id"], "act_log-fallback")
+            self.assertIn("log_warning", captured)
+            warning = captured["log_warning"]
+            assert isinstance(warning, dict)
+            self.assertEqual(warning["reason"], "sqlite_activation_log_unwritable")
+            self.assertIn("readonly database", warning["error"])
+
     def test_cli_activate_uses_memory_root_source_dirs_in_user_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()
@@ -825,6 +861,44 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(dashboard["activations"][0]["help_signal"], "supported_strong")
             self.assertEqual(dashboard["unproven_validation_queue"]["asset_count"], 0)
 
+    def test_cli_dashboard_falls_back_when_default_json_sidecar_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            default_json_path = workspace / ".agent-memory" / "reviews" / "dashboard.json"
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                if Path(path) == default_json_path:
+                    raise PermissionError("permission denied for default dashboard json")
+                original_save_json(path, payload)
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=10,
+                days=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}), patch.object(
+                cli_main,
+                "save_json",
+                side_effect=flaky_save_json,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_dashboard(args)
+
+            self.assertEqual(result, 0)
+            self.assertIn("save_warning", captured)
+            warning = captured["save_warning"]
+            assert isinstance(warning, dict)
+            self.assertEqual(warning["reason"], "default_dashboard_output_unwritable")
+            fallback_path = Path(captured["saved_to"])
+            self.assertTrue(fallback_path.exists())
+            self.assertTrue(Path(captured["data_saved_to"]).exists())
+            self.assertIn("expcap-reviews", str(fallback_path))
+
     def test_cli_doctor_reports_unproven_assets_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()
@@ -878,6 +952,143 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(proof_check["status"], "pass")
             self.assertIn("10 unproven", proof_check["summary"])
             self.assertNotIn("recommendation", proof_check)
+
+    def test_cli_status_falls_back_when_default_output_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            default_status_path = workspace / ".agent-memory" / "reviews" / "workspace_status.json"
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                if Path(path) == default_status_path:
+                    raise PermissionError("permission denied for default status json")
+                original_save_json(path, payload)
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}), patch.object(
+                cli_main,
+                "save_json",
+                side_effect=flaky_save_json,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_status(args)
+
+            self.assertEqual(result, 0)
+            self.assertIn("save_warning", captured)
+            warning = captured["save_warning"]
+            assert isinstance(warning, dict)
+            self.assertEqual(warning["reason"], "default_status_output_unwritable")
+            fallback_path = Path(captured["saved_to"])
+            self.assertTrue(fallback_path.exists())
+            self.assertIn("expcap-reviews", str(fallback_path))
+
+    def test_cli_status_uses_filesystem_fallback_when_sqlite_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            memory_root = workspace / ".agent-memory"
+            workspace.mkdir(parents=True, exist_ok=True)
+            (memory_root / "assets" / "patterns").mkdir(parents=True, exist_ok=True)
+            (memory_root / "views").mkdir(parents=True, exist_ok=True)
+            (memory_root / "assets" / "patterns" / "pattern_fs_001.json").write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_fs_001",
+                        "asset_type": "pattern",
+                        "knowledge_kind": "pattern",
+                        "title": "filesystem fallback asset",
+                        "status": "active",
+                        "confidence": 0.8,
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (memory_root / "views" / "act_fs_001.json").write_text(
+                json.dumps(
+                    {
+                        "activation_id": "act_fs_001",
+                        "workspace": str(workspace),
+                        "task_query": "status fallback",
+                        "selected_assets": [],
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}), patch.object(
+                cli_main,
+                "ensure_db",
+                side_effect=sqlite3.OperationalError("readonly sqlite index"),
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_status(args)
+
+            self.assertEqual(result, 0)
+            status = captured["status"]
+            assert isinstance(status, dict)
+            self.assertFalse(status["retrieval_backends"]["sqlite"]["available"])
+            self.assertEqual(status["retrieval_backends"]["sqlite"]["fallback"], "filesystem_json")
+            self.assertEqual(status["counts"]["assets"], 1)
+            self.assertEqual(status["counts"]["activation_logs"], 1)
+            self.assertTrue(status["runtime_warnings"])
+
+    def test_cli_doctor_warns_when_sqlite_status_is_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}), patch.object(
+                cli_main,
+                "ensure_db",
+                side_effect=sqlite3.OperationalError("locked sqlite index"),
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_doctor(args)
+
+            self.assertEqual(result, 0)
+            doctor = captured["doctor"]
+            assert isinstance(doctor, dict)
+            sqlite_check = next(item for item in doctor["checks"] if item["name"] == "sqlite_index")
+            self.assertEqual(sqlite_check["status"], "warn")
+            self.assertIn("filesystem JSON fallback", sqlite_check["summary"])
+
+    def test_dashboard_html_shows_degraded_banner_when_sqlite_unavailable(self) -> None:
+        payload = {
+            "status": {
+                "runtime_warnings": [
+                    {
+                        "reason": "sqlite_index_unavailable",
+                        "error": "readonly sqlite index",
+                    }
+                ]
+            }
+        }
+
+        html = cli_main._render_runtime_warnings(payload)
+
+        self.assertIn("Degraded Mode", html)
+        self.assertIn("sqlite_index_unavailable", html)
+        self.assertIn("readonly sqlite index", html)
 
     def test_cli_status_builds_unproven_validation_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1352,6 +1563,104 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(updated_original_asset["historical_help"]["supported_weak_count"], 0)
             self.assertEqual(updated_original_asset["historical_help"]["activation_count"], 1)
             self.assertEqual(updated_original_asset["temperature"], "warm")
+
+    def test_cli_auto_finish_does_not_feedback_unrelated_pending_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            asset_path = workspace / ".agent-memory" / "assets" / "patterns" / "pattern_task_match_001.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_task_match_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "task matched activation feedback",
+                        "content": "only attach auto-finish feedback to an activation with the same task query.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.9,
+                        "status": "active",
+                        "created_at": "2026-04-13T00:00:00+00:00",
+                        "updated_at": "2026-04-13T00:00:00+00:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            for task in ("old unrelated task", "current task"):
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "runtime.cli",
+                        "auto-start",
+                        "--task",
+                        task,
+                        "--workspace",
+                        str(workspace),
+                    ],
+                    cwd=REPO_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "feedback",
+                    "--workspace",
+                    str(workspace),
+                    "--activation-id",
+                    "act_current-task",
+                    "--help-signal",
+                    "supported_strong",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            auto_finish = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-finish",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "current task",
+                    "--verification-status",
+                    "passed",
+                    "--result-status",
+                    "success",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(auto_finish.stdout)
+            self.assertIsNone(payload["activation_feedback"])
+
+            db_path = default_db_path(workspace)
+            old_activation = next(
+                item
+                for item in list_activation_logs(db_path, workspace=str(workspace))
+                if item["task_query"] == "old unrelated task"
+            )
+            self.assertNotIn("feedback", old_activation)
 
     def test_cli_auto_finish_can_record_weak_help_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

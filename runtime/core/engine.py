@@ -12,7 +12,7 @@ from runtime.storage.fs_store import (
     shared_milvus_db_path,
 )
 from runtime.storage.milvus_store import search_asset_vectors, sync_assets_directory
-from runtime.storage.sqlite_store import list_assets, list_candidates, summarize_asset_feedback
+from runtime.storage.sqlite_store import get_asset, list_assets, list_candidates, summarize_asset_feedback
 
 
 def _now_utc() -> str:
@@ -677,6 +677,10 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
         score += vector_bonus
         evidence_bonus += vector_bonus
         evidence.append(f"语义召回分数 {vector_score:.2f}")
+    if "milvus" in asset.get("retrieval_sources", []):
+        score += 0.18
+        evidence_bonus += 0.18
+        evidence.append("Milvus 语义召回来源优先于 SQLite 状态索引")
 
     type_weight = {"rule": 0.2, "context": 0.14, "pattern": 0.14, "checklist": 0.1, "anti_pattern": 0.08}
     type_bonus = type_weight.get(knowledge_kind, type_weight.get(asset.get("asset_type", ""), 0.0))
@@ -760,6 +764,27 @@ def _tag_retrieval_source(assets: list[dict[str, Any]], source: str) -> None:
         asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), source])
 
 
+def _hydrate_assets_from_sqlite(db_path: Path | None, asset_ids: list[str]) -> list[dict[str, Any]]:
+    if not db_path:
+        return []
+    hydrated = []
+    for asset_id in asset_ids:
+        asset = get_asset(db_path, asset_id=asset_id)
+        if asset:
+            hydrated.append(asset)
+    _tag_retrieval_source(hydrated, "sqlite-hydration")
+    return hydrated
+
+
+def _hydrate_assets_from_json(assets_dir: Path, asset_ids: list[str], source: str) -> list[dict[str, Any]]:
+    if not assets_dir.exists() or not asset_ids:
+        return []
+    wanted = set(asset_ids)
+    hydrated = [asset for asset in iter_json_objects(assets_dir) if asset.get("asset_id") in wanted]
+    _tag_retrieval_source(hydrated, source)
+    return hydrated
+
+
 def _source_provenance(asset: dict[str, Any], workspace: str) -> dict[str, Any]:
     source_workspace = asset.get("source_workspace") or asset.get("workspace")
     same_project = _same_workspace_path(source_workspace, workspace)
@@ -820,6 +845,44 @@ def _llm_use_guidance(asset: dict[str, Any], details: dict[str, Any], provenance
     }
 
 
+def _selected_activation_item(
+    *,
+    score: float,
+    asset: dict[str, Any],
+    details: dict[str, Any],
+    provenance: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    evidence = details["evidence"]
+    if "milvus" in asset.get("retrieval_sources", []):
+        milvus_evidence = [item for item in evidence if "Milvus 语义召回来源优先" in item]
+        evidence = _unique_preserve_order([*milvus_evidence, *evidence])
+    return {
+        "asset_id": asset["asset_id"],
+        "asset_type": asset["asset_type"],
+        "knowledge_scope": asset.get("knowledge_scope", "project"),
+        "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
+        "title": asset["title"],
+        "reason": reason,
+        "match_score": round(score, 2),
+        "score_breakdown": {
+            "base_score": round(details["base_score"], 2),
+            "evidence_bonus": round(details["evidence_bonus"], 2),
+            "penalty_score": round(details["penalty_score"], 2),
+        },
+        "historical_help": details["historical_help"],
+        "effectiveness_summary": details["effectiveness_summary"],
+        "temperature": details["effectiveness_summary"]["temperature"],
+        "review_status": details["effectiveness_summary"]["review_status"],
+        "retrieval_sources": asset.get("retrieval_sources", []),
+        "source_provenance": provenance,
+        "llm_use_guidance": _llm_use_guidance(asset, details, provenance),
+        "vector_score": round(float(asset.get("vector_score", 0.0)), 4),
+        "match_evidence": evidence[:8],
+        "risk_flags": details["risk_flags"][:5],
+    }
+
+
 def _retrieve_activation_assets(
     *,
     workspace: Path,
@@ -850,26 +913,41 @@ def _retrieve_activation_assets(
     )
     _tag_retrieval_source(vector_shared_assets, "milvus")
 
-    assets: list[dict[str, Any]] = []
-    if db_path:
-        assets = list_assets(db_path, workspace=workspace_str)
-        _tag_retrieval_source(assets, "sqlite")
-    if not assets:
-        assets = list(iter_json_objects(assets_dir))
-        _tag_retrieval_source(assets, "json")
+    vector_assets = [*vector_project_assets, *vector_shared_assets]
+    used_sqlite_fallback = False
+    used_json_fallback = False
+    used_milvus_primary = bool(vector_assets)
+
+    if used_milvus_primary:
+        vector_asset_ids = [asset["asset_id"] for asset in vector_assets if asset.get("asset_id")]
+        hydrated_assets = _hydrate_assets_from_sqlite(db_path, vector_asset_ids)
+        if not hydrated_assets:
+            hydrated_assets = _hydrate_assets_from_json(assets_dir, vector_asset_ids, "json-hydration")
+        shared_hydrated_assets = _hydrate_assets_from_json(shared_assets_dir, vector_asset_ids, "shared-json-hydration")
+        assets = _merge_assets([*hydrated_assets, *shared_hydrated_assets], vector_assets)
+    else:
+        assets = []
+        if db_path:
+            assets = list_assets(db_path, workspace=workspace_str)
+            _tag_retrieval_source(assets, "sqlite")
+            used_sqlite_fallback = bool(assets)
+        if not assets:
+            assets = list(iter_json_objects(assets_dir))
+            _tag_retrieval_source(assets, "json")
+            used_json_fallback = bool(assets)
+
+        shared_assets = list(iter_json_objects(shared_assets_dir)) if shared_assets_dir.exists() else []
+        _tag_retrieval_source(shared_assets, "shared-json")
+        assets = _merge_assets(assets, shared_assets)
+
     for asset in assets:
         asset.setdefault("knowledge_scope", "project")
         asset.setdefault("knowledge_kind", asset.get("asset_type", "pattern"))
-
-    shared_assets = list(iter_json_objects(shared_assets_dir)) if shared_assets_dir.exists() else []
-    _tag_retrieval_source(shared_assets, "shared-json")
-    for asset in shared_assets:
-        asset.setdefault("knowledge_scope", "cross-project")
-        asset.setdefault("knowledge_kind", asset.get("asset_type", "pattern"))
-        asset.setdefault("workspace", None)
-
-    assets = _merge_assets(vector_project_assets, assets)
-    assets = _merge_assets(vector_shared_assets, assets + shared_assets)
+        if "shared-json" in asset.get("retrieval_sources", []) or "shared-json-hydration" in asset.get(
+            "retrieval_sources", []
+        ):
+            asset.setdefault("knowledge_scope", "cross-project")
+            asset.setdefault("workspace", None)
 
     used_candidate_fallback = False
     if not assets:
@@ -887,6 +965,9 @@ def _retrieve_activation_assets(
         "vector_project_assets": vector_project_assets,
         "vector_shared_assets": vector_shared_assets,
         "used_sqlite_index": bool(db_path and db_path.exists()),
+        "used_milvus_primary": used_milvus_primary,
+        "used_sqlite_fallback": used_sqlite_fallback,
+        "used_json_fallback": used_json_fallback,
         "used_candidate_fallback": used_candidate_fallback,
     }
 
@@ -934,33 +1015,56 @@ def _select_activation_assets(
     for score, asset, details in scored_assets[:5]:
         provenance = _source_provenance(asset, workspace_str)
         selected.append(
-            {
-                "asset_id": asset["asset_id"],
-                "asset_type": asset["asset_type"],
-                "knowledge_scope": asset.get("knowledge_scope", "project"),
-                "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
-                "title": asset["title"],
-                "reason": f"候选来源已确认，匹配分数 {score:.2f}；是否采用应由模型结合当前上下文判断。",
-                "match_score": round(score, 2),
-                "score_breakdown": {
-                    "base_score": round(details["base_score"], 2),
-                    "evidence_bonus": round(details["evidence_bonus"], 2),
-                    "penalty_score": round(details["penalty_score"], 2),
-                },
-                "historical_help": details["historical_help"],
-                "effectiveness_summary": details["effectiveness_summary"],
-                "temperature": details["effectiveness_summary"]["temperature"],
-                "review_status": details["effectiveness_summary"]["review_status"],
-                "retrieval_sources": asset.get("retrieval_sources", []),
-                "source_provenance": provenance,
-                "llm_use_guidance": _llm_use_guidance(asset, details, provenance),
-                "vector_score": round(float(asset.get("vector_score", 0.0)), 4),
-                "match_evidence": details["evidence"][:8],
-                "risk_flags": details["risk_flags"][:5],
-            }
+            _selected_activation_item(
+                score=score,
+                asset=asset,
+                details=details,
+                provenance=provenance,
+                reason=f"候选来源已确认，匹配分数 {score:.2f}；是否采用应由模型结合当前上下文判断。",
+            )
         )
 
     selected_ids = {item["asset_id"] for item in selected}
+    milvus_first_candidates: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+    for score, asset, details in scored_assets:
+        if asset.get("asset_id") in selected_ids:
+            continue
+        if "milvus" not in asset.get("retrieval_sources", []):
+            continue
+        if details["effectiveness_summary"].get("review_status") == "needs_review":
+            continue
+        if details["effectiveness_summary"].get("temperature") == "cool":
+            continue
+        if float(asset.get("vector_score", 0.0) or 0.0) < 0.2:
+            continue
+        milvus_first_candidates.append((score, asset, details))
+
+    selected_milvus_count = sum(1 for item in selected if "milvus" in item.get("retrieval_sources", []))
+    desired_milvus_slots = min(3, len(selected), selected_milvus_count + len(milvus_first_candidates))
+    while milvus_first_candidates and selected_milvus_count < desired_milvus_slots:
+        replacement_index = None
+        for index in range(len(selected) - 1, -1, -1):
+            if "milvus" not in selected[index].get("retrieval_sources", []):
+                replacement_index = index
+                break
+        if replacement_index is None:
+            break
+        score, asset, details = milvus_first_candidates.pop(0)
+        replaced = selected[replacement_index]
+        provenance = _source_provenance(asset, workspace_str)
+        selected[replacement_index] = _selected_activation_item(
+            score=score,
+            asset=asset,
+            details=details,
+            provenance=provenance,
+            reason=f"候选来源已确认，匹配分数 {score:.2f}；因 Milvus-first 默认策略进入最终 selected_assets。",
+        )
+        selected_ids.add(asset["asset_id"])
+        selected_milvus_count += 1
+        selection_adjustments.append(
+            f"Milvus-first 默认策略保留 {asset['asset_id']}，替换掉 SQLite-only 候选 {replaced['asset_id']}。"
+        )
+
     strongest_milvus_probe: tuple[float, dict[str, Any], dict[str, Any]] | None = None
     for score, asset, details in scored_assets:
         if asset.get("asset_id") in selected_ids:
@@ -992,30 +1096,13 @@ def _select_activation_assets(
         replaced = selected[replacement_index]
         score, asset, details = strongest_milvus_probe
         provenance = _source_provenance(asset, workspace_str)
-        selected[replacement_index] = {
-            "asset_id": asset["asset_id"],
-            "asset_type": asset["asset_type"],
-            "knowledge_scope": asset.get("knowledge_scope", "project"),
-            "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
-            "title": asset["title"],
-            "reason": f"候选来源已确认，匹配分数 {score:.2f}；因 Milvus 强语义命中被保留为试用位。",
-            "match_score": round(score, 2),
-            "score_breakdown": {
-                "base_score": round(details["base_score"], 2),
-                "evidence_bonus": round(details["evidence_bonus"], 2),
-                "penalty_score": round(details["penalty_score"], 2),
-            },
-            "historical_help": details["historical_help"],
-            "effectiveness_summary": details["effectiveness_summary"],
-            "temperature": details["effectiveness_summary"]["temperature"],
-            "review_status": details["effectiveness_summary"]["review_status"],
-            "retrieval_sources": asset.get("retrieval_sources", []),
-            "source_provenance": provenance,
-            "llm_use_guidance": _llm_use_guidance(asset, details, provenance),
-            "vector_score": round(float(asset.get("vector_score", 0.0)), 4),
-            "match_evidence": details["evidence"][:8],
-            "risk_flags": details["risk_flags"][:5],
-        }
+        selected[replacement_index] = _selected_activation_item(
+            score=score,
+            asset=asset,
+            details=details,
+            provenance=provenance,
+            reason=f"候选来源已确认，匹配分数 {score:.2f}；因 Milvus 强语义命中被保留为试用位。",
+        )
         selection_adjustments.append(
             "保留了 1 个 Milvus 试用位：高语义命中的 unproven 资产可以进入最终 selected_assets，避免被高证据旧资产完全压制。"
         )
@@ -1038,14 +1125,16 @@ def _build_activation_why_selected(
         "排序只表示候选优先级，不代表必须使用",
         "每条候选都携带 source_provenance、match_evidence 与 risk_flags",
         "宽 scope、低证据、低置信命中会被显式降权，但不会替代 LLM 判断",
-        "先召回项目内资产，再补跨项目资产，最后按证据与相关性混排",
+        "默认优先保留 Milvus 语义召回候选，SQLite 主要作为状态索引、反馈统计与降级来源",
     ]
     if constraints:
         why_selected.append("显式约束被纳入激活说明")
+    if retrieval["used_milvus_primary"]:
+        why_selected.append("Milvus 已作为 primary retrieval 生成本次候选池")
     if retrieval["used_sqlite_index"]:
-        why_selected.append("SQLite 作为轻量状态索引参与过滤、日志与降级召回")
-    if retrieval["vector_project_assets"] or retrieval["vector_shared_assets"]:
-        why_selected.append("Milvus 语义召回作为核心候选层参与排序")
+        why_selected.append("SQLite 作为轻量状态索引用于反馈、日志和 Milvus 命中的元数据补全")
+    if retrieval["used_sqlite_fallback"] or retrieval["used_json_fallback"]:
+        why_selected.append("Milvus 未返回可用候选，本次已降级到本地资产 fallback")
     if retrieval["used_candidate_fallback"]:
         why_selected.append("未找到 active asset，已回退到 candidate 经验层")
     return why_selected
@@ -1077,8 +1166,20 @@ def _build_retrieval_summary(selected: list[dict[str, Any]], retrieval: dict[str
         "milvus_shared_candidates": len(retrieval["vector_shared_assets"]),
         "selected_from_milvus": sum(1 for item in selected if "milvus" in item.get("retrieval_sources", [])),
         "selected_from_sqlite": sum(1 for item in selected if "sqlite" in item.get("retrieval_sources", [])),
+        "selected_with_sqlite_hydration": sum(
+            1 for item in selected if "sqlite-hydration" in item.get("retrieval_sources", [])
+        ),
         "selected_from_json": sum(1 for item in selected if "json" in item.get("retrieval_sources", []) or "shared-json" in item.get("retrieval_sources", [])),
+        "selected_with_json_hydration": sum(
+            1
+            for item in selected
+            if "json-hydration" in item.get("retrieval_sources", [])
+            or "shared-json-hydration" in item.get("retrieval_sources", [])
+        ),
         "selected_from_candidate_fallback": sum(1 for item in selected if "candidate-fallback" in item.get("retrieval_sources", [])),
+        "used_milvus_primary": int(bool(retrieval["used_milvus_primary"])),
+        "used_sqlite_fallback": int(bool(retrieval["used_sqlite_fallback"])),
+        "used_json_fallback": int(bool(retrieval["used_json_fallback"])),
     }
 
 

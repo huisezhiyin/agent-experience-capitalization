@@ -16,6 +16,7 @@ __pycache__/
 *.db-*
 
 # Local logs and generated outputs
+.room/
 logs/
 tmp/
 dist/

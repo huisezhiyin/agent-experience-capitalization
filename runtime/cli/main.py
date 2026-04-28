@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import tempfile
 from typing import Any
 
@@ -382,6 +383,33 @@ def _auto_resolve_stale_activation_feedback(
         summary["auto_resolved_count"] += 1
         summary["auto_resolved_activation_ids"].append(updated_activation["activation_id"])
     return summary
+
+
+def _safe_feedback_cleanup(
+    *,
+    workspace: Path,
+    db_path: Path,
+) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+    try:
+        return _auto_resolve_stale_activation_feedback(workspace=workspace, db_path=db_path), None
+    except (OSError, sqlite3.Error) as error:
+        return None, _sqlite_degraded_warning(db_path=db_path, error=error)
+
+
+def _find_unresolved_activation_for_task(
+    *,
+    db_path: Path,
+    workspace: Path,
+    task: str,
+) -> dict[str, Any] | None:
+    task_key = " ".join(task.casefold().split())
+    for activation in list_activation_logs(db_path, workspace=str(workspace)):
+        if activation.get("feedback", {}).get("help_signal"):
+            continue
+        activation_task_key = " ".join(str(activation.get("task_query") or "").casefold().split())
+        if activation_task_key == task_key:
+            return activation
+    return None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -930,6 +958,26 @@ def _fallback_activation_view_path(workspace: Path, view: dict[str, Any]) -> Pat
     )
 
 
+def _fallback_review_output_path(workspace: Path, requested_path: Path) -> Path:
+    return Path(tempfile.gettempdir()) / "expcap-reviews" / project_storage_key(workspace) / requested_path.name
+
+
+def _fallback_warning(
+    *,
+    reason: str,
+    requested_path: Path,
+    fallback_path: Path,
+    error: OSError,
+) -> dict[str, str]:
+    return {
+        "kind": "fallback_output",
+        "reason": reason,
+        "requested_path": str(requested_path),
+        "fallback_path": str(fallback_path),
+        "error": str(error),
+    }
+
+
 def _save_activation_view(
     *,
     workspace: Path,
@@ -945,13 +993,138 @@ def _save_activation_view(
             raise
         fallback_path = _fallback_activation_view_path(workspace, view)
         save_json(fallback_path, view)
-        return fallback_path, {
-            "kind": "fallback_output",
-            "reason": "default_activation_view_unwritable",
-            "requested_path": str(output_path),
-            "fallback_path": str(fallback_path),
+        return fallback_path, _fallback_warning(
+            reason="default_activation_view_unwritable",
+            requested_path=output_path,
+            fallback_path=fallback_path,
+            error=error,
+        )
+
+
+def _save_review_json(
+    *,
+    workspace: Path,
+    output_path: Path,
+    payload: dict[str, Any],
+    requested_output: str | None,
+    reason: str,
+) -> tuple[Path, dict[str, str] | None]:
+    try:
+        save_json(output_path, payload)
+        return output_path, None
+    except OSError as error:
+        if requested_output:
+            raise
+        fallback_path = _fallback_review_output_path(workspace, output_path)
+        save_json(fallback_path, payload)
+        return fallback_path, _fallback_warning(
+            reason=reason,
+            requested_path=output_path,
+            fallback_path=fallback_path,
+            error=error,
+        )
+
+
+def _record_activation_usage(
+    *,
+    db_path: Path,
+    view: dict[str, Any],
+) -> dict[str, str] | None:
+    try:
+        log_activation(db_path, view)
+        touch_assets_last_used(
+            db_path,
+            [item["asset_id"] for item in view.get("selected_assets", [])],
+            view["created_at"],
+        )
+    except (OSError, sqlite3.Error) as error:
+        return {
+            "kind": "activation_log_unwritable",
+            "reason": "sqlite_activation_log_unwritable",
+            "db_path": str(db_path),
             "error": str(error),
         }
+    return None
+
+
+def _sqlite_degraded_warning(*, db_path: Path, error: BaseException) -> dict[str, str]:
+    return {
+        "kind": "storage_degraded",
+        "reason": "sqlite_index_unavailable",
+        "db_path": str(db_path),
+        "fallback": "filesystem_json",
+        "error": str(error),
+    }
+
+
+def _filesystem_status_records(
+    *,
+    memory_root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    assets = [
+        asset
+        for asset in iter_json_objects(memory_root / "assets")
+        if asset.get("status", "active") == "active"
+    ]
+    candidates = [
+        candidate
+        for candidate in iter_json_objects(memory_root / "candidates")
+        if candidate.get("status", "new") in ALL_CANDIDATE_STATUSES
+    ]
+    activations = sorted(
+        list(iter_json_objects(memory_root / "views")),
+        key=lambda item: item.get("created_at") or "",
+        reverse=True,
+    )
+    return assets, candidates, activations
+
+
+def _load_status_records(
+    *,
+    workspace: Path,
+    db_path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, str]]]:
+    memory_root = memory_root_for_workspace(workspace)
+    try:
+        ensure_db(db_path)
+        assets = list_assets(db_path, workspace=str(workspace))
+        candidates = list_candidates(
+            db_path,
+            workspace=str(workspace),
+            statuses=ALL_CANDIDATE_STATUSES,
+        )
+        activations = list_activation_logs(db_path, workspace=str(workspace))
+        sqlite_backend = {
+            "backend": "sqlite",
+            "role": "lightweight-state-index",
+            "core_retrieval": False,
+            "available": True,
+            "degraded": False,
+            "db_path": str(db_path),
+            "db_exists": db_path.exists(),
+            "asset_rows": len(assets),
+            "candidate_rows": len(candidates),
+            "activation_log_rows": len(activations),
+        }
+        return assets, candidates, activations, sqlite_backend, []
+    except (OSError, sqlite3.Error) as error:
+        assets, candidates, activations = _filesystem_status_records(memory_root=memory_root)
+        warning = _sqlite_degraded_warning(db_path=db_path, error=error)
+        sqlite_backend = {
+            "backend": "sqlite",
+            "role": "lightweight-state-index",
+            "core_retrieval": False,
+            "available": False,
+            "degraded": True,
+            "degraded_reason": warning["reason"],
+            "fallback": warning["fallback"],
+            "db_path": str(db_path),
+            "db_exists": db_path.exists(),
+            "asset_rows": len(assets),
+            "candidate_rows": len(candidates),
+            "activation_log_rows": len(activations),
+        }
+        return assets, candidates, activations, sqlite_backend, [warning]
 
 
 def _activation_source_dirs(
@@ -1055,12 +1228,7 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
         view=view,
         requested_output=args.output,
     )
-    log_activation(db_path, view)
-    touch_assets_last_used(
-        db_path,
-        [item["asset_id"] for item in view.get("selected_assets", [])],
-        view["created_at"],
-    )
+    log_warning = _record_activation_usage(db_path=db_path, view=view)
     payload = {
         "saved_to": str(output_path),
         "activation_id": view["activation_id"],
@@ -1071,6 +1239,8 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
     }
     if save_warning:
         payload["save_warning"] = save_warning
+    if log_warning:
+        payload["log_warning"] = log_warning
     _print_json(payload)
     return 0
 
@@ -1327,12 +1497,7 @@ def _handle_progressive_recall(args: argparse.Namespace) -> int:
         view=view,
         requested_output=args.output,
     )
-    log_activation(db_path, view)
-    touch_assets_last_used(
-        db_path,
-        [item["asset_id"] for item in view.get("selected_assets", [])],
-        view["created_at"],
-    )
+    log_warning = _record_activation_usage(db_path=db_path, view=view)
     payload = {
         "triggered": True,
         "saved_to": str(output_path),
@@ -1344,6 +1509,8 @@ def _handle_progressive_recall(args: argparse.Namespace) -> int:
     }
     if save_warning:
         payload["save_warning"] = save_warning
+    if log_warning:
+        payload["log_warning"] = log_warning
     _print_json(payload)
     return 0
 
@@ -1463,12 +1630,12 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
     upsert_episode(db_path, episode)
 
     activation_feedback = None
-    latest_activation = find_latest_activation(
-        db_path,
-        workspace=str(workspace),
-        unresolved_only=True,
+    target_activation = _find_unresolved_activation_for_task(
+        db_path=db_path,
+        workspace=workspace,
+        task=args.task,
     )
-    if latest_activation and latest_activation.get("selected_assets"):
+    if target_activation and target_activation.get("selected_assets"):
         feedback = {
             "help_signal": _infer_activation_help_signal(
                 verification_status=args.verification_status,
@@ -1487,7 +1654,7 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
         activation_feedback = _apply_activation_feedback(
             workspace=workspace,
             db_path=db_path,
-            activation_id=latest_activation["activation_id"],
+            activation_id=target_activation["activation_id"],
             feedback=feedback,
         )
 
@@ -1834,8 +2001,17 @@ def _handle_benchmark_milvus(args: argparse.Namespace) -> int:
         if args.output
         else memory_root_for_workspace(workspace) / "reviews" / "milvus_benchmark.json"
     )
-    save_json(output_path, payload)
-    _print_json({"saved_to": str(output_path), "benchmark": payload})
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_milvus_benchmark_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "benchmark": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
     return 0
 
 
@@ -1861,15 +2037,12 @@ def _handle_activate(args: argparse.Namespace) -> int:
         view=view,
         requested_output=args.output,
     )
-    log_activation(db_path, view)
-    touch_assets_last_used(
-        db_path,
-        [item["asset_id"] for item in view.get("selected_assets", [])],
-        view["created_at"],
-    )
+    log_warning = _record_activation_usage(db_path=db_path, view=view)
     payload = {"saved_to": str(output_path), "activation_id": view["activation_id"], "activation_view": view}
     if save_warning:
         payload["save_warning"] = save_warning
+    if log_warning:
+        payload["log_warning"] = log_warning
     _print_json(payload)
     return 0
 
@@ -1922,20 +2095,28 @@ def _build_status_payload(
     limit: int,
     deep_retrieval_check: bool,
     feedback_cleanup: dict[str, Any] | None = None,
+    runtime_warnings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
-    ensure_db(db_path)
     backend_config = resolve_backend_config()
     project_activity = load_project_policy(workspace)
 
-    assets = list_assets(db_path, workspace=str(workspace))
-    candidates = list_candidates(
-        db_path,
-        workspace=str(workspace),
-        statuses=ALL_CANDIDATE_STATUSES,
+    assets, candidates, activations, sqlite_backend, sqlite_warnings = _load_status_records(
+        workspace=workspace,
+        db_path=db_path,
     )
-    activations = list_activation_logs(db_path, workspace=str(workspace))
+    runtime_warnings = [*(runtime_warnings or []), *sqlite_warnings]
+    candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("status", "new") in ALL_CANDIDATE_STATUSES
+    ]
+    activations = sorted(
+        activations,
+        key=lambda item: item.get("created_at") or "",
+        reverse=True,
+    )
     traces = list(iter_json_objects(memory_root / "traces" / "bundles"))
     episodes = list(iter_json_objects(memory_root / "episodes"))
 
@@ -2052,18 +2233,9 @@ def _build_status_payload(
             "pending_hours": _feedback_pending_hours(),
         },
         "storage_layout": storage_layout_for_workspace(workspace),
+        "runtime_warnings": runtime_warnings,
         "retrieval_backends": {
-            "sqlite": {
-                "backend": "sqlite",
-                "role": "lightweight-state-index",
-                "core_retrieval": False,
-                "available": True,
-                "db_path": str(db_path),
-                "db_exists": db_path.exists(),
-                "asset_rows": len(assets),
-                "candidate_rows": len(candidates),
-                "activation_log_rows": len(activations),
-            },
+            "sqlite": sqlite_backend,
             "milvus": {
                 "role": "core-semantic-retrieval",
                 "core_retrieval": backend_config["retrieval"] in {"milvus-lite", "milvus"},
@@ -2129,12 +2301,14 @@ def _build_doctor_payload(
     limit: int,
     deep_retrieval_check: bool,
     feedback_cleanup: dict[str, Any] | None = None,
+    runtime_warnings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     status_payload = _build_status_payload(
         workspace=workspace,
         limit=limit,
         deep_retrieval_check=deep_retrieval_check,
         feedback_cleanup=feedback_cleanup,
+        runtime_warnings=runtime_warnings,
     )
     memory_root = memory_root_for_workspace(workspace)
     local_milvus_path = default_milvus_db_path(workspace)
@@ -2157,9 +2331,21 @@ def _build_doctor_payload(
     checks.append(
         _diagnostic_check(
             "sqlite_index",
-            "pass" if sqlite_backend["db_exists"] else "fail",
-            f"SQLite index has {sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, and {sqlite_backend['activation_log_rows']} activation logs.",
-            None if sqlite_backend["db_exists"] else "Run any expcap command with --workspace to initialize the local index.",
+            "pass" if sqlite_backend.get("available", sqlite_backend.get("db_exists", False)) else "warn",
+            (
+                f"SQLite index has {sqlite_backend['asset_rows']} assets, "
+                f"{sqlite_backend['candidate_rows']} candidates, and "
+                f"{sqlite_backend['activation_log_rows']} activation logs."
+                if sqlite_backend.get("available", sqlite_backend.get("db_exists", False))
+                else (
+                    "SQLite index is unavailable; status used filesystem JSON fallback with "
+                    f"{sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, "
+                    f"and {sqlite_backend['activation_log_rows']} activation views."
+                )
+            ),
+            None
+            if sqlite_backend.get("available", sqlite_backend.get("db_exists", False))
+            else "Check SQLite permissions/locks; Milvus recall can continue, but state metrics are degraded.",
         )
     )
     checks.append(
@@ -2356,29 +2542,38 @@ def _build_dashboard_payload(
     limit: int,
     days: int,
     deep_retrieval_check: bool,
+    runtime_warnings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     workspace = workspace.resolve()
     db_path = default_db_path(workspace)
-    ensure_db(db_path)
     bounded_limit = max(limit, 1)
     bounded_days = max(days, 1)
     status_payload = _build_status_payload(
         workspace=workspace,
         limit=bounded_limit,
         deep_retrieval_check=deep_retrieval_check,
+        runtime_warnings=runtime_warnings,
     )
 
+    assets, candidates, activations, _, _ = _load_status_records(
+        workspace=workspace,
+        db_path=db_path,
+    )
     assets = sorted(
-        list_assets(db_path, workspace=str(workspace)),
+        assets,
         key=lambda item: item.get("updated_at") or item.get("created_at") or "",
         reverse=True,
     )
     candidates = sorted(
-        list_candidates(db_path, workspace=str(workspace), statuses=ALL_CANDIDATE_STATUSES),
+        candidates,
         key=lambda item: item.get("updated_at") or item.get("created_at") or "",
         reverse=True,
     )
-    activations = list_activation_logs(db_path, workspace=str(workspace))
+    activations = sorted(
+        activations,
+        key=lambda item: item.get("created_at") or "",
+        reverse=True,
+    )
 
     asset_rows = [
         {
@@ -2589,6 +2784,23 @@ def _render_dashboard_table(headers: list[str], rows: list[list[Any]]) -> str:
     return f"<table><thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody></table>"
 
 
+def _render_runtime_warnings(payload: dict[str, Any]) -> str:
+    warnings = payload.get("status", {}).get("runtime_warnings", [])
+    if not warnings:
+        return ""
+    rows = "".join(
+        f"<li><strong>{_safe_text(item.get('reason'))}</strong>: {_safe_text(item.get('error'))}</li>"
+        for item in warnings
+    )
+    return f"""
+    <section class="warning-banner">
+      <h2>Degraded Mode</h2>
+      <p>Some state-index data came from fallback storage. Milvus semantic recall can continue, but SQLite-derived metrics may be incomplete.</p>
+      <ul>{rows}</ul>
+    </section>
+    """
+
+
 def _render_effectiveness_snapshot(payload: dict[str, Any]) -> str:
     snapshot = payload["effectiveness_snapshot"]
     signals = snapshot["signals"]
@@ -2736,6 +2948,10 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
       box-shadow: 0 18px 50px rgba(50, 43, 31, 0.08);
     }}
     .card {{ padding: 16px; }}
+    .warning-banner {{ margin: 0 0 18px; padding: 16px 18px; border: 1px solid #d7a742; border-radius: 18px; background: #fff0c2; color: #4e3300; }}
+    .warning-banner h2 {{ margin: 0 0 6px; color: #6e4700; }}
+    .warning-banner p {{ margin: 0 0 8px; }}
+    .warning-banner ul {{ margin: 0; padding-left: 20px; }}
     .card-label {{ color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; }}
     .card-value {{ margin-top: 8px; font-size: 2rem; font-weight: 760; letter-spacing: -0.04em; }}
     .card-hint {{ color: var(--muted); font-size: 0.86rem; }}
@@ -2781,6 +2997,8 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
       This dashboard is read-only and uses the same status metrics as the CLI.
     </div>
   </header>
+
+  {_render_runtime_warnings(payload)}
 
   <section class="cards">
     {_render_count_cards(payload)}
@@ -2847,35 +3065,58 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
 
 def _handle_dashboard(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    feedback_cleanup, cleanup_warning = _safe_feedback_cleanup(workspace=workspace, db_path=db_path)
     payload = _build_dashboard_payload(
         workspace=workspace,
         limit=args.limit,
         days=args.days,
         deep_retrieval_check=args.deep_retrieval_check,
+        runtime_warnings=[cleanup_warning] if cleanup_warning else None,
     )
+    if feedback_cleanup is not None:
+        payload["status"]["feedback_cleanup"] = feedback_cleanup
     output_path = (
         Path(args.output)
         if args.output
         else memory_root_for_workspace(workspace) / "reviews" / "dashboard.html"
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(_render_dashboard_html(payload), encoding="utf-8")
-    data_output_path = output_path.with_suffix(".json")
-    save_json(data_output_path, payload)
-    _print_json(
-        {
-            "saved_to": str(output_path),
-            "data_saved_to": str(data_output_path),
-            "dashboard": {
-                "workspace": payload["workspace"],
-                "generated_at": payload["generated_at"],
-                "cards": payload["cards"],
-                "effectiveness_snapshot": payload["effectiveness_snapshot"],
-                "review_queue_count": payload["review_queue"]["candidate_count"],
-                "unproven_validation_count": payload["unproven_validation_queue"]["asset_count"],
-            },
-        }
-    )
+    save_warning = None
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(_render_dashboard_html(payload), encoding="utf-8")
+        data_output_path = output_path.with_suffix(".json")
+        save_json(data_output_path, payload)
+    except OSError as error:
+        if args.output:
+            raise
+        fallback_path = _fallback_review_output_path(workspace, output_path)
+        fallback_path.parent.mkdir(parents=True, exist_ok=True)
+        fallback_path.write_text(_render_dashboard_html(payload), encoding="utf-8")
+        data_output_path = fallback_path.with_suffix(".json")
+        save_json(data_output_path, payload)
+        save_warning = _fallback_warning(
+            reason="default_dashboard_output_unwritable",
+            requested_path=output_path,
+            fallback_path=fallback_path,
+            error=error,
+        )
+        output_path = fallback_path
+    result = {
+        "saved_to": str(output_path),
+        "data_saved_to": str(data_output_path),
+        "dashboard": {
+            "workspace": payload["workspace"],
+            "generated_at": payload["generated_at"],
+            "cards": payload["cards"],
+            "effectiveness_snapshot": payload["effectiveness_snapshot"],
+            "review_queue_count": payload["review_queue"]["candidate_count"],
+            "unproven_validation_count": payload["unproven_validation_queue"]["asset_count"],
+        },
+    }
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
     return 0
 
 
@@ -2883,24 +3124,30 @@ def _handle_status(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
-    ensure_db(db_path)
-    feedback_cleanup = _auto_resolve_stale_activation_feedback(
-        workspace=workspace,
-        db_path=db_path,
-    )
+    feedback_cleanup, cleanup_warning = _safe_feedback_cleanup(workspace=workspace, db_path=db_path)
     payload = _build_status_payload(
         workspace=workspace,
         limit=args.limit,
         deep_retrieval_check=args.deep_retrieval_check,
         feedback_cleanup=feedback_cleanup,
+        runtime_warnings=[cleanup_warning] if cleanup_warning else None,
     )
     output_path = (
         Path(args.output)
         if args.output
         else memory_root / "reviews" / "workspace_status.json"
     )
-    save_json(output_path, payload)
-    _print_json({"saved_to": str(output_path), "status": payload})
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_status_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "status": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
     return 0
 
 
@@ -2908,24 +3155,30 @@ def _handle_doctor(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
-    ensure_db(db_path)
-    feedback_cleanup = _auto_resolve_stale_activation_feedback(
-        workspace=workspace,
-        db_path=db_path,
-    )
+    feedback_cleanup, cleanup_warning = _safe_feedback_cleanup(workspace=workspace, db_path=db_path)
     payload = _build_doctor_payload(
         workspace=workspace,
         limit=args.limit,
         deep_retrieval_check=args.deep_retrieval_check,
         feedback_cleanup=feedback_cleanup,
+        runtime_warnings=[cleanup_warning] if cleanup_warning else None,
     )
     output_path = (
         Path(args.output)
         if args.output
         else memory_root / "reviews" / "doctor.json"
     )
-    save_json(output_path, payload)
-    _print_json({"saved_to": str(output_path), "doctor": payload})
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_doctor_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "doctor": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
     return 0
 
 

@@ -123,6 +123,18 @@ class MilvusStoreLockTests(unittest.TestCase):
             self.assertFalse(summary["pid_exists"])
             self.assertTrue(summary["stale_hint"])
 
+    def test_milvus_db_lock_clears_metadata_after_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+
+            with milvus_store._milvus_db_lock(db_path) as lock_error:
+                self.assertIsNone(lock_error)
+
+            summary = milvus_store.milvus_lock_summary(db_path)
+            self.assertTrue(summary["lock_exists"])
+            self.assertFalse(summary["stale_hint"])
+            self.assertEqual(summary["metadata_raw"], "")
+
     def test_backend_summary_is_lightweight_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "milvus.db"

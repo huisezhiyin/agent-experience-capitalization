@@ -175,6 +175,15 @@ def _write_lock_metadata(lock_file: Any) -> None:
         pass
 
 
+def _clear_lock_metadata(lock_file: Any) -> None:
+    try:
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.flush()
+    except Exception:
+        pass
+
+
 def _parse_lock_metadata(raw_value: str) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     for part in raw_value.split():
@@ -280,6 +289,7 @@ def _milvus_db_lock(db_path: Path):
             _write_lock_metadata(lock_file)
             yield None
         finally:
+            _clear_lock_metadata(lock_file)
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 

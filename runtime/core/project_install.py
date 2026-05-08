@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import stat
 
 from runtime.core.project_policy import DEFAULT_PROJECT_STATUS, write_project_policy
 
@@ -8,6 +10,12 @@ from runtime.core.project_policy import DEFAULT_PROJECT_STATUS, write_project_po
 EXPCAP_BLOCK_START = "<!-- EXPCAP START -->"
 EXPCAP_BLOCK_END = "<!-- EXPCAP END -->"
 EXPCAP_GITIGNORE_ENTRY = ".agent-memory/"
+INTEGRATION_MODE_DOCS_ONLY = "docs-only"
+INTEGRATION_MODE_CLAUDE_HOOKS = "claude-hooks"
+SUPPORTED_INTEGRATION_MODES = (
+    INTEGRATION_MODE_DOCS_ONLY,
+    INTEGRATION_MODE_CLAUDE_HOOKS,
+)
 
 
 def _sidecar_content(workspace: Path, *, project_status: str) -> str:
@@ -104,6 +112,147 @@ def _managed_block(sidecar_name: str = "AGENTS.expcap.md") -> str:
 {EXPCAP_BLOCK_END}"""
 
 
+def normalize_integration_mode(
+    *,
+    integration_mode: str | None = None,
+    include_claude: bool = False,
+) -> str:
+    if integration_mode:
+        if integration_mode not in SUPPORTED_INTEGRATION_MODES:
+            raise ValueError(f"unsupported integration mode: {integration_mode}")
+        return integration_mode
+    if include_claude:
+        return INTEGRATION_MODE_CLAUDE_HOOKS
+    return INTEGRATION_MODE_DOCS_ONLY
+
+
+def _claude_settings_payload(workspace: Path) -> dict[str, object]:
+    project_dir = str(workspace.resolve())
+    hooks_dir = "$CLAUDE_PROJECT_DIR/.claude/hooks"
+    return {
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{hooks_dir}/expcap_user_prompt_submit.sh",
+                            "timeout": 20,
+                        }
+                    ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{hooks_dir}/expcap_stop.sh",
+                            "timeout": 30,
+                        }
+                    ]
+                }
+            ],
+        },
+        "env": {
+            "EXPCAP_STORAGE_PROFILE": "user-cache",
+            "EXPCAP_HOME": "$HOME/.expcap",
+            "EXPCAP_PROJECT_DIR": project_dir,
+        },
+    }
+
+
+def _merge_claude_settings(existing: dict[str, object], update: dict[str, object]) -> dict[str, object]:
+    merged = dict(existing)
+    hooks = dict(existing.get("hooks") or {})
+    update_hooks = update.get("hooks") or {}
+    for event_name, entries in update_hooks.items():
+        current_entries = hooks.get(event_name)
+        if not isinstance(current_entries, list):
+            hooks[event_name] = entries
+            continue
+        normalized = [json.dumps(item, ensure_ascii=False, sort_keys=True) for item in current_entries]
+        for entry in entries:
+            encoded = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+            if encoded not in normalized:
+                current_entries.append(entry)
+                normalized.append(encoded)
+        hooks[event_name] = current_entries
+    merged["hooks"] = hooks
+
+    env = dict(existing.get("env") or {})
+    env.update(update.get("env") or {})
+    merged["env"] = env
+    return merged
+
+
+def _write_executable_script(path: Path, content: str) -> tuple[bool, bool]:
+    created = not path.exists()
+    original = path.read_text(encoding="utf-8") if path.exists() else None
+    if original != content:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        updated = True
+    else:
+        updated = False
+    current_mode = path.stat().st_mode if path.exists() else 0
+    executable_mode = current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    if path.exists() and executable_mode != current_mode:
+        path.chmod(executable_mode)
+    return created, updated
+
+
+def _ensure_claude_hook_files(workspace: Path) -> dict[str, str | bool]:
+    claude_dir = workspace / ".claude"
+    hooks_dir = claude_dir / "hooks"
+    settings_path = claude_dir / "settings.json"
+
+    prompt_hook_path = hooks_dir / "expcap_user_prompt_submit.sh"
+    stop_hook_path = hooks_dir / "expcap_stop.sh"
+
+    prompt_hook = """#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+
+exec python3 "$PROJECT_DIR/scripts/expcap-hook" user-prompt-submit --host claude --workspace "$PROJECT_DIR"
+"""
+    stop_hook = """#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+
+exec python3 "$PROJECT_DIR/scripts/expcap-hook" stop --host claude --workspace "$PROJECT_DIR"
+"""
+    created_prompt_hook, updated_prompt_hook = _write_executable_script(prompt_hook_path, prompt_hook)
+    created_stop_hook, updated_stop_hook = _write_executable_script(stop_hook_path, stop_hook)
+
+    payload = _claude_settings_payload(workspace)
+    existing = {}
+    if settings_path.exists():
+        existing = json.loads(settings_path.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            existing = {}
+    merged = _merge_claude_settings(existing, payload)
+    created_settings = not settings_path.exists()
+    original_settings = json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True) if settings_path.exists() else None
+    new_settings = json.dumps(merged, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    updated_settings = original_settings != new_settings if original_settings is not None else True
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(new_settings, encoding="utf-8")
+
+    return {
+        "claude_settings_path": str(settings_path),
+        "claude_hooks_dir": str(hooks_dir),
+        "created_claude_settings": created_settings,
+        "updated_claude_settings": updated_settings,
+        "created_claude_prompt_hook": created_prompt_hook,
+        "updated_claude_prompt_hook": updated_prompt_hook,
+        "created_claude_stop_hook": created_stop_hook,
+        "updated_claude_stop_hook": updated_stop_hook,
+    }
+
+
 def _upsert_managed_block(
     path: Path,
     *,
@@ -156,12 +305,21 @@ def _ensure_gitignore_entry(workspace: Path) -> tuple[Path, bool, bool]:
 def install_project_agents(
     workspace: Path,
     *,
+    integration_mode: str | None = None,
     include_claude: bool = False,
     project_status: str = DEFAULT_PROJECT_STATUS,
 ) -> dict[str, str | bool]:
     workspace = workspace.resolve()
+    normalized_mode = normalize_integration_mode(
+        integration_mode=integration_mode,
+        include_claude=include_claude,
+    )
     sidecar_path = workspace / "AGENTS.expcap.md"
-    policy_path = write_project_policy(workspace, project_status=project_status)
+    policy_path = write_project_policy(
+        workspace,
+        project_status=project_status,
+        integration_mode=normalized_mode,
+    )
     sidecar_path.write_text(_sidecar_content(workspace, project_status=project_status), encoding="utf-8")
     gitignore_path, created_gitignore, updated_gitignore = _ensure_gitignore_entry(workspace)
 
@@ -176,26 +334,39 @@ def install_project_agents(
     claude_path = workspace / "CLAUDE.md"
     created_claude = False
     updated_claude = False
-    if include_claude:
+    claude_hook_result: dict[str, str | bool] = {
+        "claude_settings_path": "",
+        "claude_hooks_dir": "",
+        "created_claude_settings": False,
+        "updated_claude_settings": False,
+        "created_claude_prompt_hook": False,
+        "updated_claude_prompt_hook": False,
+        "created_claude_stop_hook": False,
+        "updated_claude_stop_hook": False,
+    }
+    if normalized_mode == INTEGRATION_MODE_CLAUDE_HOOKS:
         created_claude, updated_claude = _upsert_managed_block(
             claude_path,
             title="CLAUDE.md",
             intro="本项目启用了 `expcap` 经验资本化工作流，详细规则见 `AGENTS.expcap.md`。",
             sidecar_name="AGENTS.expcap.md",
         )
+        claude_hook_result = _ensure_claude_hook_files(workspace)
 
     return {
         "workspace": str(workspace),
+        "integration_mode": normalized_mode,
         "agents_path": str(agents_path),
         "sidecar_path": str(sidecar_path),
         "policy_path": str(policy_path),
         "project_status": project_status,
         "gitignore_path": str(gitignore_path),
-        "claude_path": str(claude_path) if include_claude else "",
+        "claude_path": str(claude_path) if normalized_mode == INTEGRATION_MODE_CLAUDE_HOOKS else "",
         "created_agents": created_agents,
         "updated_agents": updated_agents,
         "created_gitignore": created_gitignore,
         "updated_gitignore": updated_gitignore,
         "created_claude": created_claude,
         "updated_claude": updated_claude,
+        **claude_hook_result,
     }

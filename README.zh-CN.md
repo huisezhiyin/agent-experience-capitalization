@@ -158,8 +158,17 @@ scripts/expcap install-project --workspace /path/to/project
 scripts/expcap install-project --workspace /path/to/project --include-claude
 ```
 
+安装 Claude hooks（Phase 1 可运行集成）：
+
+```bash
+scripts/expcap install-project --workspace /path/to/project --integration-mode claude-hooks
+```
+
 安装器会非破坏式追加说明，创建 `AGENTS.expcap.md`，并确保 `.agent-memory/`
-写入 `.gitignore`。之后 agent 可以使用 skill-backed 默认工作流：
+写入 `.gitignore`。`claude-hooks` 模式还会生成 `.claude/settings.json`、
+`.claude/hooks/expcap_user_prompt_submit.sh` 和 `.claude/hooks/expcap_stop.sh`，
+统一通过 `scripts/expcap-hook` 路由到 `auto-start` / `auto-finish`。之后 agent
+可以使用 skill-backed 默认工作流：
 
 ```bash
 expcap auto-start --task "your task" --workspace "$PWD"
@@ -183,6 +192,28 @@ activation，并同步刷新关联资产的温度和 review status。
 
 如果需要手动调试，底层流程仍然可用：`ingest -> review -> extract -> promote -> activate`。
 
+如果要把项目文档作为忠实的 codemap/context 资产导入召回层：
+
+```bash
+expcap ingest-docs --workspace "$PWD"
+```
+
+默认扫描 `README*`、`AGENTS.md`、`CLAUDE.md` 和 `docs/*.md`，按 chunk 写成
+`knowledge_kind=codemap` 资产。它保留原始文本，不把文档强行改写成精炼“真理”。
+
+如果要主动保存一条稀少但高价值的顶层先验：
+
+```bash
+expcap save-prior \
+  --workspace "$PWD" \
+  --knowledge-kind dont_repeat \
+  --title "不要重复解释项目记忆定位" \
+  --content "expcap 是用来保存用户/团队/项目局部先验、减少重复说明的本地先验层，不是真理型知识库。"
+```
+
+这个入口适合明确、稳定的偏好、约束、历史决策，或“不要让我反复说”的指令。高优先级先验会直接保存为
+active project asset，后续可由注入策略路由到 `system_prompt`。Activation 时，这类显式高优先级先验也会进入一个很小的常驻候选池，避免仅因为 Milvus top-K 更偏向旧语义命中而丢失。
+
 活跃项目控制：
 
 ```bash
@@ -204,10 +235,26 @@ scripts/expcap install-project --workspace /path/to/project --project-status ina
 Activation view 会包含 `source_provenance`、`match_evidence`、`risk_flags`
 和 `llm_use_guidance`。召回层负责提供带来源的候选，coding agent 仍需结合当前任务判断是否采用。
 
+Activation view 也会包含 `injection_plan`，把“召回到了什么”和“应该怎么注入”分开。
+稳定、很短的偏好、约束和 `dont_repeat` 指令可以进入 `system_prompt`；当前任务相关经验和显式约束进入
+`runtime_context`；较大的 codemap、背景材料和原始证据进入 `reference_summary`，让 LLM 按需重新分析。`system_prompt` 会刻意保持稀少，只放小而稳定的用户/团队/项目先验，不承载大块知识。
+
+每次 `auto-start` / `activate` 也会把注入计划物化成宿主友好的运行时产物：
+
+- `injections/<activation_id>.md`
+- `injections/<activation_id>.json`
+- `injections/latest.md`
+- `injections/latest.json`
+
+这些文件位于 `$EXPCAP_HOME` 项目记忆根目录下（只有 local profile 才会在 `.agent-memory/`）。
+Claude hooks 会把渲染后的 Markdown 作为 `additionalContext`；其他宿主可以直接读取
+`latest.md` 或 `latest.json`。
+
 资产带有作用域和生命周期字段：
 
 - `knowledge_scope`：`project` 或 `cross-project`。
-- `knowledge_kind`：`pattern`、`anti_pattern`、`rule`、`context`、`checklist`。
+- `knowledge_kind`：`pattern`、`anti_pattern`、`rule`、`context`、`checklist`、
+  `past_win`、`preference`、`constraint`、`decision_memory`、`dont_repeat` 或 `codemap`。
 - `temperature`：`hot`、`warm`、`neutral`、`cool`。
 - `review_status`：`healthy`、`watch`、`needs_review`、`unproven`。
 
@@ -305,6 +352,15 @@ expcap dashboard --workspace "$PWD"
 `benchmark-milvus` 会先同步当前 embedding profile 对应的 Milvus index，再执行
 查询，避免 profile 切换被误判成召回失败。
 
+如果要检查 codemap / 文档召回，可以带上期望条件：
+
+```bash
+expcap benchmark-milvus \
+  --workspace "$PWD" \
+  --query "README ingest-docs codemap" \
+  --expect-kind codemap
+```
+
 重点观察：
 
 - `activation_feedback_summary`：经验是否帮忙、是否 pending、是否 stale missing。
@@ -313,6 +369,8 @@ expcap dashboard --workspace "$PWD"
 - `asset_effectiveness_summary`：资产热度和健康状态。
 - `retrieval_backends`：Milvus 核心召回是否可用，以及 SQLite 轻量索引是否健康。
 - `milvus_benchmark`：抽样检查 Milvus 召回质量，包括 provider 元数据、top score 和历史选中资产命中率。
+- `injection_policy_summary`：最近 activation 是否把内容路由到了 `system_prompt`、`runtime_context`
+  或 `reference_summary`。
 - `project_activity`：当前项目是 `active` 还是 `inactive`，用于报表和覆盖率口径。
 - `backend_configuration`：当前是本地模式还是共享模式。
 

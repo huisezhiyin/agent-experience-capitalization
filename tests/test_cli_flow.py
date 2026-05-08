@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from runtime.cli import main as cli_main
 from runtime.storage.fs_store import default_db_path
-from runtime.storage.sqlite_store import upsert_asset
+from runtime.storage.sqlite_store import list_assets, upsert_asset
 from runtime.storage.sqlite_store import ensure_db, list_activation_logs, log_activation
 
 
@@ -26,6 +26,7 @@ def _write_candidate(
     status: str,
     promotion_readiness: str = "boosted",
     help_signal: str = "supported_strong",
+    knowledge_kind: str = "pattern",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -35,7 +36,7 @@ def _write_candidate(
                 "source_episode_ids": ["ep_manual_review_001"],
                 "workspace": str(workspace),
                 "candidate_type": "pattern",
-                "knowledge_kind": "pattern",
+                "knowledge_kind": knowledge_kind,
                 "title": "manual review candidate",
                 "content": "promote stable manual review experience into reusable guidance.",
                 "reusability_score": 0.8,
@@ -124,7 +125,11 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(activation["selected_assets"][0]["llm_use_guidance"]["decision_owner"], "llm")
             self.assertIn("retrieval_summary", activation)
             self.assertEqual(activation["pipeline"]["kind"], "experience_rag_activation")
-            self.assertEqual(activation["pipeline"]["stages"], ["retrieve", "rerank", "assemble"])
+            self.assertEqual(activation["pipeline"]["stages"], ["retrieve", "rerank", "route_injection", "assemble"])
+            self.assertIn("injection_artifacts", activation)
+            injection_markdown = Path(activation["injection_artifacts"]["markdown_path"])
+            self.assertTrue(injection_markdown.exists())
+            self.assertIn("Runtime Context", injection_markdown.read_text(encoding="utf-8"))
             self.assertTrue(any("SQLite" in item for item in activation["why_selected"]))
             self.assertTrue(any("最终是否采用由 LLM" in item for item in activation["why_selected"]))
 
@@ -147,6 +152,135 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(asset_count, 1)
             self.assertEqual(activation_count, 1)
             self.assertIsNotNone(asset_last_used)
+
+    def test_cli_ingest_docs_imports_markdown_as_codemap_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "README.md").write_text(
+                "# Demo Repo\n\nUse the runtime package for CLI orchestration.\n",
+                encoding="utf-8",
+            )
+            docs_dir = workspace / "docs"
+            docs_dir.mkdir()
+            (docs_dir / "architecture.md").write_text(
+                "# Architecture\n\nThe engine owns activation ranking while CLI owns command orchestration.\n",
+                encoding="utf-8",
+            )
+            ignored_dir = workspace / ".agent-memory"
+            ignored_dir.mkdir()
+            (ignored_dir / "ignored.md").write_text("# ignored\n", encoding="utf-8")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "ingest-docs",
+                    "--workspace",
+                    str(workspace),
+                    "--max-chars",
+                    "1200",
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            report = payload["ingestion"]
+
+            self.assertEqual(report["document_count"], 2)
+            self.assertEqual(report["asset_count"], 2)
+            self.assertEqual(report["pruned_existing_assets"], 0)
+            self.assertTrue(Path(payload["saved_to"]).exists())
+            self.assertEqual({item["knowledge_kind"] for item in report["assets"]}, {"codemap"})
+            asset_path = Path(report["assets"][0]["saved_to"])
+            asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(asset["asset_type"], "context")
+            self.assertEqual(asset["knowledge_kind"], "codemap")
+            self.assertTrue(asset["doc_chunk"]["preserved_raw_text"])
+            self.assertIn("Document:", asset["content"])
+
+            assets = list_assets(default_db_path(workspace), workspace=str(workspace))
+            self.assertEqual(len(assets), 2)
+            self.assertEqual({item["knowledge_kind"] for item in assets}, {"codemap"})
+
+            status = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            status_payload = json.loads(status.stdout)["status"]
+            self.assertEqual(status_payload["knowledge_kind_summary"]["assets"]["by_kind"]["codemap"], 2)
+            self.assertEqual(status_payload["knowledge_kind_summary"]["assets"]["local_prior_count"], 2)
+            self.assertEqual(status_payload["asset_review_backlog"]["total_assets"], 0)
+            self.assertEqual(status_payload["unproven_validation_queue"]["asset_count"], 0)
+
+            benchmark = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "benchmark-milvus",
+                    "--workspace",
+                    str(workspace),
+                    "--query",
+                    "README runtime package CLI orchestration",
+                    "--limit",
+                    "2",
+                    "--expect-kind",
+                    "codemap",
+                    "--expect-source-document",
+                    "README.md",
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            benchmark_payload = json.loads(benchmark.stdout)["benchmark"]
+            self.assertEqual(benchmark_payload["summary"]["expected_kind_hit_rate"], 1.0)
+            self.assertEqual(benchmark_payload["summary"]["expected_source_document_hit_rate"], 1.0)
+            self.assertEqual(
+                benchmark_payload["samples"][0]["results"][0]["source_document"],
+                "README.md",
+            )
+
+            rerun = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "ingest-docs",
+                    "--workspace",
+                    str(workspace),
+                    "--max-chars",
+                    "1200",
+                ],
+                cwd=REPO_ROOT,
+                env={**os.environ, "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            rerun_report = json.loads(rerun.stdout)["ingestion"]
+            self.assertEqual(rerun_report["asset_count"], 2)
+            self.assertEqual(rerun_report["pruned_existing_assets"], 2)
 
     def test_cli_auto_start_and_auto_finish_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -309,6 +443,52 @@ class CliFlowTests(unittest.TestCase):
             warning = captured["log_warning"]
             assert isinstance(warning, dict)
             self.assertEqual(warning["reason"], "sqlite_activation_log_unwritable")
+            self.assertIn("readonly database", warning["error"])
+
+    def test_cli_auto_start_warns_when_feedback_cleanup_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            view = {
+                "activation_id": "act_feedback-cleanup-warning",
+                "task_query": "review cleanup fallback handling",
+                "workspace": str(workspace),
+                "selected_assets": [],
+                "selected_asset_ids": [],
+                "retrieval_summary": {},
+                "created_at": "2026-04-28T00:00:00+00:00",
+            }
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="review cleanup fallback handling",
+                constraints=[],
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", return_value=view), patch.object(
+                cli_main,
+                "_safe_feedback_cleanup",
+                return_value=(
+                    None,
+                    cli_main._sqlite_degraded_warning(
+                        db_path=default_db_path(workspace),
+                        error=sqlite3.OperationalError("attempt to write a readonly database"),
+                    ),
+                ),
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_auto_start(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(captured["activation_id"], "act_feedback-cleanup-warning")
+            self.assertIn("feedback_cleanup", captured)
+            self.assertIn("feedback_cleanup_warning", captured)
+            cleanup = captured["feedback_cleanup"]
+            warning = captured["feedback_cleanup_warning"]
+            assert isinstance(cleanup, dict)
+            assert isinstance(warning, dict)
+            self.assertEqual(cleanup["auto_resolved_count"], 0)
+            self.assertEqual(warning["reason"], "sqlite_index_unavailable")
             self.assertIn("readonly database", warning["error"])
 
     def test_cli_activate_uses_memory_root_source_dirs_in_user_cache(self) -> None:
@@ -546,7 +726,7 @@ class CliFlowTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
-                env={**dict(os.environ), "CODEX_HOME": str(codex_home)},
+                env={**dict(os.environ), "CODEX_HOME": str(codex_home), "EXPCAP_STORAGE_PROFILE": "local"},
             )
 
             payload = json.loads(completed.stdout)
@@ -709,6 +889,57 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["recent_activations"][0]["help_signal"], "unclear")
             self.assertEqual(payload["unresolved_activations"], [])
 
+    def test_cli_auto_finish_warns_when_feedback_cleanup_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="fix cleanup fallback handling",
+                user_request=None,
+                constraints=[],
+                commands=[],
+                errors=[],
+                files_changed=[],
+                verification_status="passed",
+                verification_summary="1 passed",
+                result_status="success",
+                result_summary="verified",
+                host=None,
+                session_id=None,
+                trace_id="trace_feedback_cleanup_warning",
+                no_promote=False,
+                promote_threshold=0.75,
+                knowledge_scope="project",
+                knowledge_kind="pattern",
+            )
+
+            with patch.object(
+                cli_main,
+                "_safe_feedback_cleanup",
+                return_value=(
+                    None,
+                    cli_main._sqlite_degraded_warning(
+                        db_path=default_db_path(workspace),
+                        error=sqlite3.OperationalError("attempt to write a readonly database"),
+                    ),
+                ),
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_auto_finish(args)
+
+            self.assertEqual(result, 0)
+            self.assertIn("feedback_cleanup", captured)
+            self.assertIn("feedback_cleanup_warning", captured)
+            self.assertEqual(captured["trace"]["trace_id"], "trace_feedback_cleanup_warning")
+            cleanup = captured["feedback_cleanup"]
+            warning = captured["feedback_cleanup_warning"]
+            assert isinstance(cleanup, dict)
+            assert isinstance(warning, dict)
+            self.assertEqual(cleanup["auto_resolved_count"], 0)
+            self.assertEqual(warning["reason"], "sqlite_index_unavailable")
+            self.assertIn("readonly database", warning["error"])
+
     def test_cli_doctor_reports_workspace_health_and_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"
@@ -780,7 +1011,7 @@ class CliFlowTests(unittest.TestCase):
                         "workspace": str(workspace),
                         "asset_type": "pattern",
                         "knowledge_scope": "project",
-                        "knowledge_kind": "pattern",
+                        "knowledge_kind": "preference",
                         "title": "dashboard support pattern",
                         "content": "use a local dashboard to review asset quality and retrieval effectiveness.",
                         "scope": {"level": "workspace", "value": "dashboard-test"},
@@ -807,8 +1038,22 @@ class CliFlowTests(unittest.TestCase):
                                 "title": "dashboard support pattern",
                                 "retrieval_sources": ["milvus", "sqlite"],
                                 "vector_score": 0.82,
+                                "injection_channel": "system_prompt",
                             }
                         ],
+                        "injection_plan": {
+                            "policy": "local_prior_injection_v1",
+                            "channel_counts": {
+                                "system_prompt": 1,
+                                "runtime_context": 0,
+                                "reference_summary": 1,
+                            },
+                            "channels": {
+                                "system_prompt": {"items": [{"asset_id": "pattern_dashboard_001"}]},
+                                "runtime_context": {"items": []},
+                                "reference_summary": {"items": [{"asset_id": "context_doc_dashboard_001"}]},
+                            },
+                        },
                         "retrieval_summary": {
                             "milvus_project_candidates": 1,
                             "milvus_shared_candidates": 0,
@@ -852,10 +1097,21 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("Write Frequency", html)
             self.assertIn("Effectiveness Snapshot", html)
             self.assertIn("Unproven Validation Queue", html)
+            self.assertIn("Local Prior Distribution", html)
+            self.assertIn("Injection Channels", html)
             self.assertEqual(payload["dashboard"]["cards"]["assets"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["local_prior_assets"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["high_priority_prior_assets"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["system_prompt_items"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["reference_summary_items"], 1)
             self.assertIn("effectiveness_snapshot", payload["dashboard"])
             self.assertEqual(payload["dashboard"]["unproven_validation_count"], 0)
             self.assertEqual(dashboard["cards"]["healthy_assets"], 1)
+            self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["by_kind"]["preference"], 1)
+            self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["high_priority_count"], 1)
+            self.assertEqual(dashboard["injection_policy_summary"]["channel_counts"]["system_prompt"], 1)
+            self.assertEqual(dashboard["injection_policy_summary"]["channel_counts"]["reference_summary"], 1)
+            self.assertEqual(dashboard["activations"][0]["injection_channel_counts"]["system_prompt"], 1)
             self.assertEqual(dashboard["effectiveness_snapshot"]["verdict"], "healthy")
             self.assertEqual(dashboard["retrieval"]["effectiveness"]["selected_from_milvus"], 1)
             self.assertEqual(dashboard["activations"][0]["help_signal"], "supported_strong")
@@ -1459,6 +1715,343 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(status_payload["project_activity"]["auto_start_mode"], "always_on_new_chat")
             self.assertEqual(status_payload["counts"]["activation_logs"], 1)
 
+    def test_cli_install_project_can_enable_claude_hooks_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "install-project",
+                    "--workspace",
+                    str(workspace),
+                    "--integration-mode",
+                    "claude-hooks",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+
+            self.assertEqual(payload["integration_mode"], "claude-hooks")
+            self.assertTrue((workspace / ".claude" / "settings.json").exists())
+            self.assertTrue((workspace / ".claude" / "hooks" / "expcap_user_prompt_submit.sh").exists())
+            self.assertTrue((workspace / ".claude" / "hooks" / "expcap_stop.sh").exists())
+
+    def test_expcap_hook_user_prompt_submit_routes_to_auto_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            asset_path = workspace / ".agent-memory" / "assets" / "patterns" / "pattern_hook_001.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_hook_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "hook based activation pattern",
+                        "content": "route prompt-submit hooks into auto-start.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.88,
+                        "status": "active",
+                        "created_at": "2026-04-13T00:00:00+00:00",
+                        "updated_at": "2026-04-13T00:00:00+00:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "user-prompt-submit",
+                    "--host",
+                    "claude",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps({"prompt": "fix prompt routing with hook activation"}, ensure_ascii=False),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+
+            self.assertTrue(payload["continue"])
+            self.assertIn("hookSpecificOutput", payload)
+            self.assertIn("additionalContext", payload["hookSpecificOutput"])
+            self.assertIn("expcap injection context", payload["hookSpecificOutput"]["additionalContext"])
+            self.assertIn("Runtime Context", payload["hookSpecificOutput"]["additionalContext"])
+            db_path = default_db_path(workspace)
+            self.assertEqual(len(list_activation_logs(db_path, workspace=str(workspace.resolve()))), 1)
+
+    def test_expcap_hook_stop_routes_to_auto_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "complete hook stop flow",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "stop",
+                    "--host",
+                    "claude",
+                    "--workspace",
+                    str(workspace),
+                    "--result-status",
+                    "success",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input="{}",
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+
+            self.assertTrue(payload["continue"])
+            traces_dir = workspace / ".agent-memory" / "traces" / "bundles"
+            self.assertTrue(any(traces_dir.glob("trace_*.json")))
+
+    def test_expcap_hook_user_prompt_submit_skips_duplicate_within_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            for _ in range(2):
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "scripts" / "expcap-hook"),
+                        "user-prompt-submit",
+                        "--host",
+                        "claude",
+                        "--workspace",
+                        str(workspace),
+                    ],
+                    cwd=REPO_ROOT,
+                    env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local", "EXPCAP_HOOK_COOLDOWN_MINUTES": "60"},
+                    input=json.dumps({"prompt": "stabilize duplicate hook prompt handling"}, ensure_ascii=False),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            payload = json.loads(completed.stdout)
+            self.assertTrue(payload["continue"])
+            db_path = default_db_path(workspace)
+            self.assertEqual(len(list_activation_logs(db_path, workspace=str(workspace.resolve()))), 1)
+
+            status = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "5",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            status_payload = json.loads(status.stdout)["status"]
+            self.assertEqual(status_payload["hook_integration"]["last_event"]["status"], "skipped")
+            self.assertIn("duplicate_cooldown", status_payload["hook_integration"]["last_event"]["reason"])
+
+    def test_expcap_hook_stop_skips_when_user_requests_no_save(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "collect context but 不要记录 this flow",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "stop",
+                    "--host",
+                    "claude",
+                    "--workspace",
+                    str(workspace),
+                    "--result-summary",
+                    "用户明确说不要记录这次结果",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input="{}",
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            self.assertTrue(payload["continue"])
+            traces_dir = workspace / ".agent-memory" / "traces" / "bundles"
+            self.assertFalse(traces_dir.exists() and any(traces_dir.glob("trace_*.json")))
+
+            status = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "5",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            status_payload = json.loads(status.stdout)["status"]
+            self.assertEqual(status_payload["hook_integration"]["last_event"]["status"], "skipped")
+            self.assertEqual(status_payload["hook_integration"]["last_event"]["reason"], "explicit_no_save_signal")
+
+    def test_status_and_doctor_report_claude_hook_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "install-project",
+                    "--workspace",
+                    str(workspace),
+                    "--integration-mode",
+                    "claude-hooks",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "user-prompt-submit",
+                    "--host",
+                    "claude",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps({"prompt": "inspect hook health visibility"}, ensure_ascii=False),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            status = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "5",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            status_payload = json.loads(status.stdout)["status"]
+            hook_integration = status_payload["hook_integration"]
+            self.assertEqual(hook_integration["integration_mode"], "claude-hooks")
+            self.assertTrue(hook_integration["claude"]["files_present"])
+            self.assertGreaterEqual(hook_integration["event_count"], 1)
+            self.assertEqual(hook_integration["last_event"]["status"], "success")
+
+            doctor = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "doctor",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "5",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            doctor_payload = json.loads(doctor.stdout)["doctor"]
+            hook_check = next(item for item in doctor_payload["checks"] if item["name"] == "hook_runtime")
+            self.assertEqual(hook_check["status"], "pass")
+            self.assertIn("Claude hook integration is configured", hook_check["summary"])
+
     def test_cli_auto_finish_records_activation_help_feedback_for_later_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"
@@ -1940,6 +2533,8 @@ class CliFlowTests(unittest.TestCase):
 
             self.assertEqual(payload["review_queue"]["kind"], "candidate_review_queue")
             self.assertGreaterEqual(payload["candidate_count"], 1)
+            self.assertIn("knowledge_kind_summary", payload["review_queue"])
+            self.assertGreaterEqual(payload["review_queue"]["knowledge_kind_summary"]["local_prior_count"], 0)
             self.assertEqual(payload["review_queue"]["items"][0]["status"], "needs_review")
             self.assertIn(payload["review_queue"]["items"][0]["suggested_action"], {"review", "promote"})
 
@@ -2010,6 +2605,109 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(len(promoted_candidate["review_history"]), 2)
             self.assertEqual(promoted_candidate["review_history"][1]["action"], "promote")
             self.assertEqual(asset["asset_id"], "pattern_manual_review_001")
+
+    def test_cli_review_candidates_filters_and_prioritizes_high_priority_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+            _write_candidate(
+                workspace / ".agent-memory" / "candidates" / "cand_pattern_filter_001.json",
+                workspace=workspace,
+                candidate_id="cand_pattern_filter_001",
+                status="new",
+                promotion_readiness="unknown",
+                help_signal=None,
+            )
+            _write_candidate(
+                workspace / ".agent-memory" / "candidates" / "cand_preference_filter_001.json",
+                workspace=workspace,
+                candidate_id="cand_preference_filter_001",
+                status="new",
+                promotion_readiness="unknown",
+                help_signal=None,
+                knowledge_kind="preference",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "review-candidates",
+                    "--workspace",
+                    str(workspace),
+                    "--status",
+                    "new",
+                    "--knowledge-kind",
+                    "preference",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            items = payload["review_queue"]["items"]
+
+            self.assertEqual(payload["candidate_count"], 1)
+            self.assertEqual(items[0]["candidate_id"], "cand_preference_filter_001")
+            self.assertEqual(items[0]["knowledge_kind"], "preference")
+            self.assertEqual(items[0]["suggested_action"], "review")
+            self.assertTrue(any("高优先级本地先验" in item for item in items[0]["reasons"]))
+
+    def test_cli_save_prior_creates_active_high_priority_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "save-prior",
+                    "--workspace",
+                    str(workspace),
+                    "--knowledge-kind",
+                    "dont_repeat",
+                    "--title",
+                    "不要重复询问存储 profile",
+                    "--content",
+                    "不要重复询问存储 profile；本项目默认使用 user-cache 和 EXPCAP_HOME=$HOME/.expcap。",
+                    "--source-note",
+                    "user explicitly asked not to repeat stable setup preferences",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            asset_path = Path(payload["asset"]["path"])
+            asset = json.loads(asset_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(asset["knowledge_kind"], "dont_repeat")
+            self.assertEqual(asset["asset_type"], "rule")
+            self.assertEqual(asset["status"], "active")
+            self.assertEqual(asset["review_status"], "healthy")
+            self.assertEqual(asset["temperature"], "warm")
+
+            status = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            status_payload = json.loads(status.stdout)["status"]
+            self.assertEqual(status_payload["knowledge_kind_summary"]["assets"]["high_priority_count"], 1)
 
     def test_cli_review_candidates_can_reject_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2151,7 +2849,12 @@ class CliFlowTests(unittest.TestCase):
             self.assertGreaterEqual(payload["counts"]["candidates"], 1)
             self.assertEqual(payload["candidate_status_summary"]["needs_review"], 1)
             self.assertGreaterEqual(payload["candidate_review_queue"]["candidate_count"], 1)
+            self.assertIn("knowledge_kind_summary", payload)
+            self.assertIn("knowledge_kind_summary", payload["candidate_review_queue"])
+            self.assertIn("injection_policy_summary", payload)
+            self.assertIn("injection_channel_counts", payload["recent_activations"][0])
             self.assertEqual(payload["candidate_review_queue"]["top_items"][0]["status"], "needs_review")
+            self.assertIn("knowledge_kind", payload["recent_candidates"][0])
             self.assertEqual(payload["recent_activations"][0]["help_signal"], "supported_weak")
             self.assertEqual(payload["retrieval_backends"]["sqlite"]["backend"], "sqlite")
             self.assertEqual(payload["retrieval_backends"]["sqlite"]["role"], "lightweight-state-index")

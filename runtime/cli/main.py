@@ -39,6 +39,7 @@ from runtime.core.knowledge_kinds import (
     PREFERENCE,
 )
 from runtime.core.project_install import (
+    INTEGRATION_MODE_CODEX_HOOKS,
     INTEGRATION_MODE_CLAUDE_HOOKS,
     SUPPORTED_INTEGRATION_MODES,
     install_project_agents,
@@ -2815,11 +2816,19 @@ def _build_status_payload(
     claude_settings_path = workspace / ".claude" / "settings.json"
     claude_prompt_hook_path = workspace / ".claude" / "hooks" / "expcap_user_prompt_submit.sh"
     claude_stop_hook_path = workspace / ".claude" / "hooks" / "expcap_stop.sh"
-    hook_files_ok = (
+    claude_hook_files_ok = (
         claude_settings_path.exists()
         and claude_prompt_hook_path.exists()
         and claude_stop_hook_path.exists()
     ) if integration_mode == INTEGRATION_MODE_CLAUDE_HOOKS else False
+    codex_hooks_path = workspace / ".codex" / "hooks.json"
+    codex_prompt_hook_path = workspace / ".codex" / "hooks" / "expcap_user_prompt_submit.sh"
+    codex_stop_hook_path = workspace / ".codex" / "hooks" / "expcap_stop.sh"
+    codex_hook_files_ok = (
+        codex_hooks_path.exists()
+        and codex_prompt_hook_path.exists()
+        and codex_stop_hook_path.exists()
+    ) if integration_mode == INTEGRATION_MODE_CODEX_HOOKS else False
     last_hook_event = recent_hook_events[0] if recent_hook_events else None
 
     return {
@@ -2829,12 +2838,19 @@ def _build_status_payload(
         "project_activity": project_activity,
         "hook_integration": {
             "integration_mode": integration_mode,
+            "codex": {
+                "configured": integration_mode == INTEGRATION_MODE_CODEX_HOOKS,
+                "hooks_path": str(codex_hooks_path),
+                "prompt_hook_path": str(codex_prompt_hook_path),
+                "stop_hook_path": str(codex_stop_hook_path),
+                "files_present": codex_hook_files_ok,
+            },
             "claude": {
                 "configured": integration_mode == INTEGRATION_MODE_CLAUDE_HOOKS,
                 "settings_path": str(claude_settings_path),
                 "prompt_hook_path": str(claude_prompt_hook_path),
                 "stop_hook_path": str(claude_stop_hook_path),
-                "files_present": hook_files_ok,
+                "files_present": claude_hook_files_ok,
             },
             "event_count": len(recent_hook_events),
             "last_event": last_hook_event,
@@ -2953,6 +2969,7 @@ def _build_doctor_payload(
         "integration_mode": DEFAULT_INTEGRATION_MODE,
         "recent_events": [],
         "last_event": None,
+        "codex": {"files_present": False},
         "claude": {"files_present": False},
     }
 
@@ -3031,17 +3048,19 @@ def _build_doctor_payload(
     hook_mode = str(hook_integration.get("integration_mode") or DEFAULT_INTEGRATION_MODE)
     recent_hook_events = hook_integration.get("recent_events") or []
     last_hook_event = hook_integration.get("last_event") or {}
-    if hook_mode == INTEGRATION_MODE_CLAUDE_HOOKS:
-        hook_files_present = bool(hook_integration.get("claude", {}).get("files_present"))
+    if hook_mode in {INTEGRATION_MODE_CODEX_HOOKS, INTEGRATION_MODE_CLAUDE_HOOKS}:
+        host_key = "codex" if hook_mode == INTEGRATION_MODE_CODEX_HOOKS else "claude"
+        host_label = "Codex" if hook_mode == INTEGRATION_MODE_CODEX_HOOKS else "Claude"
+        hook_files_present = bool(hook_integration.get(host_key, {}).get("files_present"))
         last_hook_status = str(last_hook_event.get("status") or "unknown")
         hook_status = "pass" if hook_files_present and last_hook_status != "error" else "warn"
         hook_summary = (
-            f"Claude hook integration is configured; files_present={hook_files_present}, "
+            f"{host_label} hook integration is configured; files_present={hook_files_present}, "
             f"recent_events={len(recent_hook_events)}, last_status={last_hook_status}."
         )
         hook_recommendation = None
         if not hook_files_present:
-            hook_recommendation = "Re-run install-project with --integration-mode claude-hooks to restore missing hook files."
+            hook_recommendation = f"Re-run install-project with --integration-mode {hook_mode} to restore missing hook files."
         elif last_hook_status == "error":
             hook_recommendation = "Inspect the latest hook event and wrapper stderr; the integration is installed but the last hook run failed."
         checks.append(

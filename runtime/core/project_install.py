@@ -11,9 +11,11 @@ EXPCAP_BLOCK_START = "<!-- EXPCAP START -->"
 EXPCAP_BLOCK_END = "<!-- EXPCAP END -->"
 EXPCAP_GITIGNORE_ENTRY = ".agent-memory/"
 INTEGRATION_MODE_DOCS_ONLY = "docs-only"
+INTEGRATION_MODE_CODEX_HOOKS = "codex-hooks"
 INTEGRATION_MODE_CLAUDE_HOOKS = "claude-hooks"
 SUPPORTED_INTEGRATION_MODES = (
     INTEGRATION_MODE_DOCS_ONLY,
+    INTEGRATION_MODE_CODEX_HOOKS,
     INTEGRATION_MODE_CLAUDE_HOOKS,
 )
 
@@ -162,7 +164,36 @@ def _claude_settings_payload(workspace: Path) -> dict[str, object]:
     }
 
 
-def _merge_claude_settings(existing: dict[str, object], update: dict[str, object]) -> dict[str, object]:
+def _codex_hooks_payload(workspace: Path) -> dict[str, object]:
+    return {
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "bash .codex/hooks/expcap_user_prompt_submit.sh",
+                            "timeout": 20,
+                        }
+                    ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "bash .codex/hooks/expcap_stop.sh",
+                            "timeout": 30,
+                        }
+                    ]
+                }
+            ],
+        }
+    }
+
+
+def _merge_hook_settings(existing: dict[str, object], update: dict[str, object]) -> dict[str, object]:
     merged = dict(existing)
     hooks = dict(existing.get("hooks") or {})
     update_hooks = update.get("hooks") or {}
@@ -179,6 +210,11 @@ def _merge_claude_settings(existing: dict[str, object], update: dict[str, object
                 normalized.append(encoded)
         hooks[event_name] = current_entries
     merged["hooks"] = hooks
+    return merged
+
+
+def _merge_claude_settings(existing: dict[str, object], update: dict[str, object]) -> dict[str, object]:
+    merged = _merge_hook_settings(existing, update)
 
     env = dict(existing.get("env") or {})
     env.update(update.get("env") or {})
@@ -202,6 +238,10 @@ def _write_executable_script(path: Path, content: str) -> tuple[bool, bool]:
     return created, updated
 
 
+def _runtime_hook_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "scripts" / "expcap-hook"
+
+
 def _ensure_claude_hook_files(workspace: Path) -> dict[str, str | bool]:
     claude_dir = workspace / ".claude"
     hooks_dir = claude_dir / "hooks"
@@ -210,19 +250,28 @@ def _ensure_claude_hook_files(workspace: Path) -> dict[str, str | bool]:
     prompt_hook_path = hooks_dir / "expcap_user_prompt_submit.sh"
     stop_hook_path = hooks_dir / "expcap_stop.sh"
 
-    prompt_hook = """#!/usr/bin/env bash
+    runtime_hook = str(_runtime_hook_path())
+    prompt_hook = f"""#!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="${{CLAUDE_PROJECT_DIR:-$(pwd)}}"
+HOOK_SCRIPT="$PROJECT_DIR/scripts/expcap-hook"
+if [[ ! -f "$HOOK_SCRIPT" ]]; then
+  HOOK_SCRIPT="{runtime_hook}"
+fi
 
-exec python3 "$PROJECT_DIR/scripts/expcap-hook" user-prompt-submit --host claude --workspace "$PROJECT_DIR"
+exec python3 "$HOOK_SCRIPT" user-prompt-submit --host claude --workspace "$PROJECT_DIR"
 """
-    stop_hook = """#!/usr/bin/env bash
+    stop_hook = f"""#!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="${{CLAUDE_PROJECT_DIR:-$(pwd)}}"
+HOOK_SCRIPT="$PROJECT_DIR/scripts/expcap-hook"
+if [[ ! -f "$HOOK_SCRIPT" ]]; then
+  HOOK_SCRIPT="{runtime_hook}"
+fi
 
-exec python3 "$PROJECT_DIR/scripts/expcap-hook" stop --host claude --workspace "$PROJECT_DIR"
+exec python3 "$HOOK_SCRIPT" stop --host claude --workspace "$PROJECT_DIR"
 """
     created_prompt_hook, updated_prompt_hook = _write_executable_script(prompt_hook_path, prompt_hook)
     created_stop_hook, updated_stop_hook = _write_executable_script(stop_hook_path, stop_hook)
@@ -250,6 +299,70 @@ exec python3 "$PROJECT_DIR/scripts/expcap-hook" stop --host claude --workspace "
         "updated_claude_prompt_hook": updated_prompt_hook,
         "created_claude_stop_hook": created_stop_hook,
         "updated_claude_stop_hook": updated_stop_hook,
+    }
+
+
+def _ensure_codex_hook_files(workspace: Path) -> dict[str, str | bool]:
+    codex_dir = workspace / ".codex"
+    hooks_dir = codex_dir / "hooks"
+    hooks_path = codex_dir / "hooks.json"
+
+    prompt_hook_path = hooks_dir / "expcap_user_prompt_submit.sh"
+    stop_hook_path = hooks_dir / "expcap_stop.sh"
+
+    runtime_hook = str(_runtime_hook_path())
+    prompt_hook = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="${{CODEX_PROJECT_DIR:-${{PWD}}}}"
+export EXPCAP_STORAGE_PROFILE="${{EXPCAP_STORAGE_PROFILE:-user-cache}}"
+export EXPCAP_HOME="${{EXPCAP_HOME:-$HOME/.expcap}}"
+HOOK_SCRIPT="$PROJECT_DIR/scripts/expcap-hook"
+if [[ ! -f "$HOOK_SCRIPT" ]]; then
+  HOOK_SCRIPT="{runtime_hook}"
+fi
+
+exec python3 "$HOOK_SCRIPT" user-prompt-submit --host codex --workspace "$PROJECT_DIR"
+"""
+    stop_hook = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="${{CODEX_PROJECT_DIR:-${{PWD}}}}"
+export EXPCAP_STORAGE_PROFILE="${{EXPCAP_STORAGE_PROFILE:-user-cache}}"
+export EXPCAP_HOME="${{EXPCAP_HOME:-$HOME/.expcap}}"
+HOOK_SCRIPT="$PROJECT_DIR/scripts/expcap-hook"
+if [[ ! -f "$HOOK_SCRIPT" ]]; then
+  HOOK_SCRIPT="{runtime_hook}"
+fi
+
+exec python3 "$HOOK_SCRIPT" stop --host codex --workspace "$PROJECT_DIR"
+"""
+    created_prompt_hook, updated_prompt_hook = _write_executable_script(prompt_hook_path, prompt_hook)
+    created_stop_hook, updated_stop_hook = _write_executable_script(stop_hook_path, stop_hook)
+
+    payload = _codex_hooks_payload(workspace)
+    existing = {}
+    if hooks_path.exists():
+        existing = json.loads(hooks_path.read_text(encoding="utf-8"))
+        if not isinstance(existing, dict):
+            existing = {}
+    merged = _merge_hook_settings(existing, payload)
+    created_hooks = not hooks_path.exists()
+    original_hooks = json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True) if hooks_path.exists() else None
+    new_hooks = json.dumps(merged, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    updated_hooks = original_hooks != new_hooks if original_hooks is not None else True
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(new_hooks, encoding="utf-8")
+
+    return {
+        "codex_hooks_path": str(hooks_path),
+        "codex_hooks_dir": str(hooks_dir),
+        "created_codex_hooks": created_hooks,
+        "updated_codex_hooks": updated_hooks,
+        "created_codex_prompt_hook": created_prompt_hook,
+        "updated_codex_prompt_hook": updated_prompt_hook,
+        "created_codex_stop_hook": created_stop_hook,
+        "updated_codex_stop_hook": updated_stop_hook,
     }
 
 
@@ -344,6 +457,18 @@ def install_project_agents(
         "created_claude_stop_hook": False,
         "updated_claude_stop_hook": False,
     }
+    codex_hook_result: dict[str, str | bool] = {
+        "codex_hooks_path": "",
+        "codex_hooks_dir": "",
+        "created_codex_hooks": False,
+        "updated_codex_hooks": False,
+        "created_codex_prompt_hook": False,
+        "updated_codex_prompt_hook": False,
+        "created_codex_stop_hook": False,
+        "updated_codex_stop_hook": False,
+    }
+    if normalized_mode == INTEGRATION_MODE_CODEX_HOOKS:
+        codex_hook_result = _ensure_codex_hook_files(workspace)
     if normalized_mode == INTEGRATION_MODE_CLAUDE_HOOKS:
         created_claude, updated_claude = _upsert_managed_block(
             claude_path,
@@ -368,5 +493,6 @@ def install_project_agents(
         "updated_gitignore": updated_gitignore,
         "created_claude": created_claude,
         "updated_claude": updated_claude,
+        **codex_hook_result,
         **claude_hook_result,
     }

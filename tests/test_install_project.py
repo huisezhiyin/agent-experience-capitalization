@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from runtime.core.project_install import (
+    INTEGRATION_MODE_CODEX_HOOKS,
     INTEGRATION_MODE_CLAUDE_HOOKS,
     INTEGRATION_MODE_DOCS_ONLY,
     install_project_agents,
@@ -125,6 +126,33 @@ class InstallProjectTests(unittest.TestCase):
             self.assertIn("Stop", settings["hooks"])
             self.assertIn("EXPCAP_STORAGE_PROFILE", settings["env"])
             self.assertIn("scripts/expcap-hook", prompt_hook.read_text(encoding="utf-8"))
+            self.assertIn("scripts/expcap-hook", stop_hook.read_text(encoding="utf-8"))
+
+    def test_install_project_codex_hooks_generate_settings_and_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            result = install_project_agents(workspace, integration_mode=INTEGRATION_MODE_CODEX_HOOKS)
+
+            hooks_path = workspace / ".codex" / "hooks.json"
+            prompt_hook = workspace / ".codex" / "hooks" / "expcap_user_prompt_submit.sh"
+            stop_hook = workspace / ".codex" / "hooks" / "expcap_stop.sh"
+            hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(Path(result["codex_hooks_path"]).resolve(), hooks_path.resolve())
+            self.assertEqual(Path(result["codex_hooks_dir"]).resolve(), (workspace / ".codex" / "hooks").resolve())
+            self.assertTrue(hooks_path.exists())
+            self.assertTrue(prompt_hook.exists())
+            self.assertTrue(stop_hook.exists())
+            self.assertIn("UserPromptSubmit", hooks["hooks"])
+            self.assertIn("Stop", hooks["hooks"])
+            self.assertIn(
+                "bash .codex/hooks/expcap_user_prompt_submit.sh",
+                json.dumps(hooks["hooks"]["UserPromptSubmit"], ensure_ascii=False),
+            )
+            self.assertIn("scripts/expcap-hook", prompt_hook.read_text(encoding="utf-8"))
+            self.assertIn("--host codex", prompt_hook.read_text(encoding="utf-8"))
             self.assertIn("scripts/expcap-hook", stop_hook.read_text(encoding="utf-8"))
 
     def test_install_project_include_claude_maps_to_claude_hooks_mode(self) -> None:

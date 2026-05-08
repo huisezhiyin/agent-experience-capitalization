@@ -164,8 +164,19 @@ scripts/expcap install-project --workspace /path/to/project --include-claude
 scripts/expcap install-project --workspace /path/to/project --integration-mode claude-hooks
 ```
 
+优先安装 Codex hooks：
+
+```bash
+scripts/expcap install-project --workspace /path/to/project --integration-mode codex-hooks
+```
+
 安装器会非破坏式追加说明，创建 `AGENTS.expcap.md`，并确保 `.agent-memory/`
-写入 `.gitignore`。`claude-hooks` 模式还会生成 `.claude/settings.json`、
+写入 `.gitignore`。`codex-hooks` 模式会生成 `.codex/hooks.json`、
+`.codex/hooks/expcap_user_prompt_submit.sh` 和 `.codex/hooks/expcap_stop.sh`。
+这些 wrapper 会把 Codex 的 `UserPromptSubmit` / `Stop` 事件路由到
+`scripts/expcap-hook`，并默认使用 `user-cache` 存储。如果当前 Codex 版本只读取
+用户级 `~/.codex/hooks.json`，把项目生成的 `.codex/hooks.json` entries 合并进去即可。
+`claude-hooks` 模式还会生成 `.claude/settings.json`、
 `.claude/hooks/expcap_user_prompt_submit.sh` 和 `.claude/hooks/expcap_stop.sh`，
 统一通过 `scripts/expcap-hook` 路由到 `auto-start` / `auto-finish`。之后 agent
 可以使用 skill-backed 默认工作流：

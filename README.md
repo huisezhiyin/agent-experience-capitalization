@@ -180,9 +180,21 @@ Install Claude hooks (Phase 1 runnable integration):
 scripts/expcap install-project --workspace /path/to/project --integration-mode claude-hooks
 ```
 
+Install Codex hooks as the preferred host adapter:
+
+```bash
+scripts/expcap install-project --workspace /path/to/project --integration-mode codex-hooks
+```
+
 The installer appends non-destructive instructions and creates
 `AGENTS.expcap.md`. It also ensures `.agent-memory/` is present in
-`.gitignore`. In `claude-hooks` mode it additionally writes
+`.gitignore`. In `codex-hooks` mode it writes `.codex/hooks.json` plus
+`.codex/hooks/expcap_user_prompt_submit.sh` and `.codex/hooks/expcap_stop.sh`.
+These wrappers route Codex `UserPromptSubmit` / `Stop` events to
+`scripts/expcap-hook` with the default `user-cache` storage profile. If your
+Codex build only reads the user-level `~/.codex/hooks.json`, merge the generated
+project `.codex/hooks.json` entries into the user-level file. In `claude-hooks`
+mode it additionally writes
 `.claude/settings.json` plus hook scripts under `.claude/hooks/`, all routed
 through `scripts/expcap-hook` to call `auto-start` / `auto-finish`. Agents can
 then use the skill-backed default workflow:

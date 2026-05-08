@@ -1743,6 +1743,34 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue((workspace / ".claude" / "hooks" / "expcap_user_prompt_submit.sh").exists())
             self.assertTrue((workspace / ".claude" / "hooks" / "expcap_stop.sh").exists())
 
+    def test_cli_install_project_can_enable_codex_hooks_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "install-project",
+                    "--workspace",
+                    str(workspace),
+                    "--integration-mode",
+                    "codex-hooks",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+
+            self.assertEqual(payload["integration_mode"], "codex-hooks")
+            self.assertTrue((workspace / ".codex" / "hooks.json").exists())
+            self.assertTrue((workspace / ".codex" / "hooks" / "expcap_user_prompt_submit.sh").exists())
+            self.assertTrue((workspace / ".codex" / "hooks" / "expcap_stop.sh").exists())
+
     def test_expcap_hook_user_prompt_submit_routes_to_auto_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"
@@ -2051,6 +2079,101 @@ class CliFlowTests(unittest.TestCase):
             hook_check = next(item for item in doctor_payload["checks"] if item["name"] == "hook_runtime")
             self.assertEqual(hook_check["status"], "pass")
             self.assertIn("Claude hook integration is configured", hook_check["summary"])
+
+    def test_status_and_doctor_report_codex_hook_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "install-project",
+                    "--workspace",
+                    str(workspace),
+                    "--integration-mode",
+                    "codex-hooks",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "user-prompt-submit",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "UserPromptSubmit",
+                        "cwd": str(workspace),
+                        "prompt": "inspect codex hook health visibility",
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            status = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "5",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            status_payload = json.loads(status.stdout)["status"]
+            hook_integration = status_payload["hook_integration"]
+            self.assertEqual(hook_integration["integration_mode"], "codex-hooks")
+            self.assertTrue(hook_integration["codex"]["files_present"])
+            self.assertGreaterEqual(hook_integration["event_count"], 1)
+            self.assertEqual(hook_integration["last_event"]["host"], "codex")
+            self.assertEqual(hook_integration["last_event"]["status"], "success")
+
+            doctor = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "doctor",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "5",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            doctor_payload = json.loads(doctor.stdout)["doctor"]
+            hook_check = next(item for item in doctor_payload["checks"] if item["name"] == "hook_runtime")
+            self.assertEqual(hook_check["status"], "pass")
+            self.assertIn("Codex hook integration is configured", hook_check["summary"])
 
     def test_cli_auto_finish_records_activation_help_feedback_for_later_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

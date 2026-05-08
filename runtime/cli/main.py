@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 from html import escape as html_escape
 import json
 import os
@@ -15,6 +16,7 @@ from runtime.core.engine import (
     apply_asset_effectiveness,
     apply_candidate_promotion_feedback,
     build_candidate_review_queue,
+    build_knowledge_kind_summary,
     build_trace_bundle,
     explain_object,
     extract_candidates,
@@ -23,8 +25,26 @@ from runtime.core.engine import (
     review_trace_bundle,
     should_promote_candidate,
 )
-from runtime.core.project_install import install_project_agents
+from runtime.core.hook_activity import load_recent_hook_events
+from runtime.core.injection_materializer import materialize_injection_artifacts
+from runtime.core.injection_policy import INJECTION_CHANNELS
+from runtime.core.knowledge_kinds import (
+    CANONICAL_KNOWLEDGE_KINDS,
+    CODEMAP,
+    CONSTRAINT,
+    DECISION_MEMORY,
+    DONT_REPEAT,
+    HIGH_PRIORITY_PRIOR_KINDS,
+    PAST_WIN,
+    PREFERENCE,
+)
+from runtime.core.project_install import (
+    INTEGRATION_MODE_CLAUDE_HOOKS,
+    SUPPORTED_INTEGRATION_MODES,
+    install_project_agents,
+)
 from runtime.core.project_policy import (
+    DEFAULT_INTEGRATION_MODE,
     DEFAULT_PROJECT_STATUS,
     load_project_policy,
 )
@@ -338,6 +358,60 @@ def _summarize_milvus_retrieval_effectiveness(activations: list[dict[str, Any]])
     }
 
 
+def _activation_injection_channel_counts(activation: dict[str, Any]) -> dict[str, int]:
+    counts = {channel: 0 for channel in INJECTION_CHANNELS}
+    plan_counts = (activation.get("injection_plan") or {}).get("channel_counts")
+    if isinstance(plan_counts, dict):
+        for channel in INJECTION_CHANNELS:
+            counts[channel] = int(plan_counts.get(channel, 0) or 0)
+        return counts
+
+    for asset in activation.get("selected_assets", []):
+        channel = asset.get("injection_channel")
+        if channel in counts:
+            counts[str(channel)] += 1
+    return counts
+
+
+def _summarize_injection_policy(activations: list[dict[str, Any]]) -> dict[str, Any]:
+    channel_counts = {channel: 0 for channel in INJECTION_CHANNELS}
+    activations_with_plan = 0
+    activations_with_channels = {channel: 0 for channel in INJECTION_CHANNELS}
+    selected_with_channel = 0
+    selected_without_channel = 0
+
+    for activation in activations:
+        has_plan = bool((activation.get("injection_plan") or {}).get("channel_counts"))
+        if has_plan:
+            activations_with_plan += 1
+        counts = _activation_injection_channel_counts(activation)
+        for channel in INJECTION_CHANNELS:
+            count = int(counts.get(channel, 0) or 0)
+            channel_counts[channel] += count
+            if count:
+                activations_with_channels[channel] += 1
+        for asset in activation.get("selected_assets", []):
+            if asset.get("injection_channel") in INJECTION_CHANNELS:
+                selected_with_channel += 1
+            else:
+                selected_without_channel += 1
+
+    activation_count = len(activations)
+    total_injected_items = sum(channel_counts.values())
+    return {
+        "policy": "local_prior_injection_v1",
+        "activation_count": activation_count,
+        "activations_with_plan": activations_with_plan,
+        "plan_coverage_ratio": round(activations_with_plan / activation_count, 4) if activation_count else 0.0,
+        "channel_counts": channel_counts,
+        "activations_with_channels": activations_with_channels,
+        "total_injected_items": total_injected_items,
+        "avg_items_per_activation": round(total_injected_items / activation_count, 4) if activation_count else 0.0,
+        "selected_with_channel": selected_with_channel,
+        "selected_without_channel": selected_without_channel,
+    }
+
+
 def _update_activation_view_file(workspace: Path, activation: dict[str, Any]) -> None:
     activation_view_path = memory_root_for_workspace(workspace) / "views" / f"{activation['activation_id']}.json"
     if activation_view_path.exists():
@@ -435,6 +509,26 @@ def _build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--session-id", help="Optional host session id.")
     ingest.add_argument("--trace-id", help="Optional explicit trace id.")
     ingest.add_argument("--output", help="Optional output path for the trace JSON.")
+
+    ingest_docs = subparsers.add_parser(
+        "ingest-docs",
+        help="Import project markdown docs as faithful codemap/context assets.",
+    )
+    ingest_docs.add_argument("--workspace", required=True, help="Workspace path whose docs should be imported.")
+    ingest_docs.add_argument(
+        "--path",
+        dest="paths",
+        action="append",
+        default=[],
+        help="Specific markdown file or directory to import. Defaults to README/AGENTS/CLAUDE and docs/*.md.",
+    )
+    ingest_docs.add_argument(
+        "--max-chars",
+        type=int,
+        default=4000,
+        help="Maximum characters per imported chunk. Defaults to 4000.",
+    )
+    ingest_docs.add_argument("--output", help="Optional output path for the ingestion report JSON.")
 
     auto_start = subparsers.add_parser(
         "auto-start",
@@ -582,9 +676,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     install_project.add_argument("--workspace", required=True, help="Target project workspace.")
     install_project.add_argument(
+        "--integration-mode",
+        choices=SUPPORTED_INTEGRATION_MODES,
+        help="How expcap should integrate with the target host. Defaults to docs-only.",
+    )
+    install_project.add_argument(
         "--include-claude",
         action="store_true",
-        help="Also append an expcap block to CLAUDE.md for Claude Code users.",
+        help=f"Backward-compatible alias for --integration-mode {INTEGRATION_MODE_CLAUDE_HOOKS}.",
     )
     install_project.add_argument(
         "--project-status",
@@ -637,6 +736,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--include-shared",
         action="store_true",
         help="Also query the shared cross-project Milvus index.",
+    )
+    benchmark_milvus.add_argument(
+        "--expect-kind",
+        dest="expected_kinds",
+        action="append",
+        default=[],
+        choices=list(CANONICAL_KNOWLEDGE_KINDS),
+        help="Expected knowledge kind that should appear in each result set. May be passed multiple times.",
+    )
+    benchmark_milvus.add_argument(
+        "--expect-source-document",
+        dest="expected_source_documents",
+        action="append",
+        default=[],
+        help="Expected source_document path that should appear in each result set. May be passed multiple times.",
     )
     benchmark_milvus.add_argument("--output", help="Optional output JSON path.")
 
@@ -752,10 +866,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     review_candidates.add_argument(
         "--knowledge-kind",
-        choices=["pattern", "anti_pattern", "rule", "context", "checklist"],
-        help="Optional knowledge kind override used when --action promote is selected.",
+        choices=list(CANONICAL_KNOWLEDGE_KINDS),
+        help="Filter queue by kind; also used as an override when --action promote is selected.",
     )
     review_candidates.add_argument("--output", help="Optional output path for the review queue JSON.")
+
+    save_prior = subparsers.add_parser(
+        "save-prior",
+        help="Save an explicit active local prior such as a preference, constraint, or dont_repeat instruction.",
+    )
+    save_prior.add_argument("--workspace", required=True, help="Workspace path that owns the prior.")
+    save_prior.add_argument(
+        "--knowledge-kind",
+        required=True,
+        choices=[PAST_WIN, PREFERENCE, CONSTRAINT, DECISION_MEMORY, DONT_REPEAT],
+        help="Local-prior kind to save as an active asset.",
+    )
+    save_prior.add_argument("--title", help="Optional short title. Defaults to a compact content-derived title.")
+    save_prior.add_argument("--content", required=True, help="Durable prior content to inject in future tasks.")
+    save_prior.add_argument("--scope-level", default="workspace", help="Scope level for the prior. Defaults to workspace.")
+    save_prior.add_argument(
+        "--scope-value",
+        default="general-coding-task",
+        help="Scope value for the prior. Defaults to general-coding-task.",
+    )
+    save_prior.add_argument("--confidence", type=float, default=0.9, help="Confidence for the explicit prior.")
+    save_prior.add_argument("--source-note", help="Optional note explaining why this prior was saved.")
 
     status = subparsers.add_parser(
         "status",
@@ -949,6 +1085,323 @@ def _handle_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+_DOC_INGEST_EXCLUDED_PARTS = {
+    ".agent-memory",
+    ".claude",
+    ".expcap",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+}
+
+
+def _doc_asset_slug(value: str) -> str:
+    cleaned = []
+    for ch in value.lower():
+        if ch.isalnum():
+            cleaned.append(ch)
+        elif cleaned and cleaned[-1] != "-":
+            cleaned.append("-")
+    return "".join(cleaned).strip("-")[:64] or "doc"
+
+
+def _prior_asset_type(knowledge_kind: str) -> str:
+    if knowledge_kind in HIGH_PRIORITY_PRIOR_KINDS:
+        return "rule"
+    return "context"
+
+
+def _build_prior_asset(
+    *,
+    workspace: Path,
+    knowledge_kind: str,
+    title: str | None,
+    content: str,
+    scope_level: str,
+    scope_value: str,
+    confidence: float,
+    source_note: str | None,
+) -> dict[str, Any]:
+    created_at = now_utc()
+    asset_type = _prior_asset_type(knowledge_kind)
+    digest = hashlib.sha1(f"{knowledge_kind}\n{content}".encode("utf-8")).hexdigest()[:10]
+    slug = _doc_asset_slug(title or content)
+    review_status = "healthy" if knowledge_kind in HIGH_PRIORITY_PRIOR_KINDS else "unproven"
+    return {
+        "asset_id": f"{asset_type}_{knowledge_kind}_{slug}_{digest}",
+        "workspace": str(workspace),
+        "asset_type": asset_type,
+        "knowledge_scope": "project",
+        "knowledge_kind": knowledge_kind,
+        "title": title or _compact_text_for_cli(content, limit=72),
+        "content": content,
+        "scope": {"level": scope_level, "value": scope_value},
+        "source_episode_ids": [],
+        "source_candidate_ids": [],
+        "source": {
+            "kind": "explicit_prior",
+            "note": source_note,
+        },
+        "confidence": round(max(0.0, min(float(confidence), 1.0)), 4),
+        "status": "active",
+        "temperature": "warm" if knowledge_kind in HIGH_PRIORITY_PRIOR_KINDS else "neutral",
+        "review_status": review_status,
+        "last_used_at": None,
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+
+
+def _compact_text_for_cli(value: str, limit: int = 96) -> str:
+    cleaned = " ".join(str(value).split())
+    return cleaned if len(cleaned) <= limit else cleaned[: limit - 1].rstrip() + "…"
+
+
+def _handle_save_prior(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    asset = _build_prior_asset(
+        workspace=workspace,
+        knowledge_kind=args.knowledge_kind,
+        title=args.title,
+        content=args.content,
+        scope_level=args.scope_level,
+        scope_value=args.scope_value,
+        confidence=args.confidence,
+        source_note=args.source_note,
+    )
+    asset_path = memory_root_for_workspace(workspace) / "assets" / f"{asset['asset_type']}s" / f"{asset['asset_id']}.json"
+    save_json(asset_path, asset)
+    upsert_asset(db_path, asset)
+    upsert_asset_vector(default_milvus_db_path(workspace), asset)
+    _print_json(
+        {
+            "asset": {
+                "asset_id": asset["asset_id"],
+                "path": str(asset_path),
+                "knowledge_kind": asset["knowledge_kind"],
+                "knowledge_scope": asset["knowledge_scope"],
+                "review_status": asset["review_status"],
+                "temperature": asset["temperature"],
+            }
+        }
+    )
+    return 0
+
+
+def _is_ingestable_doc_path(workspace: Path, path: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(workspace)
+    except ValueError:
+        return False
+    if path.suffix.lower() != ".md":
+        return False
+    if any(part in _DOC_INGEST_EXCLUDED_PARTS for part in relative.parts):
+        return False
+    if path.name.startswith(".env"):
+        return False
+    return path.is_file()
+
+
+def _default_doc_ingest_paths(workspace: Path) -> list[Path]:
+    paths = [
+        workspace / "README.md",
+        workspace / "README.zh-CN.md",
+        workspace / "AGENTS.md",
+        workspace / "CLAUDE.md",
+    ]
+    docs_dir = workspace / "docs"
+    if docs_dir.exists():
+        paths.extend(sorted(docs_dir.rglob("*.md")))
+    return [path for path in paths if _is_ingestable_doc_path(workspace, path)]
+
+
+def _expand_doc_ingest_paths(workspace: Path, raw_paths: list[str]) -> list[Path]:
+    if not raw_paths:
+        return _default_doc_ingest_paths(workspace)
+    expanded: list[Path] = []
+    for raw_path in raw_paths:
+        path = (workspace / raw_path).resolve() if not Path(raw_path).is_absolute() else Path(raw_path).resolve()
+        if path.is_dir():
+            expanded.extend(sorted(path.rglob("*.md")))
+        else:
+            expanded.append(path)
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in expanded:
+        if path in seen or not _is_ingestable_doc_path(workspace, path):
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
+
+
+def _chunk_doc_text(text: str, *, max_chars: int) -> list[str]:
+    max_chars = max(max_chars, 1000)
+    soft_heading_boundary = int(max_chars * 0.55)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in text.splitlines():
+        line_len = len(line) + 1
+        starts_heading = line.startswith("#") and current_len >= soft_heading_boundary
+        would_overflow = current_len + line_len > max_chars and current
+        if starts_heading or would_overflow:
+            chunks.append("\n".join(current).strip())
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append("\n".join(current).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _build_doc_asset(
+    *,
+    workspace: Path,
+    relative_path: Path,
+    chunk_text: str,
+    chunk_index: int,
+    chunk_count: int,
+    generated_at: str,
+) -> dict[str, Any]:
+    relative_text = relative_path.as_posix()
+    digest = hashlib.sha1(f"{relative_text}:{chunk_index}:{chunk_text}".encode("utf-8")).hexdigest()[:10]
+    slug = _doc_asset_slug(relative_text)
+    asset_id = f"context_doc_{slug}_{chunk_index:03d}_{digest}"
+    return {
+        "asset_id": asset_id,
+        "workspace": str(workspace),
+        "asset_type": "context",
+        "knowledge_scope": "project",
+        "knowledge_kind": CODEMAP,
+        "title": _compact_doc_title(relative_text, chunk_index, chunk_count),
+        "content": f"Document: {relative_text}\nChunk: {chunk_index}/{chunk_count}\n\n{chunk_text}",
+        "scope": {"level": "workspace", "value": "general-coding-task"},
+        "source_workspace": str(workspace),
+        "source_episode_ids": [],
+        "source_candidate_ids": [],
+        "source_document": relative_text,
+        "doc_chunk": {
+            "relative_path": relative_text,
+            "chunk_index": chunk_index,
+            "chunk_count": chunk_count,
+            "preserved_raw_text": True,
+        },
+        "confidence": 0.72,
+        "status": "active",
+        "review_status": "unproven",
+        "temperature": "neutral",
+        "last_used_at": None,
+        "created_at": generated_at,
+        "updated_at": generated_at,
+    }
+
+
+def _compact_doc_title(relative_text: str, chunk_index: int, chunk_count: int) -> str:
+    title = f"Doc codemap: {relative_text}"
+    if chunk_count > 1:
+        title = f"{title} #{chunk_index}/{chunk_count}"
+    return title if len(title) <= 96 else title[:95].rstrip() + "…"
+
+
+def _prune_existing_doc_assets(*, workspace: Path, memory_root: Path, db_path: Path) -> int:
+    contexts_dir = memory_root / "assets" / "contexts"
+    pruned_asset_ids: list[str] = []
+    if contexts_dir.exists():
+        for path in sorted(contexts_dir.glob("context_doc_*.json")):
+            try:
+                asset = load_json(path)
+                asset_id = str(asset.get("asset_id") or path.stem)
+            except (OSError, json.JSONDecodeError):
+                asset_id = path.stem
+            path.unlink(missing_ok=True)
+            pruned_asset_ids.append(asset_id)
+    if pruned_asset_ids:
+        ensure_db(db_path)
+        placeholders = ", ".join("?" for _ in pruned_asset_ids)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                f"DELETE FROM assets WHERE workspace = ? AND asset_id IN ({placeholders})",
+                (str(workspace), *pruned_asset_ids),
+            )
+    return len(pruned_asset_ids)
+
+
+def _handle_ingest_docs(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    memory_root = memory_root_for_workspace(workspace)
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    pruned_existing_assets = _prune_existing_doc_assets(
+        workspace=workspace,
+        memory_root=memory_root,
+        db_path=db_path,
+    )
+    docs = _expand_doc_ingest_paths(workspace, args.paths)
+    generated_at = now_utc()
+    assets: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    for doc_path in docs:
+        relative_path = doc_path.relative_to(workspace)
+        text = doc_path.read_text(encoding="utf-8")
+        chunks = _chunk_doc_text(text, max_chars=int(args.max_chars or 4000))
+        if not chunks:
+            skipped.append({"path": relative_path.as_posix(), "reason": "empty"})
+            continue
+        for index, chunk in enumerate(chunks, start=1):
+            asset = _build_doc_asset(
+                workspace=workspace,
+                relative_path=relative_path,
+                chunk_text=chunk,
+                chunk_index=index,
+                chunk_count=len(chunks),
+                generated_at=generated_at,
+            )
+            asset_path = memory_root / "assets" / "contexts" / f"{asset['asset_id']}.json"
+            save_json(asset_path, asset)
+            upsert_asset(db_path, asset)
+            vector_synced = upsert_asset_vector(default_milvus_db_path(workspace), asset)
+            assets.append(
+                {
+                    "asset_id": asset["asset_id"],
+                    "knowledge_kind": asset["knowledge_kind"],
+                    "source_document": asset["source_document"],
+                    "chunk_index": index,
+                    "chunk_count": len(chunks),
+                    "saved_to": str(asset_path),
+                    "vector_synced": bool(vector_synced),
+                }
+            )
+    milvus_sync_report = sync_assets_directory_with_report(
+        default_milvus_db_path(workspace),
+        memory_root / "assets",
+        prune=True,
+    )
+    report = {
+        "kind": "doc_ingestion_report",
+        "workspace": str(workspace),
+        "generated_at": generated_at,
+        "document_count": len(docs),
+        "asset_count": len(assets),
+        "vector_synced_count": sum(1 for item in assets if item["vector_synced"]),
+        "pruned_existing_assets": pruned_existing_assets,
+        "milvus_sync_report": milvus_sync_report,
+        "skipped": skipped,
+        "assets": assets,
+    }
+    output_path = Path(args.output) if args.output else memory_root / "reviews" / "doc_ingestion.json"
+    save_json(output_path, report)
+    _print_json({"saved_to": str(output_path), "ingestion": report})
+    return 0
+
+
 def _fallback_activation_view_path(workspace: Path, view: dict[str, Any]) -> Path:
     return (
         Path(tempfile.gettempdir())
@@ -999,6 +1452,20 @@ def _save_activation_view(
             fallback_path=fallback_path,
             error=error,
         )
+
+
+def _safe_materialize_injection_artifacts(
+    *,
+    workspace: Path,
+    view: dict[str, Any],
+) -> tuple[dict[str, str], dict[str, str] | None]:
+    try:
+        return materialize_injection_artifacts(workspace=workspace, activation=view), None
+    except OSError as error:
+        return {}, {
+            "reason": "injection_artifact_unwritable",
+            "error": str(error),
+        }
 
 
 def _save_review_json(
@@ -1210,10 +1677,17 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
     project_activity = load_project_policy(workspace)
     db_path = default_db_path(workspace)
     ensure_db(db_path)
-    feedback_cleanup = _auto_resolve_stale_activation_feedback(
+    feedback_cleanup, feedback_cleanup_warning = _safe_feedback_cleanup(
         workspace=workspace,
         db_path=db_path,
     )
+    if feedback_cleanup is None:
+        feedback_cleanup = {
+            "auto_resolved_count": 0,
+            "auto_resolved_activation_ids": [],
+            "resolution_help_signal": STALE_FEEDBACK_HELP_SIGNAL,
+            "pending_hours": _feedback_pending_hours(),
+        }
     assets_dir, candidates_dir = _activation_source_dirs(workspace)
     view = activate_assets(
         task=args.task,
@@ -1228,9 +1702,17 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
         view=view,
         requested_output=args.output,
     )
+    injection_artifacts, injection_artifact_warning = _safe_materialize_injection_artifacts(
+        workspace=workspace,
+        view=view,
+    )
+    if injection_artifacts:
+        view["injection_artifacts"] = injection_artifacts
+    save_json(output_path, view)
     log_warning = _record_activation_usage(db_path=db_path, view=view)
     payload = {
         "saved_to": str(output_path),
+        "injection_artifacts": injection_artifacts,
         "activation_id": view["activation_id"],
         "selected_count": len(view.get("selected_assets", [])),
         "project_activity": project_activity,
@@ -1241,6 +1723,10 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
         payload["save_warning"] = save_warning
     if log_warning:
         payload["log_warning"] = log_warning
+    if injection_artifact_warning:
+        payload["injection_artifact_warning"] = injection_artifact_warning
+    if feedback_cleanup_warning:
+        payload["feedback_cleanup_warning"] = feedback_cleanup_warning
     _print_json(payload)
     return 0
 
@@ -1587,6 +2073,7 @@ def _handle_review(args: argparse.Namespace) -> int:
 def _handle_install_project(args: argparse.Namespace) -> int:
     result = install_project_agents(
         Path(args.workspace),
+        integration_mode=args.integration_mode,
         include_claude=args.include_claude,
         project_status=args.project_status,
     )
@@ -1599,10 +2086,17 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
     ensure_db(db_path)
-    feedback_cleanup = _auto_resolve_stale_activation_feedback(
+    feedback_cleanup, feedback_cleanup_warning = _safe_feedback_cleanup(
         workspace=workspace,
         db_path=db_path,
     )
+    if feedback_cleanup is None:
+        feedback_cleanup = {
+            "auto_resolved_count": 0,
+            "auto_resolved_activation_ids": [],
+            "resolution_help_signal": STALE_FEEDBACK_HELP_SIGNAL,
+            "pending_hours": _feedback_pending_hours(),
+        }
 
     trace = build_trace_bundle(
         workspace=workspace,
@@ -1718,6 +2212,7 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             "feedback_cleanup": feedback_cleanup,
             "auto_promote_enabled": not args.no_promote,
             "promote_threshold": args.promote_threshold,
+            "feedback_cleanup_warning": feedback_cleanup_warning,
         }
     )
     return 0
@@ -1869,6 +2364,8 @@ def _build_milvus_benchmark_payload(
     sample_size: int,
     limit: int,
     include_shared: bool,
+    expected_kinds: list[str] | None = None,
+    expected_source_documents: list[str] | None = None,
 ) -> dict[str, Any]:
     workspace = workspace.resolve()
     db_path = default_db_path(workspace)
@@ -1897,6 +2394,12 @@ def _build_milvus_benchmark_payload(
     result_counts: list[int] = []
     hit_sample_count = 0
     comparable_sample_count = 0
+    expected_kinds = [item for item in (expected_kinds or []) if item]
+    expected_source_documents = [item for item in (expected_source_documents or []) if item]
+    expected_kind_hit_count = 0
+    expected_kind_top_hit_count = 0
+    expected_source_document_hit_count = 0
+    expected_source_document_top_hit_count = 0
 
     for sample in samples:
         local_results = search_asset_vectors(
@@ -1927,6 +2430,26 @@ def _build_milvus_benchmark_payload(
         result_ids = [str(item.get("asset_id")) for item in results if item.get("asset_id")]
         expected_ids = sample["expected_asset_ids"]
         hits = [asset_id for asset_id in expected_ids if asset_id in result_ids]
+        kind_hits = [
+            str(item.get("asset_id"))
+            for item in results
+            if str(item.get("knowledge_kind") or "") in expected_kinds
+        ]
+        source_document_hits = [
+            str(item.get("asset_id"))
+            for item in results
+            if _result_matches_expected_source_document(item, expected_source_documents)
+        ]
+        if expected_kinds:
+            if kind_hits:
+                expected_kind_hit_count += 1
+            if results and str(results[0].get("knowledge_kind") or "") in expected_kinds:
+                expected_kind_top_hit_count += 1
+        if expected_source_documents:
+            if source_document_hits:
+                expected_source_document_hit_count += 1
+            if results and _result_matches_expected_source_document(results[0], expected_source_documents):
+                expected_source_document_top_hit_count += 1
         if expected_ids:
             comparable_sample_count += 1
             if hits:
@@ -1942,12 +2465,17 @@ def _build_milvus_benchmark_payload(
                 "top_score": round(scores[0], 4) if scores else 0.0,
                 "hit_asset_ids": hits,
                 "hit_count": len(hits),
+                "expected_kind_hit_asset_ids": kind_hits,
+                "expected_kind_hit_count": len(kind_hits),
+                "expected_source_document_hit_asset_ids": source_document_hits,
+                "expected_source_document_hit_count": len(source_document_hits),
                 "results": [
                     {
                         "asset_id": item.get("asset_id"),
                         "title": item.get("title"),
                         "knowledge_scope": item.get("knowledge_scope"),
                         "knowledge_kind": item.get("knowledge_kind"),
+                        "source_document": item.get("source_document"),
                         "milvus_index": item.get("milvus_index"),
                         "vector_score": round(float(item.get("vector_score", 0.0) or 0.0), 4),
                         "embedding": item.get("embedding"),
@@ -1971,6 +2499,8 @@ def _build_milvus_benchmark_payload(
         "limit": bounded_limit,
         "sample_size": bounded_sample_size,
         "include_shared": include_shared,
+        "expected_kinds": expected_kinds,
+        "expected_source_documents": expected_source_documents,
         "sample_count": len(benchmark_items),
         "summary": {
             "queries_with_results": sum(1 for item in benchmark_items if item["result_count"] > 0),
@@ -1982,9 +2512,40 @@ def _build_milvus_benchmark_payload(
             "avg_result_count": result_count_summary["avg"],
             "avg_top_score": top_score_summary["avg"],
             "max_top_score": top_score_summary["max"],
+            "queries_with_expected_kind": expected_kind_hit_count if expected_kinds else None,
+            "expected_kind_hit_rate": round(expected_kind_hit_count / len(benchmark_items), 4)
+            if expected_kinds and benchmark_items
+            else None,
+            "expected_kind_top_hit_rate": round(expected_kind_top_hit_count / len(benchmark_items), 4)
+            if expected_kinds and benchmark_items
+            else None,
+            "queries_with_expected_source_document": expected_source_document_hit_count
+            if expected_source_documents
+            else None,
+            "expected_source_document_hit_rate": round(expected_source_document_hit_count / len(benchmark_items), 4)
+            if expected_source_documents and benchmark_items
+            else None,
+            "expected_source_document_top_hit_rate": round(
+                expected_source_document_top_hit_count / len(benchmark_items),
+                4,
+            )
+            if expected_source_documents and benchmark_items
+            else None,
         },
         "samples": benchmark_items,
     }
+
+
+def _result_matches_expected_source_document(item: dict[str, Any], expected_source_documents: list[str]) -> bool:
+    if not expected_source_documents:
+        return False
+    source_document = str(item.get("source_document") or "")
+    title = str(item.get("title") or "")
+    content = str(item.get("content") or "")
+    return any(
+        expected in source_document or expected in title or expected in content
+        for expected in expected_source_documents
+    )
 
 
 def _handle_benchmark_milvus(args: argparse.Namespace) -> int:
@@ -1995,6 +2556,8 @@ def _handle_benchmark_milvus(args: argparse.Namespace) -> int:
         sample_size=args.sample_size,
         limit=args.limit,
         include_shared=args.include_shared,
+        expected_kinds=args.expected_kinds,
+        expected_source_documents=args.expected_source_documents,
     )
     output_path = (
         Path(args.output)
@@ -2037,12 +2600,26 @@ def _handle_activate(args: argparse.Namespace) -> int:
         view=view,
         requested_output=args.output,
     )
+    injection_artifacts, injection_artifact_warning = _safe_materialize_injection_artifacts(
+        workspace=workspace,
+        view=view,
+    )
+    if injection_artifacts:
+        view["injection_artifacts"] = injection_artifacts
+    save_json(output_path, view)
     log_warning = _record_activation_usage(db_path=db_path, view=view)
-    payload = {"saved_to": str(output_path), "activation_id": view["activation_id"], "activation_view": view}
+    payload = {
+        "saved_to": str(output_path),
+        "injection_artifacts": injection_artifacts,
+        "activation_id": view["activation_id"],
+        "activation_view": view,
+    }
     if save_warning:
         payload["save_warning"] = save_warning
     if log_warning:
         payload["log_warning"] = log_warning
+    if injection_artifact_warning:
+        payload["injection_artifact_warning"] = injection_artifact_warning
     _print_json(payload)
     return 0
 
@@ -2070,6 +2647,12 @@ def _handle_review_candidates(args: argparse.Namespace) -> int:
             candidate
             for candidate in iter_json_objects(candidates_dir) or []
             if candidate.get("status") in statuses
+        ]
+    if args.knowledge_kind:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("knowledge_kind", candidate.get("candidate_type", "pattern")) == args.knowledge_kind
         ]
     queue = build_candidate_review_queue(candidates, workspace=str(workspace))
     output_path = (
@@ -2119,14 +2702,21 @@ def _build_status_payload(
     )
     traces = list(iter_json_objects(memory_root / "traces" / "bundles"))
     episodes = list(iter_json_objects(memory_root / "episodes"))
+    recent_hook_events = load_recent_hook_events(workspace, limit=limit)
 
     feedback_summary = _summarize_activation_feedback(activations)
     unresolved_activations = _build_unresolved_activation_items(activations, limit=limit)
     milvus_effectiveness = _summarize_milvus_retrieval_effectiveness(activations)
+    injection_policy_summary = _summarize_injection_policy(activations)
 
+    proof_tracked_assets = [
+        asset
+        for asset in assets
+        if str(asset.get("knowledge_kind", asset.get("asset_type", "pattern")) or "pattern") != CODEMAP
+    ]
     temperature_summary = {"hot": 0, "warm": 0, "neutral": 0, "cool": 0}
     review_status_summary = {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}
-    for asset in assets:
+    for asset in proof_tracked_assets:
         temperature_summary[asset.get("temperature", "neutral")] = (
             temperature_summary.get(asset.get("temperature", "neutral"), 0) + 1
         )
@@ -2135,10 +2725,10 @@ def _build_status_payload(
         )
     asset_review_backlog = _build_asset_review_backlog(
         review_status_summary,
-        total_assets=len(assets),
+        total_assets=len(proof_tracked_assets),
     )
     unproven_validation_queue = _build_unproven_validation_queue(
-        assets,
+        proof_tracked_assets,
         activations=activations,
         limit=limit,
     )
@@ -2178,6 +2768,7 @@ def _build_status_payload(
         {
             "candidate_id": candidate.get("candidate_id"),
             "title": candidate.get("title"),
+            "knowledge_kind": candidate.get("knowledge_kind", candidate.get("candidate_type", "pattern")),
             "status": candidate.get("status"),
             "promotion_readiness": candidate.get("promotion_readiness"),
             "help_signal": candidate.get("promotion_feedback", {}).get("help_signal"),
@@ -2195,6 +2786,7 @@ def _build_status_payload(
             "activation_id": activation.get("activation_id"),
             "task_query": activation.get("task_query"),
             "selected_count": len(activation.get("selected_assets", [])),
+            "injection_channel_counts": _activation_injection_channel_counts(activation),
             "help_signal": activation.get("feedback", {}).get("help_signal"),
             "created_at": activation.get("created_at"),
         }
@@ -2219,12 +2811,35 @@ def _build_status_payload(
         if isinstance(milvus_indexed_entities, int) and assets
         else None
     )
+    integration_mode = str(project_activity.get("integration_mode") or DEFAULT_INTEGRATION_MODE)
+    claude_settings_path = workspace / ".claude" / "settings.json"
+    claude_prompt_hook_path = workspace / ".claude" / "hooks" / "expcap_user_prompt_submit.sh"
+    claude_stop_hook_path = workspace / ".claude" / "hooks" / "expcap_stop.sh"
+    hook_files_ok = (
+        claude_settings_path.exists()
+        and claude_prompt_hook_path.exists()
+        and claude_stop_hook_path.exists()
+    ) if integration_mode == INTEGRATION_MODE_CLAUDE_HOOKS else False
+    last_hook_event = recent_hook_events[0] if recent_hook_events else None
 
     return {
         "workspace": str(workspace),
         "generated_at": now_utc(),
         "backend_configuration": backend_config,
         "project_activity": project_activity,
+        "hook_integration": {
+            "integration_mode": integration_mode,
+            "claude": {
+                "configured": integration_mode == INTEGRATION_MODE_CLAUDE_HOOKS,
+                "settings_path": str(claude_settings_path),
+                "prompt_hook_path": str(claude_prompt_hook_path),
+                "stop_hook_path": str(claude_stop_hook_path),
+                "files_present": hook_files_ok,
+            },
+            "event_count": len(recent_hook_events),
+            "last_event": last_hook_event,
+            "recent_events": recent_hook_events,
+        },
         "feedback_cleanup": feedback_cleanup
         or {
             "auto_resolved_count": 0,
@@ -2257,6 +2872,7 @@ def _build_status_payload(
             },
         },
         "milvus_retrieval_effectiveness": milvus_effectiveness,
+        "injection_policy_summary": injection_policy_summary,
         "counts": {
             "traces": len(traces),
             "episodes": len(episodes),
@@ -2270,12 +2886,18 @@ def _build_status_payload(
             "temperature": temperature_summary,
             "review_status": review_status_summary,
         },
+        "knowledge_kind_summary": {
+            "assets": build_knowledge_kind_summary(assets),
+            "candidates": build_knowledge_kind_summary(candidates),
+            "review_queue": review_queue["knowledge_kind_summary"],
+        },
         "asset_review_backlog": asset_review_backlog,
         "unproven_validation_queue": unproven_validation_queue,
         "candidate_status_summary": candidate_status_summary,
         "candidate_review_queue": {
             "candidate_count": review_queue["candidate_count"],
             "status_summary": review_queue["status_summary"],
+            "knowledge_kind_summary": review_queue["knowledge_kind_summary"],
             "top_items": review_queue["items"][:limit],
         },
         "recent_assets": recent_assets,
@@ -2327,6 +2949,12 @@ def _build_doctor_payload(
     asset_health = status_payload["asset_effectiveness_summary"]["review_status"]
     asset_backlog = status_payload["asset_review_backlog"]
     unproven_validation_queue = status_payload["unproven_validation_queue"]
+    hook_integration = status_payload.get("hook_integration") or {
+        "integration_mode": DEFAULT_INTEGRATION_MODE,
+        "recent_events": [],
+        "last_event": None,
+        "claude": {"files_present": False},
+    }
 
     checks.append(
         _diagnostic_check(
@@ -2400,6 +3028,30 @@ def _build_doctor_payload(
             None if missing == 0 else "Finish or annotate older unresolved activations so help-rate metrics stay meaningful.",
         )
     )
+    hook_mode = str(hook_integration.get("integration_mode") or DEFAULT_INTEGRATION_MODE)
+    recent_hook_events = hook_integration.get("recent_events") or []
+    last_hook_event = hook_integration.get("last_event") or {}
+    if hook_mode == INTEGRATION_MODE_CLAUDE_HOOKS:
+        hook_files_present = bool(hook_integration.get("claude", {}).get("files_present"))
+        last_hook_status = str(last_hook_event.get("status") or "unknown")
+        hook_status = "pass" if hook_files_present and last_hook_status != "error" else "warn"
+        hook_summary = (
+            f"Claude hook integration is configured; files_present={hook_files_present}, "
+            f"recent_events={len(recent_hook_events)}, last_status={last_hook_status}."
+        )
+        hook_recommendation = None
+        if not hook_files_present:
+            hook_recommendation = "Re-run install-project with --integration-mode claude-hooks to restore missing hook files."
+        elif last_hook_status == "error":
+            hook_recommendation = "Inspect the latest hook event and wrapper stderr; the integration is installed but the last hook run failed."
+        checks.append(
+            _diagnostic_check(
+                "hook_runtime",
+                hook_status,
+                hook_summary,
+                hook_recommendation,
+            )
+        )
 
     local_milvus = milvus_backend["local"]
     local_milvus_status = "pass" if local_milvus["status"] == "ready" else "warn"
@@ -2593,6 +3245,7 @@ def _build_dashboard_payload(
         {
             "candidate_id": candidate.get("candidate_id"),
             "title": candidate.get("title"),
+            "knowledge_kind": candidate.get("knowledge_kind", candidate.get("candidate_type", "pattern")),
             "status": candidate.get("status"),
             "promotion_readiness": candidate.get("promotion_readiness"),
             "help_signal": candidate.get("promotion_feedback", {}).get("help_signal"),
@@ -2619,6 +3272,7 @@ def _build_dashboard_payload(
             "task_query": activation.get("task_query"),
             "selected_count": len(activation.get("selected_assets", [])),
             "help_signal": activation.get("feedback", {}).get("help_signal"),
+            "injection_channel_counts": _activation_injection_channel_counts(activation),
             "selected_from_milvus": activation.get("retrieval_summary", {}).get("selected_from_milvus", 0),
             "milvus_project_candidates": activation.get("retrieval_summary", {}).get("milvus_project_candidates", 0),
             "milvus_shared_candidates": activation.get("retrieval_summary", {}).get("milvus_shared_candidates", 0),
@@ -2658,7 +3312,7 @@ def _build_dashboard_payload(
     resolved_feedback_count = supported_count + int(feedback_summary.get("unclear", 0) or 0) + int(
         feedback_summary.get("missing", 0) or 0
     )
-    total_assets = int(status_payload["counts"]["assets"] or 0)
+    total_assets = int(status_payload["asset_review_backlog"]["total_assets"] or 0)
     healthy_assets = int(status_payload["asset_review_backlog"]["healthy_count"] or 0)
     recent_writes = sum(item["assets"] + item["candidates"] + item["activations"] for item in write_frequency)
     asset_quality_ratio = _clamp_ratio(healthy_assets / total_assets) if total_assets else 0.0
@@ -2695,6 +3349,10 @@ def _build_dashboard_payload(
             "activation_logs": status_payload["counts"]["activation_logs"],
             "healthy_assets": status_payload["asset_review_backlog"]["healthy_count"],
             "unproven_assets": status_payload["asset_review_backlog"]["unproven_count"],
+            "local_prior_assets": status_payload["knowledge_kind_summary"]["assets"]["local_prior_count"],
+            "high_priority_prior_assets": status_payload["knowledge_kind_summary"]["assets"]["high_priority_count"],
+            "system_prompt_items": status_payload["injection_policy_summary"]["channel_counts"]["system_prompt"],
+            "reference_summary_items": status_payload["injection_policy_summary"]["channel_counts"]["reference_summary"],
             "milvus_selected_ratio": status_payload["milvus_retrieval_effectiveness"]["milvus_selected_ratio"],
             "activation_selected_ratio": status_payload["milvus_retrieval_effectiveness"]["activation_selected_ratio"],
             "stale_missing_feedback": status_payload["activation_feedback_summary"]["missing"],
@@ -2738,6 +3396,8 @@ def _build_dashboard_payload(
         "unproven_assets": unproven_rows,
         "activations": activation_rows,
         "review_queue": status_payload["candidate_review_queue"],
+        "knowledge_kind_summary": status_payload["knowledge_kind_summary"],
+        "injection_policy_summary": status_payload["injection_policy_summary"],
         "retrieval": {
             "milvus": status_payload["retrieval_backends"]["milvus"],
             "effectiveness": status_payload["milvus_retrieval_effectiveness"],
@@ -2746,6 +3406,8 @@ def _build_dashboard_payload(
             "asset_effectiveness_summary": status_payload["asset_effectiveness_summary"],
             "asset_review_backlog": status_payload["asset_review_backlog"],
             "activation_feedback_summary": status_payload["activation_feedback_summary"],
+            "knowledge_kind_summary": status_payload["knowledge_kind_summary"],
+            "injection_policy_summary": status_payload["injection_policy_summary"],
         },
     }
 
@@ -2757,6 +3419,10 @@ def _render_count_cards(payload: dict[str, Any]) -> str:
         ("Activations", cards["activation_logs"], "recent get attempts"),
         ("Healthy", cards["healthy_assets"], "assets with positive proof"),
         ("Unproven", cards["unproven_assets"], "assets still needing evidence"),
+        ("Local Priors", cards["local_prior_assets"], "assets carrying local behavior/context priors"),
+        ("High Priority Priors", cards["high_priority_prior_assets"], "preference, constraint, and dont_repeat assets"),
+        ("System Prompt", cards["system_prompt_items"], "tiny durable priors routed to system prompt"),
+        ("Reference", cards["reference_summary_items"], "codemap/raw evidence routed for LLM re-analysis"),
         ("Milvus Selected", f"{cards['milvus_selected_ratio']:.0%}", "selected assets from semantic retrieval"),
         ("Feedback Missing", cards["stale_missing_feedback"], "stale activations without help signal"),
     ]
@@ -2844,9 +3510,34 @@ def _render_effectiveness_snapshot(payload: dict[str, Any]) -> str:
     """
 
 
+def _render_injection_policy_panel(payload: dict[str, Any]) -> str:
+    summary = payload["injection_policy_summary"]
+    channel_counts = summary.get("channel_counts", {})
+    activations_with_channels = summary.get("activations_with_channels", {})
+    rows = [
+        [
+            channel,
+            channel_counts.get(channel, 0),
+            activations_with_channels.get(channel, 0),
+        ]
+        for channel in INJECTION_CHANNELS
+    ]
+    return f"""
+    <section class="panel">
+      <h2>Injection Channels</h2>
+      <div class="metric-line"><span>Policy</span><strong>{_safe_text(summary.get("policy"))}</strong></div>
+      <div class="metric-line"><span>Plan coverage</span><strong>{_safe_text(f"{float(summary.get('plan_coverage_ratio', 0.0) or 0.0):.0%}")}</strong></div>
+      <div class="metric-line"><span>Average injected items</span><strong>{_safe_text(summary.get("avg_items_per_activation"))}</strong></div>
+      {_render_dashboard_table(["Channel", "Items", "Activations"], rows)}
+    </section>
+    """
+
+
 def _render_dashboard_html(payload: dict[str, Any]) -> str:
     retrieval = payload["retrieval"]["effectiveness"]
     quality = payload["quality"]
+    kind_summary = payload["knowledge_kind_summary"]
+    injection_summary = payload["injection_policy_summary"]
     raw_json = html_escape(json.dumps(payload, ensure_ascii=False, indent=2), quote=False)
     write_rows = [
         [item["date"], item["assets"], item["candidates"], item["activations"]]
@@ -2869,6 +3560,9 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
             item["task_query"],
             item["selected_count"],
             item["selected_from_milvus"],
+            item.get("injection_channel_counts", {}).get("system_prompt", 0),
+            item.get("injection_channel_counts", {}).get("runtime_context", 0),
+            item.get("injection_channel_counts", {}).get("reference_summary", 0),
             item["milvus_project_candidates"],
             item["milvus_shared_candidates"],
             item["help_signal"] or "pending",
@@ -2879,6 +3573,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
     candidate_rows = [
         [
             item["title"],
+            item["knowledge_kind"],
             item["status"],
             item["promotion_readiness"],
             item["help_signal"],
@@ -2890,6 +3585,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
     queue_rows = [
         [
             item.get("title"),
+            item.get("knowledge_kind"),
             item.get("status"),
             item.get("promotion_readiness"),
             item.get("priority_score"),
@@ -2907,6 +3603,20 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
             item.get("updated_at"),
         ]
         for item in payload["unproven_assets"]
+    ]
+    prior_kind_rows = [
+        [
+            section,
+            summary.get("local_prior_count"),
+            summary.get("high_priority_count"),
+            summary.get("by_kind"),
+            summary.get("high_priority_by_kind"),
+        ]
+        for section, summary in [
+            ("Assets", kind_summary["assets"]),
+            ("Candidates", kind_summary["candidates"]),
+            ("Review queue", kind_summary["review_queue"]),
+        ]
     ]
 
     return f"""<!doctype html>
@@ -3020,6 +3730,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
       <div class="metric-line"><span>Temperature</span><strong>{_safe_text(quality["asset_effectiveness_summary"]["temperature"])}</strong></div>
       <div class="metric-line"><span>Activation feedback</span><strong>{_safe_text(quality["activation_feedback_summary"])}</strong></div>
       <div class="metric-line"><span>Candidate queue</span><strong>{_safe_text(payload["review_queue"].get("candidate_count"))}</strong></div>
+      <div class="metric-line"><span>Injection policy</span><strong>{_safe_text(injection_summary.get("policy"))}</strong></div>
     </div>
   </section>
 
@@ -3029,18 +3740,25 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
   </section>
 
   <section class="panel">
+    <h2>Local Prior Distribution</h2>
+    {_render_dashboard_table(["Section", "Local priors", "High priority", "By kind", "High priority by kind"], prior_kind_rows)}
+  </section>
+
+  {_render_injection_policy_panel(payload)}
+
+  <section class="panel">
     <h2>Assets</h2>
     {_render_dashboard_table(["Title", "Kind", "Scope", "Temp", "Review", "Confidence", "Updated"], asset_rows)}
   </section>
 
   <section class="panel">
     <h2>Recent Activations</h2>
-    {_render_dashboard_table(["Task", "Selected", "Milvus selected", "Milvus project", "Milvus shared", "Help", "Created"], activation_rows)}
+    {_render_dashboard_table(["Task", "Selected", "Milvus selected", "System", "Runtime", "Reference", "Milvus project", "Milvus shared", "Help", "Created"], activation_rows)}
   </section>
 
   <section class="panel">
     <h2>Candidate Review Queue</h2>
-    {_render_dashboard_table(["Title", "Status", "Readiness", "Priority", "Candidate ID"], queue_rows)}
+    {_render_dashboard_table(["Title", "Kind", "Status", "Readiness", "Priority", "Candidate ID"], queue_rows)}
   </section>
 
   <section class="panel">
@@ -3050,7 +3768,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
 
   <section class="panel">
     <h2>Recent Candidates</h2>
-    {_render_dashboard_table(["Title", "Status", "Readiness", "Help", "Updated"], candidate_rows)}
+    {_render_dashboard_table(["Title", "Kind", "Status", "Readiness", "Help", "Updated"], candidate_rows)}
   </section>
 
   <details>
@@ -3188,6 +3906,10 @@ def main() -> int:
 
     if args.command == "ingest":
         return _handle_ingest(args)
+    if args.command == "save-prior":
+        return _handle_save_prior(args)
+    if args.command == "ingest-docs":
+        return _handle_ingest_docs(args)
     if args.command == "auto-start":
         return _handle_auto_start(args)
     if args.command == "feedback":

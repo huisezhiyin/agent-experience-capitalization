@@ -74,6 +74,45 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(asset["asset_type"], "pattern")
         self.assertGreaterEqual(asset["confidence"], 0.75)
 
+    def test_extract_candidates_infers_local_prior_kinds_from_strong_signals(self) -> None:
+        base_episode = {
+            "episode_id": "ep_demo_001",
+            "trace_id": "trace_demo_001",
+            "goal": "更新项目经验策略",
+            "constraints": [],
+            "workspace": "/tmp/demo",
+            "files_touched": [],
+            "commands": [],
+            "turning_points": [],
+            "attempted_paths": [],
+            "abandoned_paths": [],
+            "decision_rationale": [],
+            "result": "success",
+            "verification": "passed",
+            "user_feedback": "accepted",
+            "lesson": "默认保持原有模式。",
+            "scope_hint": "general-coding-task",
+            "confidence_hint": 0.8,
+            "created_at": "2026-04-13T00:00:00+00:00",
+        }
+
+        cases = [
+            ("dont_repeat", {"lesson": "用户明确说：我不要重复说这个，以后默认由 Codex 代跑命令。"}),
+            ("preference", {"lesson": "我喜欢默认使用集中 EXPCAP_HOME 存储。"}),
+            ("constraint", {"constraints": ["不能提交 .agent-memory 和本地 SQLite 运行数据"]}),
+            ("decision_memory", {"lesson": "这个 hook 设计成触发层是历史原因，当时是为了避免策略泄漏到宿主。"}),
+            ("past_win", {"lesson": "上次这个路径验证过成功，可以作为类似任务的参考。"}),
+        ]
+
+        for expected_kind, override in cases:
+            with self.subTest(expected_kind=expected_kind):
+                episode = {**base_episode, **override, "episode_id": f"ep_{expected_kind}_001"}
+                [candidate] = extract_candidates(episode)
+                self.assertEqual(candidate["candidate_type"], "pattern")
+                self.assertEqual(candidate["knowledge_kind"], expected_kind)
+                if expected_kind == "constraint":
+                    self.assertEqual(candidate["content"], "不能提交 .agent-memory 和本地 SQLite 运行数据")
+
     def test_should_promote_candidate_requires_success_passed_and_threshold(self) -> None:
         candidate = {
             "reusability_score": 0.85,
@@ -295,9 +334,300 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(activation["selected_assets"][0]["source_provenance"]["data_source_confirmed"])
             self.assertIn("retrieval_summary", activation)
             self.assertEqual(activation["pipeline"]["kind"], "experience_rag_activation")
-            self.assertEqual(activation["pipeline"]["stages"], ["retrieve", "rerank", "assemble"])
+            self.assertEqual(activation["pipeline"]["stages"], ["retrieve", "rerank", "route_injection", "assemble"])
+            self.assertIn("injection_plan", activation)
             self.assertTrue(any("最终是否采用由 LLM" in item for item in activation["why_selected"]))
+            self.assertTrue(any("注入策略" in item for item in activation["why_selected"]))
             self.assertTrue(any("跨项目经验" in item for item in activation["selection_risks"]))
+
+    def test_activate_assets_prioritizes_and_renders_local_priors(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_dir = workspace / ".agent-memory" / "assets" / "patterns"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            pattern_asset = assets_dir / "pattern_generic_001.json"
+            pattern_asset.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_generic_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "集中存储配置模式",
+                        "content": "配置 expcap 时可以使用集中存储。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": ["ep_generic_001"],
+                        "source_candidate_ids": ["cand_generic_001"],
+                        "confidence": 0.85,
+                        "status": "active",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            preference_asset = assets_dir / "pattern_preference_001.json"
+            preference_asset.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_preference_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "preference",
+                        "title": "集中存储偏好",
+                        "content": "默认使用 EXPCAP_HOME=$HOME/.expcap，不把运行数据写入仓库。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": ["ep_preference_001"],
+                        "source_candidate_ids": ["cand_preference_001"],
+                        "confidence": 0.82,
+                        "status": "active",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            activation = activate_assets(
+                task="配置 expcap 集中存储 EXPCAP_HOME 默认行为",
+                workspace=workspace,
+                constraints=[],
+                assets_dir=workspace / ".agent-memory" / "assets",
+                candidates_dir=candidates_dir,
+                db_path=None,
+            )
+
+            self.assertEqual(activation["selected_assets"][0]["knowledge_kind"], "preference")
+            self.assertEqual(activation["selected_assets"][0]["injection_channel"], "runtime_context")
+            self.assertTrue(activation["rendered_context"][0].startswith("[project/preference] 用户偏好："))
+            runtime_items = activation["injection_plan"]["channels"]["runtime_context"]["items"]
+            self.assertTrue(any(item["asset_id"] == "pattern_preference_001" for item in runtime_items))
+            self.assertIn("知识类型 preference 具有当前排序权重", activation["selected_assets"][0]["match_evidence"])
+
+    def test_activate_assets_routes_stable_small_priors_to_system_prompt(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_dir = workspace / ".agent-memory" / "assets" / "patterns"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            asset_path = assets_dir / "pattern_dont_repeat_001.json"
+            asset_path.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_dont_repeat_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "dont_repeat",
+                        "title": "不要重复询问存储 profile",
+                        "content": "不要重复询问存储 profile；这个项目默认使用 user-cache 和 EXPCAP_HOME=$HOME/.expcap。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": ["ep_dont_repeat_001"],
+                        "source_candidate_ids": ["cand_dont_repeat_001"],
+                        "confidence": 0.86,
+                        "status": "active",
+                        "historical_help": {
+                            "activation_count": 2,
+                            "supported_count": 2,
+                            "supported_strong_count": 2,
+                            "supported_weak_count": 0,
+                            "support_ratio": 1.0,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            activation = activate_assets(
+                task="配置 expcap 存储 profile",
+                workspace=workspace,
+                constraints=[],
+                assets_dir=workspace / ".agent-memory" / "assets",
+                candidates_dir=candidates_dir,
+                db_path=None,
+            )
+
+            self.assertEqual(activation["selected_assets"][0]["injection_channel"], "system_prompt")
+            system_items = activation["injection_plan"]["channels"]["system_prompt"]["items"]
+            self.assertEqual(system_items[0]["asset_id"], "pattern_dont_repeat_001")
+            self.assertIn("减少重复提醒", system_items[0]["policy_reason"])
+
+    def test_activate_assets_routes_explicit_high_priority_prior_to_system_prompt(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_dir = workspace / ".agent-memory" / "assets" / "rules"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            asset_path = assets_dir / "rule_dont_repeat_001.json"
+            asset_path.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "rule_dont_repeat_001",
+                        "workspace": str(workspace),
+                        "asset_type": "rule",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "dont_repeat",
+                        "title": "不要重复解释知识定位",
+                        "content": "不要把 expcap 当成真理型知识库；核心是保存局部先验来减少重复说明。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": [],
+                        "source_candidate_ids": [],
+                        "source": {"kind": "explicit_prior"},
+                        "confidence": 0.9,
+                        "status": "active",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            activation = activate_assets(
+                task="验证 expcap 知识定位 dont_repeat",
+                workspace=workspace,
+                constraints=[],
+                assets_dir=workspace / ".agent-memory" / "assets",
+                candidates_dir=candidates_dir,
+                db_path=None,
+            )
+
+            self.assertEqual(activation["selected_assets"][0]["injection_channel"], "system_prompt")
+            system_items = activation["injection_plan"]["channels"]["system_prompt"]["items"]
+            self.assertEqual(system_items[0]["asset_id"], "rule_dont_repeat_001")
+
+    def test_activate_assets_reserves_explicit_prior_pool_with_milvus_primary(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_root = workspace / ".agent-memory" / "assets"
+            rules_dir = assets_root / "rules"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            rules_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            prior_asset = {
+                "asset_id": "rule_dont_repeat_explicit_001",
+                "workspace": str(workspace),
+                "asset_type": "rule",
+                "knowledge_scope": "project",
+                "knowledge_kind": "dont_repeat",
+                "title": "不要重复解释 expcap 知识定位",
+                "content": "不要把 expcap 当成真理型知识库；核心是保存局部先验来减少重复说明。",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "source": {"kind": "explicit_prior"},
+                "confidence": 0.9,
+                "status": "active",
+            }
+            (rules_dir / "rule_dont_repeat_explicit_001.json").write_text(
+                json.dumps(prior_asset, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            vector_assets = [
+                {
+                    "asset_id": f"pattern_vector_{index:03d}",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": f"generic milvus workflow {index}",
+                    "content": "generic expcap milvus workflow guidance",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.82,
+                    "status": "active",
+                    "vector_score": 0.5,
+                }
+                for index in range(5)
+            ]
+
+            with patch("runtime.core.engine.search_asset_vectors", side_effect=[vector_assets, []]):
+                activation = activate_assets(
+                    task="继续推进 expcap 顶层先验注入验证",
+                    workspace=workspace,
+                    constraints=[],
+                    assets_dir=assets_root,
+                    candidates_dir=candidates_dir,
+                    db_path=None,
+                )
+
+            selected_ids = [item["asset_id"] for item in activation["selected_assets"]]
+            self.assertIn("rule_dont_repeat_explicit_001", selected_ids)
+            prior_item = next(item for item in activation["selected_assets"] if item["asset_id"] == "rule_dont_repeat_explicit_001")
+            self.assertEqual(prior_item["injection_channel"], "system_prompt")
+            self.assertIn("explicit-prior-pool", prior_item["retrieval_sources"])
+            self.assertEqual(activation["retrieval_summary"]["explicit_prior_pool_candidates"], 1)
+
+    def test_activate_assets_renders_selected_codemap_context_for_doc_tasks(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_dir = workspace / ".agent-memory" / "assets" / "contexts"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            codemap_asset = assets_dir / "context_doc_readme_001.json"
+            codemap_asset.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "context_doc_readme_001",
+                        "workspace": str(workspace),
+                        "asset_type": "context",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "codemap",
+                        "title": "Doc codemap: README.md",
+                        "content": "Document: README.md\n\nUse ingest-docs to import codemap chunks.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": [],
+                        "source_candidate_ids": [],
+                        "confidence": 0.72,
+                        "status": "active",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            activation = activate_assets(
+                task="README ingest-docs codemap 使用说明",
+                workspace=workspace,
+                constraints=[],
+                assets_dir=workspace / ".agent-memory" / "assets",
+                candidates_dir=candidates_dir,
+                db_path=None,
+            )
+
+            self.assertTrue(any(item["knowledge_kind"] == "codemap" for item in activation["selected_assets"]))
+            self.assertTrue(any("[project/codemap] 代码地图：" in item for item in activation["rendered_context"]))
+            codemap_item = next(item for item in activation["selected_assets"] if item["knowledge_kind"] == "codemap")
+            self.assertEqual(codemap_item["injection_channel"], "reference_summary")
+            reference_items = activation["injection_plan"]["channels"]["reference_summary"]["items"]
+            self.assertTrue(any(item["asset_id"] == "context_doc_readme_001" for item in reference_items))
 
     def test_build_asset_effectiveness_summary_marks_needs_review_for_cold_assets(self) -> None:
         summary = build_asset_effectiveness_summary(
@@ -433,6 +763,87 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(queue["items"][0]["candidate_id"], "cand_approved_001")
         self.assertEqual(queue["items"][0]["suggested_action"], "promote")
         self.assertEqual(queue["status_summary"]["approved"], 1)
+
+    def test_build_candidate_review_queue_summarizes_local_prior_kinds(self) -> None:
+        queue = build_candidate_review_queue(
+            [
+                {
+                    "candidate_id": "cand_preference_001",
+                    "candidate_type": "pattern",
+                    "knowledge_kind": "preference",
+                    "title": "preference item",
+                    "status": "needs_review",
+                    "confidence_score": 0.8,
+                    "reusability_score": 0.8,
+                    "stability_score": 0.8,
+                    "constraint_value_score": 0.8,
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "created_at": "2026-04-17T00:00:00+00:00",
+                },
+                {
+                    "candidate_id": "cand_pattern_001",
+                    "candidate_type": "pattern",
+                    "knowledge_kind": "pattern",
+                    "title": "pattern item",
+                    "status": "new",
+                    "confidence_score": 0.7,
+                    "reusability_score": 0.7,
+                    "stability_score": 0.7,
+                    "constraint_value_score": 0.7,
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "created_at": "2026-04-17T00:01:00+00:00",
+                },
+            ],
+            workspace="/tmp/demo",
+        )
+
+        summary = queue["knowledge_kind_summary"]
+        self.assertEqual(summary["by_kind"]["preference"], 1)
+        self.assertEqual(summary["by_kind"]["pattern"], 1)
+        self.assertEqual(summary["local_prior_count"], 1)
+        self.assertEqual(summary["high_priority_count"], 1)
+        self.assertEqual(summary["high_priority_by_kind"]["preference"], 1)
+
+    def test_build_candidate_review_queue_suggests_review_for_high_priority_priors(self) -> None:
+        queue = build_candidate_review_queue(
+            [
+                {
+                    "candidate_id": "cand_pattern_watch_001",
+                    "candidate_type": "pattern",
+                    "knowledge_kind": "pattern",
+                    "title": "generic pattern",
+                    "status": "new",
+                    "promotion_readiness": "unknown",
+                    "promotion_feedback": {"help_signal": None, "signal_bonus": 0.0},
+                    "confidence_score": 0.75,
+                    "reusability_score": 0.75,
+                    "stability_score": 0.75,
+                    "constraint_value_score": 0.75,
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "created_at": "2026-04-17T00:01:00+00:00",
+                },
+                {
+                    "candidate_id": "cand_dont_repeat_001",
+                    "candidate_type": "pattern",
+                    "knowledge_kind": "dont_repeat",
+                    "title": "do not repeat item",
+                    "status": "new",
+                    "promotion_readiness": "unknown",
+                    "promotion_feedback": {"help_signal": None, "signal_bonus": 0.0},
+                    "confidence_score": 0.75,
+                    "reusability_score": 0.75,
+                    "stability_score": 0.75,
+                    "constraint_value_score": 0.75,
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "created_at": "2026-04-17T00:00:00+00:00",
+                },
+            ],
+            workspace="/tmp/demo",
+        )
+
+        self.assertEqual(queue["items"][0]["candidate_id"], "cand_dont_repeat_001")
+        self.assertEqual(queue["items"][0]["suggested_action"], "review")
+        self.assertTrue(any("高优先级本地先验" in item for item in queue["items"][0]["reasons"]))
 
     def test_activate_assets_demotes_broad_scope_low_evidence_matches(self) -> None:
         import json

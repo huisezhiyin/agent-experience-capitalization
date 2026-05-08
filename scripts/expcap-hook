@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from runtime.storage.fs_store import default_db_path  # noqa: E402
+from runtime.storage.sqlite_store import list_activation_logs  # noqa: E402
+from runtime.core.hook_activity import load_recent_hook_events, parse_hook_timestamp, record_hook_event  # noqa: E402
+from runtime.core.injection_materializer import render_hook_additional_context  # noqa: E402
+
+
+TRIVIAL_PROMPTS = {
+    "hi",
+    "hello",
+    "thanks",
+    "thank you",
+    "你好",
+    "谢谢",
+    "在吗",
+}
+NO_SAVE_MARKERS = (
+    "不要记录",
+    "不要保存",
+    "别记录",
+    "别保存",
+    "don't save",
+    "do not save",
+    "no save",
+)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="expcap-hook")
+    subparsers = parser.add_subparsers(dest="event", required=True)
+
+    for event in ("user-prompt-submit", "stop"):
+        sub = subparsers.add_parser(event)
+        sub.add_argument("--host", default="claude")
+        sub.add_argument("--workspace")
+        sub.add_argument("--task")
+        sub.add_argument("--verification-status", default="unknown")
+        sub.add_argument("--result-status", default="unknown")
+        sub.add_argument("--result-summary")
+    return parser.parse_args()
+
+
+def _read_stdin_payload() -> dict[str, Any]:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _workspace(args: argparse.Namespace, payload: dict[str, Any]) -> Path:
+    candidates = [
+        args.workspace,
+        payload.get("workspace"),
+        payload.get("cwd"),
+        payload.get("projectDir"),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return Path(str(candidate)).resolve()
+    return Path.cwd().resolve()
+
+
+def _normalize_task(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(value.split())
+    return normalized or None
+
+
+def _task_for_prompt(args: argparse.Namespace, payload: dict[str, Any]) -> str | None:
+    return _normalize_task(args.task or payload.get("prompt") or payload.get("task"))
+
+
+def _latest_activation_task(workspace: Path) -> str | None:
+    activations = list_activation_logs(default_db_path(workspace), workspace=str(workspace), limit=20)
+    for activation in activations:
+        feedback = activation.get("feedback", {})
+        if not feedback.get("help_signal"):
+            task = _normalize_task(str(activation.get("task_query") or ""))
+            if task:
+                return task
+    if activations:
+        return _normalize_task(str(activations[0].get("task_query") or ""))
+    return None
+
+
+def _is_trivial_prompt(task: str | None) -> bool:
+    if not task:
+        return True
+    lowered = task.casefold()
+    if lowered in TRIVIAL_PROMPTS:
+        return True
+    return len(lowered) < 8 and len(lowered.split()) <= 2
+
+
+def _cooldown_minutes(event: str) -> float:
+    default = "10"
+    if event == "stop":
+        default = "15"
+    raw = os.environ.get("EXPCAP_HOOK_COOLDOWN_MINUTES", default)
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return float(default)
+
+
+def _contains_no_save_signal(*values: str | None) -> bool:
+    haystack = " ".join(value for value in values if value).casefold()
+    return any(marker.casefold() in haystack for marker in NO_SAVE_MARKERS)
+
+
+def _recent_duplicate_event(workspace: Path, *, event: str, task: str | None) -> dict[str, Any] | None:
+    if not task:
+        return None
+    now = datetime.now(timezone.utc)
+    cooldown = _cooldown_minutes(event)
+    for item in load_recent_hook_events(workspace, limit=20):
+        if item.get("event") != event:
+            continue
+        if item.get("status") != "success":
+            continue
+        if _normalize_task(str(item.get("task") or "")) != task:
+            continue
+        created_at = parse_hook_timestamp(item.get("created_at"))
+        if created_at is None:
+            continue
+        age_minutes = (now - created_at).total_seconds() / 60.0
+        if age_minutes <= cooldown:
+            return {**item, "age_minutes": round(age_minutes, 2), "cooldown_minutes": cooldown}
+    return None
+
+
+def _run_expcap(command: list[str]) -> dict[str, Any]:
+    completed = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def _user_prompt_hook_output(result: dict[str, Any]) -> dict[str, Any]:
+    summary = render_hook_additional_context(result.get("activation_view") or {})
+    return {
+        "continue": True,
+        "suppressOutput": True,
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": summary,
+        },
+    }
+
+
+def _skip_output(reason: str, *, hook_event_name: str | None = None) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "continue": True,
+        "suppressOutput": True,
+        "stopReason": reason,
+    }
+    if hook_event_name:
+        output["hookSpecificOutput"] = {
+            "hookEventName": hook_event_name,
+            "additionalContext": "",
+        }
+    return output
+
+
+def _record(
+    workspace: Path,
+    *,
+    host: str,
+    event: str,
+    status: str,
+    task: str | None,
+    reason: str | None = None,
+    command: str | None = None,
+    result_summary: str | None = None,
+) -> None:
+    record_hook_event(
+        workspace,
+        {
+            "host": host,
+            "event": event,
+            "status": status,
+            "task": task,
+            "reason": reason,
+            "command": command,
+            "result_summary": result_summary,
+        },
+    )
+
+
+def main() -> int:
+    args = _parse_args()
+    payload = _read_stdin_payload()
+    workspace = _workspace(args, payload)
+
+    try:
+        if args.event == "user-prompt-submit":
+            task = _task_for_prompt(args, payload)
+            if _is_trivial_prompt(task):
+                _record(workspace, host=args.host, event=args.event, status="skipped", task=task, reason="trivial_or_empty_prompt")
+                print(json.dumps(_skip_output("skip trivial or empty prompt", hook_event_name="UserPromptSubmit"), ensure_ascii=False))
+                return 0
+            duplicate = _recent_duplicate_event(workspace, event=args.event, task=task)
+            if duplicate:
+                _record(
+                    workspace,
+                    host=args.host,
+                    event=args.event,
+                    status="skipped",
+                    task=task,
+                    reason=f"duplicate_cooldown:{duplicate['age_minutes']}/{duplicate['cooldown_minutes']}",
+                )
+                print(json.dumps(_skip_output("skip duplicate prompt within cooldown", hook_event_name="UserPromptSubmit"), ensure_ascii=False))
+                return 0
+            result = _run_expcap(
+                [
+                    str(PROJECT_ROOT / "scripts" / "expcap"),
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    task,
+                ]
+            )
+            _record(
+                workspace,
+                host=args.host,
+                event=args.event,
+                status="success",
+                task=task,
+                command="auto-start",
+                result_summary=f"selected_count={result.get('selected_count', 0)}",
+            )
+            print(json.dumps(_user_prompt_hook_output(result), ensure_ascii=False))
+            return 0
+
+        task = _normalize_task(args.task or payload.get("task")) or _latest_activation_task(workspace)
+        if not task:
+            _record(workspace, host=args.host, event=args.event, status="skipped", task=None, reason="task_unresolved")
+            print(json.dumps(_skip_output("skip stop hook without resolvable task"), ensure_ascii=False))
+            return 0
+        if _contains_no_save_signal(task, args.result_summary, str(payload.get("prompt") or ""), str(payload.get("task") or "")):
+            _record(workspace, host=args.host, event=args.event, status="skipped", task=task, reason="explicit_no_save_signal")
+            print(json.dumps(_skip_output("skip stop hook due to explicit no-save signal"), ensure_ascii=False))
+            return 0
+        duplicate = _recent_duplicate_event(workspace, event=args.event, task=task)
+        if duplicate:
+            _record(
+                workspace,
+                host=args.host,
+                event=args.event,
+                status="skipped",
+                task=task,
+                reason=f"duplicate_cooldown:{duplicate['age_minutes']}/{duplicate['cooldown_minutes']}",
+            )
+            print(json.dumps(_skip_output("skip duplicate stop within cooldown"), ensure_ascii=False))
+            return 0
+        result = _run_expcap(
+            [
+                str(PROJECT_ROOT / "scripts" / "expcap"),
+                "auto-finish",
+                "--workspace",
+                str(workspace),
+                "--task",
+                task,
+                "--verification-status",
+                args.verification_status,
+                "--result-status",
+                args.result_status,
+                "--result-summary",
+                args.result_summary or f"hook auto-finish from {args.host} stop event",
+            ]
+        )
+        _record(
+            workspace,
+            host=args.host,
+            event=args.event,
+            status="success",
+            task=task,
+            command="auto-finish",
+            result_summary=f"trace_id={result.get('trace', {}).get('trace_id')}",
+        )
+        print(json.dumps(_skip_output("stop hook completed auto-finish"), ensure_ascii=False))
+        return 0
+    except subprocess.CalledProcessError as error:
+        stderr = error.stderr.strip() or error.stdout.strip() or str(error)
+        task = _normalize_task(args.task or payload.get("prompt") or payload.get("task"))
+        _record(workspace, host=args.host, event=args.event, status="error", task=task, reason=stderr)
+        print(f"expcap-hook failed: {stderr}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

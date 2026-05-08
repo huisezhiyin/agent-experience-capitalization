@@ -5,6 +5,21 @@ from pathlib import Path
 from typing import Any
 
 from runtime.backends import resolve_backend_config
+from runtime.core.injection_policy import build_injection_plan, injection_channel_for_asset
+from runtime.core.knowledge_kinds import (
+    ANTI_PATTERN,
+    CODEMAP,
+    CONSTRAINT,
+    DONT_REPEAT,
+    HIGH_PRIORITY_PRIOR_KINDS,
+    LOCAL_PRIOR_KINDS,
+    PATTERN,
+    PREFERENCE,
+    activation_label_for_kind,
+    infer_local_prior_kind,
+    ranking_weight_for_kind,
+    title_label_for_kind,
+)
 from runtime.storage.fs_store import (
     default_milvus_db_path,
     iter_json_objects,
@@ -183,7 +198,7 @@ def review_trace_bundle(trace: dict[str, Any]) -> dict[str, Any]:
     return episode
 
 
-def _candidate_title(episode: dict[str, Any], candidate_type: str) -> str:
+def _candidate_title(episode: dict[str, Any], candidate_type: str, knowledge_kind: str | None = None) -> str:
     scope_hint = episode.get("scope_hint", "general-coding-task")
     if scope_hint == "python-import-error":
         prefix = "Python 导入错误处理模式" if candidate_type == "pattern" else "Python 导入错误避坑提示"
@@ -191,9 +206,19 @@ def _candidate_title(episode: dict[str, Any], candidate_type: str) -> str:
     if scope_hint == "test-failure":
         prefix = "测试失败定位模式" if candidate_type == "pattern" else "测试失败反模式"
         return prefix
+    if knowledge_kind:
+        label = title_label_for_kind(knowledge_kind)
+        if label:
+            return _compact_text(f"{label}：{episode.get('goal', '任务')}", limit=48)
     goal = episode.get("goal", "任务")
     suffix = "可复用模式" if candidate_type == "pattern" else "失败警示"
     return _compact_text(f"{goal} {suffix}", limit=48)
+
+
+def _candidate_content(episode: dict[str, Any], knowledge_kind: str, lesson: str) -> str:
+    if knowledge_kind == CONSTRAINT and episode.get("constraints"):
+        return "；".join(str(item) for item in episode.get("constraints", []) if item)
+    return lesson
 
 
 def build_asset_effectiveness_summary(historical_help: dict[str, Any]) -> dict[str, Any]:
@@ -306,6 +331,11 @@ def build_candidate_review_queue(
         "rejected": -0.8,
         "promoted": -0.5,
     }
+    kind_weight = {
+        CONSTRAINT: 0.22,
+        DONT_REPEAT: 0.22,
+        PREFERENCE: 0.18,
+    }
 
     items = []
     for candidate in candidates:
@@ -316,6 +346,7 @@ def build_candidate_review_queue(
         reusability_score = float(candidate.get("reusability_score", 0.0) or 0.0)
         stability_score = float(candidate.get("stability_score", 0.0) or 0.0)
         constraint_value_score = float(candidate.get("constraint_value_score", 0.0) or 0.0)
+        knowledge_kind = str(candidate.get("knowledge_kind") or candidate.get("candidate_type") or "pattern")
         base_score = round(
             (
                 confidence_score
@@ -330,10 +361,13 @@ def build_candidate_review_queue(
             base_score
             + signal_bonus
             + readiness_weight.get(promotion_readiness, 0.0)
-            + status_weight.get(candidate.get("status", "new"), 0.0),
+            + status_weight.get(candidate.get("status", "new"), 0.0)
+            + kind_weight.get(knowledge_kind, 0.0),
             4,
         )
         reasons = []
+        if knowledge_kind in HIGH_PRIORITY_PRIOR_KINDS:
+            reasons.append("高优先级本地先验，适合优先审核是否应进入 active prior")
         if candidate.get("status") == "needs_review":
             reasons.append("候选已进入 needs_review，适合优先人工审核")
         if candidate.get("status") == "approved":
@@ -351,6 +385,8 @@ def build_candidate_review_queue(
         elif candidate.get("status") == "rejected":
             suggested_action = "ignore"
         elif candidate.get("status") == "needs_review":
+            suggested_action = "review"
+        elif knowledge_kind in HIGH_PRIORITY_PRIOR_KINDS:
             suggested_action = "review"
         elif promotion_readiness == "boosted":
             suggested_action = "review"
@@ -382,6 +418,7 @@ def build_candidate_review_queue(
         )
     )
 
+    kind_summary = build_knowledge_kind_summary(items)
     return {
         "kind": "candidate_review_queue",
         "workspace": workspace,
@@ -394,15 +431,38 @@ def build_candidate_review_queue(
             "rejected": sum(1 for item in items if item["status"] == "rejected"),
             "promoted": sum(1 for item in items if item["status"] == "promoted"),
         },
+        "knowledge_kind_summary": kind_summary,
         "items": items,
+    }
+
+
+def build_knowledge_kind_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+    by_kind: dict[str, int] = {}
+    local_prior_count = 0
+    high_priority_count = 0
+    high_priority_by_kind: dict[str, int] = {}
+    for item in items:
+        kind = str(item.get("knowledge_kind") or item.get("asset_type") or item.get("candidate_type") or "pattern")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        if kind in LOCAL_PRIOR_KINDS:
+            local_prior_count += 1
+        if kind in HIGH_PRIORITY_PRIOR_KINDS:
+            high_priority_count += 1
+            high_priority_by_kind[kind] = high_priority_by_kind.get(kind, 0) + 1
+    return {
+        "by_kind": dict(sorted(by_kind.items())),
+        "local_prior_count": local_prior_count,
+        "high_priority_count": high_priority_count,
+        "high_priority_by_kind": dict(sorted(high_priority_by_kind.items())),
     }
 
 
 def extract_candidates(episode: dict[str, Any]) -> list[dict[str, Any]]:
     lesson = episode.get("lesson", "")
     success = episode.get("result") == "success"
-    candidate_type = "pattern" if success else "anti_pattern"
-    knowledge_kind = "pattern" if success else "anti_pattern"
+    candidate_type = PATTERN if success else ANTI_PATTERN
+    knowledge_kind = infer_local_prior_kind(episode) if success else None
+    knowledge_kind = knowledge_kind or (PATTERN if success else ANTI_PATTERN)
     confidence = float(episode.get("confidence_hint", 0.6))
     scope = {"level": "task-family", "value": episode.get("scope_hint", "general-coding-task")}
     candidate_id = episode["episode_id"].replace("ep_", "cand_", 1)
@@ -412,8 +472,8 @@ def extract_candidates(episode: dict[str, Any]) -> list[dict[str, Any]]:
         "workspace": episode.get("workspace"),
         "candidate_type": candidate_type,
         "knowledge_kind": knowledge_kind,
-        "title": _candidate_title(episode, candidate_type),
-        "content": lesson,
+        "title": _candidate_title(episode, candidate_type, knowledge_kind),
+        "content": _candidate_content(episode, knowledge_kind, lesson),
         "reusability_score": round(min(confidence + 0.05, 0.95), 2),
         "stability_score": round(0.7 if success else 0.62, 2),
         "confidence_score": round(confidence, 2),
@@ -681,9 +741,12 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
         score += 0.18
         evidence_bonus += 0.18
         evidence.append("Milvus 语义召回来源优先于 SQLite 状态索引")
+    if "project-priority-pool" in asset.get("retrieval_sources", []):
+        score += 0.28
+        evidence_bonus += 0.28
+        evidence.append("项目优先候选池补入，用于避免 shared 资产压过本项目资产")
 
-    type_weight = {"rule": 0.2, "context": 0.14, "pattern": 0.14, "checklist": 0.1, "anti_pattern": 0.08}
-    type_bonus = type_weight.get(knowledge_kind, type_weight.get(asset.get("asset_type", ""), 0.0))
+    type_bonus = ranking_weight_for_kind(knowledge_kind, str(asset.get("asset_type", "")))
     score += type_bonus
     evidence_bonus += type_bonus
     evidence.append(f"知识类型 {knowledge_kind} 具有当前排序权重")
@@ -762,6 +825,76 @@ def _merge_assets(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]
 def _tag_retrieval_source(assets: list[dict[str, Any]], source: str) -> None:
     for asset in assets:
         asset["retrieval_sources"] = _unique_preserve_order([*asset.get("retrieval_sources", []), source])
+
+
+def _is_explicit_high_priority_prior(asset: dict[str, Any]) -> bool:
+    source = asset.get("source") if isinstance(asset.get("source"), dict) else {}
+    return (
+        asset.get("status") == "active"
+        and asset.get("knowledge_kind") in HIGH_PRIORITY_PRIOR_KINDS
+        and source.get("kind") == "explicit_prior"
+        and float(asset.get("confidence", 0.0) or 0.0) >= 0.8
+    )
+
+
+def _load_explicit_high_priority_priors(
+    *,
+    assets_dir: Path,
+    db_path: Path | None,
+    workspace_str: str,
+) -> list[dict[str, Any]]:
+    priors: list[dict[str, Any]] = []
+    if db_path:
+        sqlite_priors = [
+            asset
+            for asset in list_assets(db_path, workspace=workspace_str)
+            if _is_explicit_high_priority_prior(asset)
+        ]
+        _tag_retrieval_source(sqlite_priors, "sqlite")
+        priors.extend(sqlite_priors)
+
+    if assets_dir.exists():
+        json_priors = [
+            asset
+            for asset in iter_json_objects(assets_dir)
+            if _is_explicit_high_priority_prior(asset)
+        ]
+        _tag_retrieval_source(json_priors, "json")
+        priors.extend(json_priors)
+
+    _tag_retrieval_source(priors, "explicit-prior-pool")
+    return _merge_assets(priors, [])
+
+
+def _load_project_priority_assets(
+    *,
+    assets_dir: Path,
+    db_path: Path | None,
+    workspace_str: str,
+) -> list[dict[str, Any]]:
+    assets: list[dict[str, Any]] = []
+    if db_path:
+        sqlite_assets = [
+            asset
+            for asset in list_assets(db_path, workspace=workspace_str)
+            if asset.get("status") == "active"
+            and str(asset.get("knowledge_scope") or "project") == "project"
+        ]
+        _tag_retrieval_source(sqlite_assets, "sqlite")
+        assets.extend(sqlite_assets)
+
+    if assets_dir.exists():
+        json_assets = [
+            asset
+            for asset in iter_json_objects(assets_dir)
+            if asset.get("status") == "active"
+            and str(asset.get("knowledge_scope") or "project") == "project"
+        ]
+        _tag_retrieval_source(json_assets, "json")
+        assets.extend(json_assets)
+
+    _tag_retrieval_source(assets, "project-priority-pool")
+    return _merge_assets(assets, [])
 
 
 def _hydrate_assets_from_sqlite(db_path: Path | None, asset_ids: list[str]) -> list[dict[str, Any]]:
@@ -854,15 +987,22 @@ def _selected_activation_item(
     reason: str,
 ) -> dict[str, Any]:
     evidence = details["evidence"]
+    kind_evidence = [item for item in evidence if item.startswith("知识类型 ")]
     if "milvus" in asset.get("retrieval_sources", []):
         milvus_evidence = [item for item in evidence if "Milvus 语义召回来源优先" in item]
-        evidence = _unique_preserve_order([*milvus_evidence, *evidence])
+        evidence = _unique_preserve_order([*milvus_evidence, *kind_evidence, *evidence])
+    elif kind_evidence:
+        evidence = _unique_preserve_order([*kind_evidence, *evidence])
     return {
         "asset_id": asset["asset_id"],
         "asset_type": asset["asset_type"],
         "knowledge_scope": asset.get("knowledge_scope", "project"),
         "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
         "title": asset["title"],
+        "content": asset.get("content", ""),
+        "confidence": asset.get("confidence"),
+        "source": asset.get("source"),
+        "status": asset.get("status"),
         "reason": reason,
         "match_score": round(score, 2),
         "score_breakdown": {
@@ -878,8 +1018,9 @@ def _selected_activation_item(
         "source_provenance": provenance,
         "llm_use_guidance": _llm_use_guidance(asset, details, provenance),
         "vector_score": round(float(asset.get("vector_score", 0.0)), 4),
-        "match_evidence": evidence[:8],
+        "match_evidence": evidence[:10],
         "risk_flags": details["risk_flags"][:5],
+        "source_episode_ids": asset.get("source_episode_ids", []),
     }
 
 
@@ -900,7 +1041,7 @@ def _retrieve_activation_assets(
     vector_project_assets = search_asset_vectors(
         default_milvus_db_path(workspace),
         query_text=query_text,
-        limit=5,
+        limit=10,
         knowledge_scope="project",
         workspace=workspace_str,
     )
@@ -908,7 +1049,7 @@ def _retrieve_activation_assets(
     vector_shared_assets = search_asset_vectors(
         shared_milvus_db_path(),
         query_text=query_text,
-        limit=5,
+        limit=10,
         knowledge_scope="cross-project",
     )
     _tag_retrieval_source(vector_shared_assets, "milvus")
@@ -940,6 +1081,22 @@ def _retrieve_activation_assets(
         _tag_retrieval_source(shared_assets, "shared-json")
         assets = _merge_assets(assets, shared_assets)
 
+    project_priority_assets: list[dict[str, Any]] = []
+    if used_milvus_primary and not vector_project_assets and vector_shared_assets:
+        project_priority_assets = _load_project_priority_assets(
+            assets_dir=assets_dir,
+            db_path=db_path,
+            workspace_str=workspace_str,
+        )
+        assets = _merge_assets(project_priority_assets, assets)
+
+    explicit_prior_assets = _load_explicit_high_priority_priors(
+        assets_dir=assets_dir,
+        db_path=db_path,
+        workspace_str=workspace_str,
+    )
+    assets = _merge_assets(explicit_prior_assets, assets)
+
     for asset in assets:
         asset.setdefault("knowledge_scope", "project")
         asset.setdefault("knowledge_kind", asset.get("asset_type", "pattern"))
@@ -964,6 +1121,8 @@ def _retrieve_activation_assets(
         "assets": assets,
         "vector_project_assets": vector_project_assets,
         "vector_shared_assets": vector_shared_assets,
+        "project_priority_pool_assets": project_priority_assets,
+        "explicit_prior_pool_assets": explicit_prior_assets,
         "used_sqlite_index": bool(db_path and db_path.exists()),
         "used_milvus_primary": used_milvus_primary,
         "used_sqlite_fallback": used_sqlite_fallback,
@@ -1000,6 +1159,7 @@ def _rerank_activation_assets(
 def _select_activation_assets(
     scored_assets: list[tuple[float, dict[str, Any], dict[str, Any]]],
     *,
+    task: str,
     workspace_str: str,
 ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     selected: list[dict[str, Any]] = []
@@ -1110,7 +1270,90 @@ def _select_activation_assets(
             f"Milvus 试用位命中 {asset['asset_id']}，替换掉 {replaced['asset_id']}。"
         )
 
+    if selected and not any(_is_explicit_high_priority_prior(item) for item in selected):
+        explicit_prior_probe: tuple[float, dict[str, Any], dict[str, Any]] | None = None
+        for score, asset, details in scored_assets:
+            if asset.get("asset_id") in selected_ids:
+                continue
+            if not _is_explicit_high_priority_prior(asset):
+                continue
+            explicit_prior_probe = (score, asset, details)
+            break
+        if explicit_prior_probe is not None:
+            replacement_index = len(selected) - 1
+            for index in range(len(selected) - 1, -1, -1):
+                item = selected[index]
+                if item.get("knowledge_kind") not in HIGH_PRIORITY_PRIOR_KINDS:
+                    replacement_index = index
+                    break
+            replaced = selected[replacement_index]
+            score, asset, details = explicit_prior_probe
+            provenance = _source_provenance(asset, workspace_str)
+            selected[replacement_index] = _selected_activation_item(
+                score=score,
+                asset=asset,
+                details=details,
+                provenance=provenance,
+                reason=f"候选来源已确认，匹配分数 {score:.2f}；显式保存的高优先级先验被保留为长期提示位。",
+            )
+            selected_ids.add(asset["asset_id"])
+            selection_adjustments.append(
+                f"高优先级显式先验 {asset['asset_id']} 进入 selected_assets，替换掉 {replaced['asset_id']}。"
+            )
+
+    if _task_requests_codemap(task) and selected and not any(item.get("knowledge_kind") == CODEMAP for item in selected):
+        codemap_probe: tuple[float, dict[str, Any], dict[str, Any]] | None = None
+        for score, asset, details in scored_assets:
+            if asset.get("asset_id") in selected_ids:
+                continue
+            if asset.get("knowledge_kind") != CODEMAP:
+                continue
+            if "milvus" not in asset.get("retrieval_sources", []):
+                continue
+            if not (details.get("title_hits") or details.get("content_hits") or float(asset.get("vector_score", 0.0) or 0.0) >= 0.15):
+                continue
+            codemap_probe = (score, asset, details)
+            break
+        if codemap_probe is not None:
+            replacement_index = len(selected) - 1
+            for index in range(len(selected) - 1, -1, -1):
+                item = selected[index]
+                if item.get("knowledge_kind") not in HIGH_PRIORITY_PRIOR_KINDS:
+                    replacement_index = index
+                    break
+            replaced = selected[replacement_index]
+            score, asset, details = codemap_probe
+            provenance = _source_provenance(asset, workspace_str)
+            selected[replacement_index] = _selected_activation_item(
+                score=score,
+                asset=asset,
+                details=details,
+                provenance=provenance,
+                reason=f"候选来源已确认，匹配分数 {score:.2f}；当前任务显式需要项目文档/codemap，因此保留为上下文位。",
+            )
+            selection_adjustments.append(
+                f"Codemap 上下文位命中 {asset['asset_id']}，替换掉 {replaced['asset_id']}。"
+            )
+
     return selected, selection_risks, selection_adjustments
+
+
+def _task_requests_codemap(task: str) -> bool:
+    task_lower = task.lower()
+    markers = (
+        "readme",
+        "agents",
+        "claude",
+        "docs",
+        "doc",
+        "codemap",
+        "architecture",
+        "架构",
+        "文档",
+        "约定",
+        "目录",
+    )
+    return any(marker in task_lower for marker in markers)
 
 
 def _build_activation_why_selected(
@@ -1126,6 +1369,7 @@ def _build_activation_why_selected(
         "每条候选都携带 source_provenance、match_evidence 与 risk_flags",
         "宽 scope、低证据、低置信命中会被显式降权，但不会替代 LLM 判断",
         "默认优先保留 Milvus 语义召回候选，SQLite 主要作为状态索引、反馈统计与降级来源",
+        "注入策略会把小而稳定的长期先验、任务上下文和大块参考材料分流到不同 channel",
     ]
     if constraints:
         why_selected.append("显式约束被纳入激活说明")
@@ -1137,33 +1381,52 @@ def _build_activation_why_selected(
         why_selected.append("Milvus 未返回可用候选，本次已降级到本地资产 fallback")
     if retrieval["used_candidate_fallback"]:
         why_selected.append("未找到 active asset，已回退到 candidate 经验层")
+    if retrieval.get("project_priority_pool_assets"):
+        why_selected.append("当 Milvus 仅命中 shared 资产时，本项目 active 资产会补入候选池以保持 project-first")
+    if retrieval.get("explicit_prior_pool_assets"):
+        why_selected.append("显式保存的高优先级先验会作为小型常驻候选池参与注入路由")
     return why_selected
 
 
 def _assemble_activation_context(
-    scored_assets: list[tuple[float, dict[str, Any], dict[str, Any]]],
+    selected_assets: list[dict[str, Any]],
     *,
     constraints: list[str],
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    injection_plan = build_injection_plan(selected_assets, constraints=constraints)
+    for asset in selected_assets:
+        asset["injection_channel"] = injection_channel_for_asset(asset)
+
     rendered_context = [
-        f"[{asset.get('knowledge_scope', 'project')}/{asset.get('knowledge_kind', asset.get('asset_type', 'pattern'))}] {asset['content']}"
-        for _, asset, _ in scored_assets[: min(3, len(scored_assets))]
+        _render_activation_context_item(asset)
+        for asset in selected_assets[: min(5, len(selected_assets))]
     ]
     if constraints:
         rendered_context.append(f"当前约束：{'；'.join(constraints)}")
 
     fallback_episode_refs = [
         ref
-        for _, asset, _ in scored_assets[:3]
+        for asset in selected_assets[:5]
         for ref in asset.get("source_episode_ids", [])
     ]
-    return rendered_context, fallback_episode_refs
+    return rendered_context, fallback_episode_refs, injection_plan
+
+
+def _render_activation_context_item(asset: dict[str, Any]) -> str:
+    knowledge_kind = asset.get("knowledge_kind", asset.get("asset_type", "pattern"))
+    content = str(asset["content"])
+    label = activation_label_for_kind(str(knowledge_kind))
+    if label and not content.startswith(f"{label}："):
+        content = f"{label}：{content}"
+    return f"[{asset.get('knowledge_scope', 'project')}/{knowledge_kind}] {content}"
 
 
 def _build_retrieval_summary(selected: list[dict[str, Any]], retrieval: dict[str, Any]) -> dict[str, int]:
     return {
         "milvus_project_candidates": len(retrieval["vector_project_assets"]),
         "milvus_shared_candidates": len(retrieval["vector_shared_assets"]),
+        "project_priority_pool_candidates": len(retrieval.get("project_priority_pool_assets", [])),
+        "explicit_prior_pool_candidates": len(retrieval.get("explicit_prior_pool_assets", [])),
         "selected_from_milvus": sum(1 for item in selected if "milvus" in item.get("retrieval_sources", [])),
         "selected_from_sqlite": sum(1 for item in selected if "sqlite" in item.get("retrieval_sources", [])),
         "selected_with_sqlite_hydration": sum(
@@ -1211,9 +1474,11 @@ def activate_assets(
         db_path=db_path,
     )
     selected, selection_risks, selection_adjustments = _select_activation_assets(
-        scored_assets, workspace_str=workspace_str
+        scored_assets, task=task, workspace_str=workspace_str
     )
-    rendered_context, fallback_episode_refs = _assemble_activation_context(scored_assets, constraints=constraints)
+    rendered_context, fallback_episode_refs, injection_plan = _assemble_activation_context(
+        selected, constraints=constraints
+    )
 
     return {
         "activation_id": f"act_{_slugify(task)}",
@@ -1226,8 +1491,9 @@ def activate_assets(
         "retrieval_summary": _build_retrieval_summary(selected, retrieval),
         "pipeline": {
             "kind": "experience_rag_activation",
-            "stages": ["retrieve", "rerank", "assemble"],
+            "stages": ["retrieve", "rerank", "route_injection", "assemble"],
         },
+        "injection_plan": injection_plan,
         "rendered_context": rendered_context,
         "fallback_episode_refs": fallback_episode_refs,
         "created_at": _now_utc(),

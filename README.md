@@ -174,9 +174,18 @@ Also update `CLAUDE.md`:
 scripts/expcap install-project --workspace /path/to/project --include-claude
 ```
 
+Install Claude hooks (Phase 1 runnable integration):
+
+```bash
+scripts/expcap install-project --workspace /path/to/project --integration-mode claude-hooks
+```
+
 The installer appends non-destructive instructions and creates
 `AGENTS.expcap.md`. It also ensures `.agent-memory/` is present in
-`.gitignore`. Agents can then use the skill-backed default workflow:
+`.gitignore`. In `claude-hooks` mode it additionally writes
+`.claude/settings.json` plus hook scripts under `.claude/hooks/`, all routed
+through `scripts/expcap-hook` to call `auto-start` / `auto-finish`. Agents can
+then use the skill-backed default workflow:
 
 ```bash
 expcap auto-start --task "your task" --workspace "$PWD"
@@ -203,6 +212,33 @@ temperature and review status.
 For manual debugging, the lower-level pipeline is still available:
 `ingest -> review -> extract -> promote -> activate`.
 
+To import project docs as faithful codemap/context assets for LLM recall:
+
+```bash
+expcap ingest-docs --workspace "$PWD"
+```
+
+By default this scans `README*`, `AGENTS.md`, `CLAUDE.md`, and `docs/*.md`,
+then stores chunks as `knowledge_kind=codemap` assets. It preserves source text
+instead of rewriting docs into polished "truth".
+
+To intentionally save a sparse top-level prior:
+
+```bash
+expcap save-prior \
+  --workspace "$PWD" \
+  --knowledge-kind dont_repeat \
+  --title "Do not re-explain the project memory thesis" \
+  --content "expcap is a local-prior layer for saving repeated user/team/project context, not a truth-only knowledge base."
+```
+
+Use this for explicit, durable preferences, constraints, historical decisions,
+or "do not make me repeat this" instructions. High-priority priors are saved as
+active project assets so the injection policy can route small stable items into
+`system_prompt`. During activation, explicit high-priority priors also join a
+small always-considered prior pool, so they are not lost just because Milvus
+top-K retrieval favored older semantic matches.
+
 Active-project control:
 
 ```bash
@@ -227,11 +263,32 @@ Activation views include `source_provenance`, `match_evidence`, `risk_flags`,
 and `llm_use_guidance`. Retrieval provides sourced candidates; the coding agent
 is still responsible for deciding whether an asset fits the current task.
 
+Activation views also include an `injection_plan` that separates retrieval from
+injection. Tiny durable priors such as stable preferences, constraints, and
+`dont_repeat` instructions can be routed to `system_prompt`; task-relevant
+lessons and explicit constraints go to `runtime_context`; larger codemap or
+background chunks go to `reference_summary` so the LLM can re-analyze them on
+demand. `system_prompt` remains intentionally sparse: it is for tiny, durable
+project/team/user priors, not for bulk knowledge.
+
+Each `auto-start` / `activate` call also materializes the plan as host-friendly
+artifacts under the project memory root:
+
+- `injections/<activation_id>.md`
+- `injections/<activation_id>.json`
+- `injections/latest.md`
+- `injections/latest.json`
+
+These files are runtime artifacts in `$EXPCAP_HOME` (or `.agent-memory/` only
+when using the local profile). Claude hooks use the rendered Markdown as
+`additionalContext`; other hosts can read `latest.md` or `latest.json` directly.
+
 Assets carry scope and lifecycle metadata:
 
 - `knowledge_scope`: `project` or `cross-project`.
-- `knowledge_kind`: `pattern`, `anti_pattern`, `rule`, `context`, or
-  `checklist`.
+- `knowledge_kind`: `pattern`, `anti_pattern`, `rule`, `context`, `checklist`,
+  `past_win`, `preference`, `constraint`, `decision_memory`, `dont_repeat`, or
+  `codemap`.
 - `temperature`: `hot`, `warm`, `neutral`, or `cool`.
 - `review_status`: `healthy`, `watch`, `needs_review`, or `unproven`.
 
@@ -336,6 +393,15 @@ Quickstart to generate and open it directly.
 `benchmark-milvus` pre-syncs the active embedding-profile Milvus index before
 querying, so profile switches do not look like retrieval failures.
 
+For codemap/doc recall checks, add expectations:
+
+```bash
+expcap benchmark-milvus \
+  --workspace "$PWD" \
+  --query "README ingest-docs codemap" \
+  --expect-kind codemap
+```
+
 Watch these fields:
 
 - `activation_feedback_summary`: helped, pending, or stale missing feedback.
@@ -347,6 +413,8 @@ Watch these fields:
   index health.
 - `milvus_benchmark`: sampled Milvus retrieval quality, including provider
   metadata, top scores, and historical selected-asset hit rate.
+- `injection_policy_summary`: whether recent activation plans are routing
+  items into `system_prompt`, `runtime_context`, or `reference_summary`.
 - `project_activity`: whether the workspace is `active` or `inactive` for
   reporting and coverage analysis.
 - `backend_configuration`: active local/shareable backend profile.

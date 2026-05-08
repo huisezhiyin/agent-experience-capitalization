@@ -90,6 +90,17 @@ def _task_for_prompt(args: argparse.Namespace, payload: dict[str, Any]) -> str |
     return _normalize_task(args.task or payload.get("prompt") or payload.get("task"))
 
 
+def _payload_value(payload: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        normalized = _normalize_task(str(value))
+        if normalized:
+            return normalized
+    return None
+
+
 def _latest_activation_task(workspace: Path) -> str | None:
     activations = list_activation_logs(default_db_path(workspace), workspace=str(workspace), limit=20)
     for activation in activations:
@@ -262,7 +273,10 @@ def main() -> int:
             _record(workspace, host=args.host, event=args.event, status="skipped", task=None, reason="task_unresolved")
             print(json.dumps(_skip_output("skip stop hook without resolvable task"), ensure_ascii=False))
             return 0
-        if _contains_no_save_signal(task, args.result_summary, str(payload.get("prompt") or ""), str(payload.get("task") or "")):
+        verification_status = _payload_value(payload, "verification_status", "verificationStatus") or args.verification_status
+        result_status = _payload_value(payload, "result_status", "resultStatus") or args.result_status
+        result_summary = _payload_value(payload, "result_summary", "resultSummary", "summary")
+        if _contains_no_save_signal(task, args.result_summary, result_summary, str(payload.get("prompt") or ""), str(payload.get("task") or "")):
             _record(workspace, host=args.host, event=args.event, status="skipped", task=task, reason="explicit_no_save_signal")
             print(json.dumps(_skip_output("skip stop hook due to explicit no-save signal"), ensure_ascii=False))
             return 0
@@ -287,11 +301,11 @@ def main() -> int:
                 "--task",
                 task,
                 "--verification-status",
-                args.verification_status,
+                verification_status,
                 "--result-status",
-                args.result_status,
+                result_status,
                 "--result-summary",
-                args.result_summary or f"hook auto-finish from {args.host} stop event",
+                args.result_summary or result_summary or f"hook auto-finish from {args.host} stop event",
             ]
         )
         _record(

@@ -1876,6 +1876,89 @@ class CliFlowTests(unittest.TestCase):
             traces_dir = workspace / ".agent-memory" / "traces" / "bundles"
             self.assertTrue(any(traces_dir.glob("trace_*.json")))
 
+    def test_expcap_hook_stop_reads_status_fields_from_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+            asset_path = workspace / ".agent-memory" / "assets" / "patterns" / "pattern_stop_payload_001.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_stop_payload_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "codex stop payload mapping",
+                        "content": "map stop hook payload status fields into auto-finish feedback.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.88,
+                        "status": "active",
+                        "created_at": "2026-05-08T00:00:00+00:00",
+                        "updated_at": "2026-05-08T00:00:00+00:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "complete codex stop payload mapping",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "stop",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "Stop",
+                        "cwd": str(workspace),
+                        "task": "complete codex stop payload mapping",
+                        "verification_status": "passed",
+                        "result_status": "success",
+                        "result_summary": "Codex stop payload carried status fields.",
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            self.assertTrue(payload["continue"])
+
+            db_path = default_db_path(workspace)
+            activations = list_activation_logs(db_path, workspace=str(workspace.resolve()), limit=5)
+            activation = next(item for item in activations if item.get("task_query") == "complete codex stop payload mapping")
+            self.assertEqual(activation.get("feedback", {}).get("help_signal"), "supported_strong")
+            self.assertIn("Codex stop payload carried status fields", activation.get("feedback", {}).get("feedback_summary", ""))
+
     def test_expcap_hook_user_prompt_submit_skips_duplicate_within_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"

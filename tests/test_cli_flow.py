@@ -2033,6 +2033,81 @@ class CliFlowTests(unittest.TestCase):
                 {"type": "error", "content": "AssertionError: lifecycle evidence missing", "important": True},
                 events,
             )
+            self.assertNotIn(
+                {"type": "command", "content": "progressive-recall", "important": True},
+                events,
+            )
+
+    def test_expcap_hook_post_tool_use_injects_progressive_recall_on_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            env = {**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"}
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}):
+                db_path = default_db_path(workspace)
+                ensure_db(db_path)
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": "pattern_hook_progressive_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "hook progressive WebSocketTimeoutError repair",
+                        "content": "When WebSocketTimeoutError appears in tests/test_websocket.py after a tool run, trigger continuous runtime recall and focus on the new stderr signal.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": ["ep_hook_progressive_001"],
+                        "source_candidate_ids": ["cand_hook_progressive_001"],
+                        "confidence": 0.84,
+                        "status": "active",
+                        "review_status": "healthy",
+                        "temperature": "warm",
+                        "created_at": "2026-05-09T00:00:00+00:00",
+                        "updated_at": "2026-05-09T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "post-tool-use",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "python -m pytest tests/test_websocket.py"},
+                        "tool_response": {"exit_code": 1, "stderr": "WebSocketTimeoutError in tests/test_websocket.py"},
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            context = payload["hookSpecificOutput"]["additionalContext"]
+            latest = json.loads((workspace / ".agent-memory" / "hooks" / "latest.json").read_text(encoding="utf-8"))
+            view_path = next((workspace / ".agent-memory" / "views").glob("*progressive.json"))
+            view = json.loads(view_path.read_text(encoding="utf-8"))
+
+            self.assertIn("continuous_runtime_recall_injection", context)
+            self.assertIn("hook progressive WebSocketTimeoutError repair", context)
+            self.assertEqual(latest["event"], "post-tool-use")
+            self.assertEqual(latest["status"], "progressive-recall")
+            self.assertIn("selected_count=1", latest["result_summary"])
+            self.assertEqual(view["progressive_recall"]["injection_layer"], "continuous_runtime_recall_injection")
 
     def test_expcap_hook_pre_tool_use_blocks_destructive_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

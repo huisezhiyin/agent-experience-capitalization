@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime.backends import resolve_backend_config
-from runtime.core.injection_policy import build_injection_plan, injection_channel_for_asset
+from runtime.core.injection_policy import CHANNEL_TO_LAYER, build_injection_plan, injection_channel_for_asset
 from runtime.core.knowledge_kinds import (
     ANTI_PATTERN,
     CODEMAP,
@@ -1395,7 +1395,9 @@ def _assemble_activation_context(
 ) -> tuple[list[str], list[str], dict[str, Any]]:
     injection_plan = build_injection_plan(selected_assets, constraints=constraints)
     for asset in selected_assets:
-        asset["injection_channel"] = injection_channel_for_asset(asset)
+        channel = injection_channel_for_asset(asset)
+        asset["injection_channel"] = channel
+        asset["injection_layer"] = CHANNEL_TO_LAYER[channel]
 
     rendered_context = [
         _render_activation_context_item(asset)

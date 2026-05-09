@@ -3,7 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from runtime.core.injection_policy import REFERENCE_SUMMARY, RUNTIME_CONTEXT, SYSTEM_PROMPT
+from runtime.core.injection_policy import (
+    CONTINUOUS_RUNTIME_RECALL_INJECTION,
+    REFERENCE_SUMMARY,
+    RUNTIME_CONTEXT,
+    SYSTEM_PROMPT,
+    SYSTEM_PROMPT_INJECTION,
+    TASK_START_RUNTIME_INJECTION,
+)
 from runtime.storage.fs_store import memory_root_for_workspace, save_json
 
 
@@ -14,6 +21,18 @@ CHANNEL_TITLES = {
 }
 
 CHANNEL_ORDER = (SYSTEM_PROMPT, RUNTIME_CONTEXT, REFERENCE_SUMMARY)
+
+LAYER_TITLES = {
+    TASK_START_RUNTIME_INJECTION: "Task Start Runtime Injection",
+    SYSTEM_PROMPT_INJECTION: "System Prompt Injection",
+    CONTINUOUS_RUNTIME_RECALL_INJECTION: "Continuous Runtime Recall Injection",
+}
+
+LAYER_ORDER = (
+    TASK_START_RUNTIME_INJECTION,
+    SYSTEM_PROMPT_INJECTION,
+    CONTINUOUS_RUNTIME_RECALL_INJECTION,
+)
 
 
 def _compact(value: str, limit: int) -> str:
@@ -35,6 +54,20 @@ def _channel_items(activation: dict[str, Any], channel: str) -> list[dict[str, A
     return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
 
+def _plan_layers(activation: dict[str, Any]) -> dict[str, Any]:
+    plan = activation.get("injection_plan") if isinstance(activation.get("injection_plan"), dict) else {}
+    layers = plan.get("injection_layers") if isinstance(plan.get("injection_layers"), dict) else {}
+    return layers if isinstance(layers, dict) else {}
+
+
+def _layer_items(activation: dict[str, Any], layer: str) -> list[dict[str, Any]]:
+    layer_payload = _plan_layers(activation).get(layer)
+    if not isinstance(layer_payload, dict):
+        return []
+    items = layer_payload.get("items")
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
 def injection_artifact_payload(activation: dict[str, Any]) -> dict[str, Any]:
     return {
         "activation_id": activation.get("activation_id"),
@@ -43,12 +76,20 @@ def injection_artifact_payload(activation: dict[str, Any]) -> dict[str, Any]:
         "created_at": activation.get("created_at"),
         "policy": (activation.get("injection_plan") or {}).get("policy"),
         "channel_counts": (activation.get("injection_plan") or {}).get("channel_counts", {}),
+        "layer_counts": (activation.get("injection_plan") or {}).get("layer_counts", {}),
         "channels": {
             channel: {
                 "title": CHANNEL_TITLES[channel],
                 "items": _channel_items(activation, channel),
             }
             for channel in CHANNEL_ORDER
+        },
+        "injection_layers": {
+            layer: {
+                "title": LAYER_TITLES[layer],
+                "items": _layer_items(activation, layer),
+            }
+            for layer in LAYER_ORDER
         },
     }
 
@@ -75,6 +116,17 @@ def render_injection_markdown(activation: dict[str, Any], *, max_chars: int | No
             lines.append(f"- [{kind}] {title}")
             if content:
                 lines.append(f"  {content}")
+        lines.append("")
+    layers = _plan_layers(activation)
+    if layers:
+        lines.append("## Injection Layers")
+        for layer in LAYER_ORDER:
+            payload = layers.get(layer) if isinstance(layers.get(layer), dict) else {}
+            items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            lines.append(f"- {LAYER_TITLES[layer]}: {len(items)} item(s)")
+            purpose = payload.get("purpose")
+            if purpose:
+                lines.append(f"  {_compact(str(purpose), 180)}")
         lines.append("")
     rendered = "\n".join(lines).rstrip() + "\n"
     if max_chars is not None and len(rendered) > max_chars:

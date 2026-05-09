@@ -247,8 +247,13 @@ Activation view 会包含 `source_provenance`、`match_evidence`、`risk_flags`
 和 `llm_use_guidance`。召回层负责提供带来源的候选，coding agent 仍需结合当前任务判断是否采用。
 
 Activation view 也会包含 `injection_plan`，把“召回到了什么”和“应该怎么注入”分开。
-稳定、很短的偏好、约束和 `dont_repeat` 指令可以进入 `system_prompt`；当前任务相关经验和显式约束进入
-`runtime_context`；较大的 codemap、背景材料和原始证据进入 `reference_summary`，让 LLM 按需重新分析。`system_prompt` 会刻意保持稀少，只放小而稳定的用户/团队/项目先验，不承载大块知识。
+注入优先按三层理解：
+
+- `task_start_runtime_injection`：任务开始运行时注入，用于 `SessionStart`、`UserPromptSubmit`、`auto-start` 的任务输入增强。
+- `system_prompt_injection`：系统提示词注入，把稳定、很短的项目级先验沉淀到 `AGENTS.md` / `AGENTS.expcap.md`。
+- `continuous_runtime_recall_injection`：持续运行时召回注入，在对话中出现新错误、新文件、新阶段或 topic drift 时通过 `progressive-recall` 按需查找。
+
+为保持兼容，runtime 仍保留旧的 `system_prompt`、`runtime_context`、`reference_summary` channel 字段；它们会映射到上面的三层注入语义。
 
 每次 `auto-start` / `activate` 也会把注入计划物化成宿主友好的运行时产物：
 
@@ -289,6 +294,13 @@ export EXPCAP_HOME="$HOME/.expcap"
 ```
 
 这样运行数据不会落在项目目录，同时仍保留 project-owned asset identity。
+
+知识保存也按四层理解：
+
+- `milvus`：语义召回索引层，负责找得到相似经验。
+- `sqlite`：轻量状态索引层，负责候选状态、反馈、review queue、activation log 与统计。
+- `markdown_files`：人类可读知识层，包括项目提示词、注入快照和文档资产。
+- `logs`：原始运行证据层，包括 trace、episode、hook event 和 activation view。
 
 显式 local profile：
 
@@ -361,7 +373,8 @@ expcap dashboard --workspace "$PWD"
 `saved_to` 路径复制到浏览器打开，也可以使用快速开始里的 macOS 一键打开命令。
 
 `benchmark-milvus` 会先同步当前 embedding profile 对应的 Milvus index，再执行
-查询，避免 profile 切换被误判成召回失败。
+查询，避免 profile 切换被误判成召回失败。如果当前环境 Milvus runtime 不可用，benchmark
+会明确报告该状态，并可使用带标记的 state-index fallback 做期望条件诊断。
 
 如果要检查 codemap / 文档召回，可以带上期望条件：
 

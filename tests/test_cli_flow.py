@@ -685,6 +685,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(view["selected_assets"][0]["asset_id"], "pattern_progressive_001")
             self.assertEqual(view["retrieval_summary"]["selected_from_sqlite"], 1)
             self.assertEqual(view["progressive_recall"]["kind"], "event_driven_delta")
+            self.assertEqual(view["progressive_recall"]["injection_layer"], "continuous_runtime_recall_injection")
             self.assertEqual(activations[0]["progressive_recall"]["phase"], "fix")
 
     def test_cli_auto_finish_can_promote_cross_project_asset(self) -> None:
@@ -1099,6 +1100,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("Unproven Validation Queue", html)
             self.assertIn("Local Prior Distribution", html)
             self.assertIn("Injection Channels", html)
+            self.assertIn("Injection Layers", html)
             self.assertEqual(payload["dashboard"]["cards"]["assets"], 1)
             self.assertEqual(payload["dashboard"]["cards"]["local_prior_assets"], 1)
             self.assertEqual(payload["dashboard"]["cards"]["high_priority_prior_assets"], 1)
@@ -1110,6 +1112,12 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["by_kind"]["preference"], 1)
             self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["high_priority_count"], 1)
             self.assertEqual(dashboard["injection_policy_summary"]["channel_counts"]["system_prompt"], 1)
+            self.assertEqual(
+                dashboard["injection_policy_summary"]["layer_counts"]["system_prompt_injection"],
+                1,
+            )
+            self.assertIn("knowledge_save_layers", dashboard)
+            self.assertEqual(dashboard["knowledge_save_layers"]["logs"]["role"], "raw_execution_evidence")
             self.assertEqual(dashboard["injection_policy_summary"]["channel_counts"]["reference_summary"], 1)
             self.assertEqual(dashboard["activations"][0]["injection_channel_counts"]["system_prompt"], 1)
             self.assertEqual(dashboard["effectiveness_snapshot"]["verdict"], "healthy")
@@ -1298,6 +1306,11 @@ class CliFlowTests(unittest.TestCase):
             assert isinstance(status, dict)
             self.assertFalse(status["retrieval_backends"]["sqlite"]["available"])
             self.assertEqual(status["retrieval_backends"]["sqlite"]["fallback"], "filesystem_json")
+            self.assertIn("knowledge_save_layers", status)
+            self.assertEqual(status["knowledge_save_layers"]["sqlite"]["role"], "lightweight_state_index")
+            self.assertEqual(status["knowledge_save_layers"]["milvus"]["role"], "semantic_retrieval_index")
+            self.assertEqual(status["knowledge_save_layers"]["markdown_files"]["role"], "human_readable_knowledge_assets")
+            self.assertEqual(status["knowledge_save_layers"]["logs"]["role"], "raw_execution_evidence")
             self.assertEqual(status["counts"]["assets"], 1)
             self.assertEqual(status["counts"]["activation_logs"], 1)
             self.assertTrue(status["runtime_warnings"])
@@ -1770,6 +1783,10 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue((workspace / ".codex" / "hooks.json").exists())
             self.assertTrue((workspace / ".codex" / "hooks" / "expcap_user_prompt_submit.sh").exists())
             self.assertTrue((workspace / ".codex" / "hooks" / "expcap_stop.sh").exists())
+            self.assertTrue((workspace / ".codex" / "hooks" / "expcap_session_start.sh").exists())
+            self.assertTrue((workspace / ".codex" / "hooks" / "expcap_pre_tool_use.sh").exists())
+            self.assertTrue((workspace / ".codex" / "hooks" / "expcap_permission_request.sh").exists())
+            self.assertTrue((workspace / ".codex" / "hooks" / "expcap_post_tool_use.sh").exists())
 
     def test_expcap_hook_user_prompt_submit_routes_to_auto_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1828,6 +1845,65 @@ class CliFlowTests(unittest.TestCase):
             db_path = default_db_path(workspace)
             self.assertEqual(len(list_activation_logs(db_path, workspace=str(workspace.resolve()))), 1)
 
+    def test_expcap_hook_session_start_injects_workspace_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            asset_path = workspace / ".agent-memory" / "assets" / "rules" / "rule_session_start_001.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "rule_session_start_001",
+                        "workspace": str(workspace),
+                        "asset_type": "rule",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "rule",
+                        "title": "session start workspace convention",
+                        "content": "load project conventions when a Codex session starts.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.9,
+                        "status": "active",
+                        "created_at": "2026-05-09T00:00:00+00:00",
+                        "updated_at": "2026-05-09T00:00:00+00:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "session-start",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps({"hook_event_name": "SessionStart", "source": "startup"}, ensure_ascii=False),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            context = payload["hookSpecificOutput"]["additionalContext"]
+
+            self.assertTrue(payload["continue"])
+            self.assertIn("expcap injection context", context)
+            self.assertIn("session start workspace convention", context)
+            self.assertTrue((workspace / ".agent-memory" / "injections" / "latest.md").exists())
+            db_path = default_db_path(workspace)
+            activations = list_activation_logs(db_path, workspace=str(workspace.resolve()), limit=5)
+            self.assertEqual(len(activations), 1)
+            self.assertIn("session start", activations[0]["task_query"])
+
     def test_expcap_hook_stop_routes_to_auto_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"
@@ -1875,6 +1951,245 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue(payload["continue"])
             traces_dir = workspace / ".agent-memory" / "traces" / "bundles"
             self.assertTrue(any(traces_dir.glob("trace_*.json")))
+
+    def test_expcap_hook_stop_includes_recent_codex_tool_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    "complete codex lifecycle evidence flow",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "post-tool-use",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "python -m pytest tests/test_lifecycle.py"},
+                        "tool_response": {"exit_code": 1, "stderr": "AssertionError: lifecycle evidence missing"},
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "stop",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                    "--result-status",
+                    "success",
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps({"task": "complete codex lifecycle evidence flow"}, ensure_ascii=False),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            trace_path = next((workspace / ".agent-memory" / "traces" / "bundles").glob("trace_*.json"))
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            events = trace["events"]
+            self.assertIn(
+                {"type": "command", "content": "python -m pytest tests/test_lifecycle.py", "important": True},
+                events,
+            )
+            self.assertIn(
+                {"type": "error", "content": "AssertionError: lifecycle evidence missing", "important": True},
+                events,
+            )
+
+    def test_expcap_hook_pre_tool_use_blocks_destructive_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "pre-tool-use",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "git reset --hard HEAD"},
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            hook_output = payload["hookSpecificOutput"]
+            self.assertEqual(hook_output["hookEventName"], "PreToolUse")
+            self.assertEqual(hook_output["permissionDecision"], "deny")
+            self.assertIn("destructive", hook_output["permissionDecisionReason"].lower())
+
+            latest = json.loads((workspace / ".agent-memory" / "hooks" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["event"], "pre-tool-use")
+            self.assertEqual(latest["status"], "blocked")
+
+    def test_expcap_hook_pre_tool_use_allows_safe_command_quietly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "pre-tool-use",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "python3 -m unittest tests.test_install_project"},
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.stdout, "")
+            latest = json.loads((workspace / ".agent-memory" / "hooks" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["event"], "pre-tool-use")
+            self.assertEqual(latest["status"], "success")
+
+    def test_expcap_hook_permission_request_denies_destructive_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "permission-request",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PermissionRequest",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {
+                            "command": "git clean -xdf",
+                            "description": "Escalate to clean untracked files.",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            decision = payload["hookSpecificOutput"]["decision"]
+            self.assertEqual(payload["hookSpecificOutput"]["hookEventName"], "PermissionRequest")
+            self.assertEqual(decision["behavior"], "deny")
+            self.assertIn("destructive", decision["message"].lower())
+
+            latest = json.loads((workspace / ".agent-memory" / "hooks" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["event"], "permission-request")
+            self.assertEqual(latest["status"], "blocked")
+
+    def test_expcap_hook_permission_request_declines_safe_request_quietly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "permission-request",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PermissionRequest",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {
+                            "command": "python3 -m unittest discover -s tests -v",
+                            "description": "Run the project test suite.",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.stdout, "")
+            latest = json.loads((workspace / ".agent-memory" / "hooks" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["event"], "permission-request")
+            self.assertEqual(latest["status"], "success")
+            self.assertEqual(latest["reason"], "Run the project test suite.")
 
     def test_expcap_hook_stop_reads_status_fields_from_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

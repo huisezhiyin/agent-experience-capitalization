@@ -188,6 +188,7 @@ def _guardrail_reason(tool_name: str | None, command: str | None) -> str | None:
         return None
     lowered = command.casefold()
     normalized = " ".join(lowered.split())
+    is_git_write = "git add" in normalized or "git commit" in normalized
 
     if (tool_name or "").casefold() == "bash":
         destructive_patterns = (
@@ -203,8 +204,24 @@ def _guardrail_reason(tool_name: str | None, command: str | None) -> str | None:
         )
         if any(pattern in normalized for pattern in destructive_patterns):
             return "Blocked destructive shell or git command. Ask the user before running irreversible cleanup/reset operations."
-        if ".agent-memory" in normalized and ("git add" in normalized or "git commit" in normalized):
-            return "Blocked attempt to include expcap local runtime data in git. Do not commit .agent-memory/."
+        runtime_data_markers = (
+            ".agent-memory",
+            ".expcap/projects/",
+            "/.expcap/projects/",
+            "~/.expcap/projects/",
+            "$home/.expcap/projects/",
+            "codex/expcap-memory/",
+            "/.codex/expcap-memory/",
+            "index.sqlite3",
+            "milvus.db",
+            "milvus.openai",
+            "milvus.local",
+        )
+        if is_git_write and any(marker in normalized for marker in runtime_data_markers):
+            return (
+                "Blocked attempt to include expcap local runtime data in git. "
+                "Do not commit trace, episode, candidate, SQLite, or Milvus runtime data."
+            )
 
     secret_markers = (
         "openai_api_key=",

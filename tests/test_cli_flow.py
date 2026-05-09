@@ -2074,6 +2074,81 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(latest["event"], "pre-tool-use")
             self.assertEqual(latest["status"], "blocked")
 
+    def test_expcap_hook_pre_tool_use_blocks_runtime_data_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "pre-tool-use",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "git add ~/.expcap/projects/demo/index.sqlite3"},
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            hook_output = payload["hookSpecificOutput"]
+            self.assertEqual(hook_output["hookEventName"], "PreToolUse")
+            self.assertEqual(hook_output["permissionDecision"], "deny")
+            self.assertIn("runtime data", hook_output["permissionDecisionReason"].lower())
+
+            latest = json.loads((workspace / ".agent-memory" / "hooks" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["event"], "pre-tool-use")
+            self.assertEqual(latest["status"], "blocked")
+
+    def test_expcap_hook_pre_tool_use_allows_project_config_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "pre-tool-use",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env={**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"},
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "git add .expcap-project.json"},
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.stdout, "")
+            latest = json.loads((workspace / ".agent-memory" / "hooks" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["event"], "pre-tool-use")
+            self.assertEqual(latest["status"], "success")
+
     def test_expcap_hook_pre_tool_use_allows_safe_command_quietly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"

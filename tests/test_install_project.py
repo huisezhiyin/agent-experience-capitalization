@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from runtime.core.project_install import (
     INTEGRATION_MODE_CODEX_HOOKS,
@@ -47,17 +48,22 @@ class InstallProjectTests(unittest.TestCase):
             agents_path = workspace / "AGENTS.md"
             agents_path.write_text("# AGENTS.md\n\n原有规则。\n", encoding="utf-8")
 
-            install_project_agents(workspace)
-            once = agents_path.read_text(encoding="utf-8")
-            gitignore_once = (workspace / ".gitignore").read_text(encoding="utf-8")
-            policy_once = (workspace / ".expcap-project.json").read_text(encoding="utf-8")
-            install_project_agents(workspace)
+            with patch(
+                "runtime.core.project_policy._now_utc",
+                side_effect=["2026-05-09T00:00:00+00:00", "2026-05-09T00:01:00+00:00"],
+            ):
+                install_project_agents(workspace)
+                once = agents_path.read_text(encoding="utf-8")
+                gitignore_once = (workspace / ".gitignore").read_text(encoding="utf-8")
+                policy_once = (workspace / ".expcap-project.json").read_text(encoding="utf-8")
+                install_project_agents(workspace)
             twice = agents_path.read_text(encoding="utf-8")
             gitignore_twice = (workspace / ".gitignore").read_text(encoding="utf-8")
             policy_twice = (workspace / ".expcap-project.json").read_text(encoding="utf-8")
 
             self.assertEqual(once, twice)
             self.assertEqual(gitignore_once, gitignore_twice)
+            self.assertEqual(policy_once, policy_twice)
             self.assertEqual(json.loads(policy_once)["project_status"], "active")
             self.assertEqual(json.loads(policy_twice)["project_status"], "active")
             self.assertEqual(once.count("<!-- EXPCAP START -->"), 1)

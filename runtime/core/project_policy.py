@@ -67,10 +67,21 @@ def write_project_policy(
 ) -> Path:
     workspace = workspace.resolve()
     path = project_policy_path(workspace)
-    payload = {
+    stable_payload = {
         "project_status": normalize_project_status(project_status),
         "integration_mode": integration_mode or DEFAULT_INTEGRATION_MODE,
         "auto_start_mode": "always_on_new_chat",
+    }
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        existing_stable = {key: existing.get(key) for key in stable_payload}
+        if existing_stable == stable_payload:
+            return path
+    payload = {
+        **stable_payload,
         "updated_at": _now_utc(),
     }
     path.write_text(

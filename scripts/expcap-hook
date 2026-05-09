@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from runtime.storage.fs_store import default_db_path  # noqa: E402
+from runtime.storage.fs_store import default_db_path, memory_root_for_workspace  # noqa: E402
 from runtime.storage.sqlite_store import list_activation_logs  # noqa: E402
 from runtime.core.hook_activity import load_recent_hook_events, parse_hook_timestamp, record_hook_event  # noqa: E402
 from runtime.core.injection_materializer import render_hook_additional_context  # noqa: E402
@@ -44,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="expcap-hook")
     subparsers = parser.add_subparsers(dest="event", required=True)
 
-    for event in ("user-prompt-submit", "stop"):
+    for event in ("user-prompt-submit", "stop", "session-start", "pre-tool-use", "permission-request", "post-tool-use"):
         sub = subparsers.add_parser(event)
         sub.add_argument("--host", default="claude")
         sub.add_argument("--workspace")
@@ -90,6 +90,11 @@ def _task_for_prompt(args: argparse.Namespace, payload: dict[str, Any]) -> str |
     return _normalize_task(args.task or payload.get("prompt") or payload.get("task"))
 
 
+def _session_start_task(args: argparse.Namespace, payload: dict[str, Any]) -> str:
+    task = _normalize_task(args.task or payload.get("task") or payload.get("prompt"))
+    return task or "session start: load project experience and workspace conventions"
+
+
 def _payload_value(payload: dict[str, Any], *keys: str) -> str | None:
     for key in keys:
         value = payload.get(key)
@@ -99,6 +104,173 @@ def _payload_value(payload: dict[str, Any], *keys: str) -> str | None:
         if normalized:
             return normalized
     return None
+
+
+def _truncate(value: str | None, *, limit: int = 600) -> str | None:
+    if not value:
+        return None
+    normalized = " ".join(str(value).split())
+    if not normalized:
+        return None
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "…"
+
+
+def _nested_value(value: Any, *keys: str) -> Any:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _tool_name(payload: dict[str, Any]) -> str | None:
+    return _payload_value(payload, "tool_name", "toolName", "tool")
+
+
+def _tool_command(payload: dict[str, Any]) -> str | None:
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
+    if isinstance(tool_input, dict):
+        return _truncate(
+            str(
+                tool_input.get("command")
+                or tool_input.get("cmd")
+                or tool_input.get("input")
+                or tool_input.get("patch")
+                or ""
+            ),
+            limit=800,
+        )
+    if isinstance(tool_input, str):
+        return _truncate(tool_input, limit=800)
+    return None
+
+
+def _tool_response_status(payload: dict[str, Any]) -> str:
+    response = payload.get("tool_response") or payload.get("toolResponse") or {}
+    exit_code = _nested_value(response, "exit_code")
+    if exit_code is None:
+        exit_code = _nested_value(response, "exitCode")
+    if exit_code is None:
+        exit_code = _nested_value(response, "metadata", "exit_code")
+    if exit_code is None:
+        return "unknown"
+    return "success" if str(exit_code) == "0" else "failed"
+
+
+def _tool_error(payload: dict[str, Any]) -> str | None:
+    response = payload.get("tool_response") or payload.get("toolResponse") or {}
+    candidates: list[Any] = []
+    if isinstance(response, dict):
+        candidates.extend(
+            [
+                response.get("stderr"),
+                response.get("error"),
+                response.get("message"),
+                _nested_value(response, "metadata", "stderr"),
+            ]
+        )
+        if _tool_response_status(payload) == "failed":
+            candidates.extend([response.get("stdout"), response.get("output")])
+    elif isinstance(response, str):
+        candidates.append(response)
+    for candidate in candidates:
+        text = _truncate(str(candidate), limit=800) if candidate is not None else None
+        if text:
+            return text
+    return None
+
+
+def _guardrail_reason(tool_name: str | None, command: str | None) -> str | None:
+    if not command:
+        return None
+    lowered = command.casefold()
+    normalized = " ".join(lowered.split())
+
+    if (tool_name or "").casefold() == "bash":
+        destructive_patterns = (
+            "rm -rf /",
+            "rm -rf ~",
+            "rm -rf $home",
+            "sudo rm -rf",
+            "git reset --hard",
+            "git clean -fd",
+            "git clean -xdf",
+            "git checkout -- .",
+            "git restore .",
+        )
+        if any(pattern in normalized for pattern in destructive_patterns):
+            return "Blocked destructive shell or git command. Ask the user before running irreversible cleanup/reset operations."
+        if ".agent-memory" in normalized and ("git add" in normalized or "git commit" in normalized):
+            return "Blocked attempt to include expcap local runtime data in git. Do not commit .agent-memory/."
+
+    secret_markers = (
+        "openai_api_key=",
+        "api_key=",
+        "access_token=",
+        "secret_key=",
+        "private_key=",
+        "-----begin private key-----",
+    )
+    if any(marker in normalized for marker in secret_markers):
+        return "Blocked apparent local secret or API key from being written through a tool call."
+    if "add file: .env" in normalized or "update file: .env" in normalized:
+        return "Blocked direct edit of .env; local credentials should not be managed by Codex hooks."
+    return None
+
+
+def _pre_tool_use_block_output(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _permission_request_deny_output(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "deny",
+                "message": reason,
+            },
+        }
+    }
+
+
+def _recent_tool_evidence(workspace: Path) -> tuple[list[str], list[str]]:
+    commands: list[str] = []
+    errors: list[str] = []
+    seen_commands: set[str] = set()
+    seen_errors: set[str] = set()
+    for item in load_recent_hook_events(workspace, limit=50):
+        if item.get("event") != "post-tool-use":
+            continue
+        command = _truncate(str(item.get("command") or ""), limit=800)
+        if command and command not in seen_commands:
+            commands.append(command)
+            seen_commands.add(command)
+        error = _truncate(str(item.get("error") or ""), limit=800)
+        if error and error not in seen_errors:
+            errors.append(error)
+            seen_errors.add(error)
+        if len(commands) >= 5 and len(errors) >= 3:
+            break
+    return commands[:5], errors[:3]
+
+
+def _latest_injection_context(workspace: Path) -> str:
+    latest_path = memory_root_for_workspace(workspace) / "injections" / "latest.md"
+    try:
+        context = latest_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return context[:6000]
 
 
 def _latest_activation_task(workspace: Path) -> str | None:
@@ -183,6 +355,17 @@ def _user_prompt_hook_output(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _json_continue_output(hook_event_name: str, *, additional_context: str = "") -> dict[str, Any]:
+    return {
+        "continue": True,
+        "suppressOutput": True,
+        "hookSpecificOutput": {
+            "hookEventName": hook_event_name,
+            "additionalContext": additional_context,
+        },
+    }
+
+
 def _skip_output(reason: str, *, hook_event_name: str | None = None) -> dict[str, Any]:
     output: dict[str, Any] = {
         "continue": True,
@@ -207,6 +390,9 @@ def _record(
     reason: str | None = None,
     command: str | None = None,
     result_summary: str | None = None,
+    tool_name: str | None = None,
+    tool_status: str | None = None,
+    error: str | None = None,
 ) -> None:
     record_hook_event(
         workspace,
@@ -218,6 +404,9 @@ def _record(
             "reason": reason,
             "command": command,
             "result_summary": result_summary,
+            "tool_name": tool_name,
+            "tool_status": tool_status,
+            "error": error,
         },
     )
 
@@ -228,6 +417,122 @@ def main() -> int:
     workspace = _workspace(args, payload)
 
     try:
+        if args.event == "session-start":
+            source = _payload_value(payload, "source") or "unknown"
+            task = _session_start_task(args, payload)
+            duplicate = _recent_duplicate_event(workspace, event=args.event, task=task)
+            if duplicate:
+                context = _latest_injection_context(workspace)
+                _record(
+                    workspace,
+                    host=args.host,
+                    event=args.event,
+                    status="skipped",
+                    task=task,
+                    reason=f"duplicate_cooldown:{duplicate['age_minutes']}/{duplicate['cooldown_minutes']}",
+                )
+                print(json.dumps(_json_continue_output("SessionStart", additional_context=context), ensure_ascii=False))
+                return 0
+            result = _run_expcap(
+                [
+                    str(PROJECT_ROOT / "scripts" / "expcap"),
+                    "auto-start",
+                    "--workspace",
+                    str(workspace),
+                    "--task",
+                    task,
+                ]
+            )
+            context = render_hook_additional_context(result.get("activation_view") or {})
+            _record(
+                workspace,
+                host=args.host,
+                event=args.event,
+                status="success",
+                task=task,
+                reason=f"source:{source}",
+                command="auto-start",
+                result_summary=f"selected_count={result.get('selected_count', 0)}",
+            )
+            print(json.dumps(_json_continue_output("SessionStart", additional_context=context), ensure_ascii=False))
+            return 0
+
+        if args.event == "post-tool-use":
+            tool_name = _tool_name(payload)
+            command = _tool_command(payload)
+            tool_status = _tool_response_status(payload)
+            error = _tool_error(payload)
+            _record(
+                workspace,
+                host=args.host,
+                event=args.event,
+                status="success",
+                task=None,
+                command=command,
+                tool_name=tool_name,
+                tool_status=tool_status,
+                error=error,
+            )
+            print(json.dumps(_json_continue_output("PostToolUse"), ensure_ascii=False))
+            return 0
+
+        if args.event == "pre-tool-use":
+            tool_name = _tool_name(payload)
+            command = _tool_command(payload)
+            reason = _guardrail_reason(tool_name, command)
+            if reason:
+                _record(
+                    workspace,
+                    host=args.host,
+                    event=args.event,
+                    status="blocked",
+                    task=None,
+                    reason=reason,
+                    command=command,
+                    tool_name=tool_name,
+                )
+                print(json.dumps(_pre_tool_use_block_output(reason), ensure_ascii=False))
+                return 0
+            _record(
+                workspace,
+                host=args.host,
+                event=args.event,
+                status="success",
+                task=None,
+                command=command,
+                tool_name=tool_name,
+            )
+            return 0
+
+        if args.event == "permission-request":
+            tool_name = _tool_name(payload)
+            command = _tool_command(payload)
+            reason = _guardrail_reason(tool_name, command)
+            if reason:
+                _record(
+                    workspace,
+                    host=args.host,
+                    event=args.event,
+                    status="blocked",
+                    task=None,
+                    reason=reason,
+                    command=command,
+                    tool_name=tool_name,
+                )
+                print(json.dumps(_permission_request_deny_output(reason), ensure_ascii=False))
+                return 0
+            _record(
+                workspace,
+                host=args.host,
+                event=args.event,
+                status="success",
+                task=None,
+                command=command,
+                tool_name=tool_name,
+                reason=_payload_value(payload.get("tool_input") or {}, "description") if isinstance(payload.get("tool_input"), dict) else None,
+            )
+            return 0
+
         if args.event == "user-prompt-submit":
             task = _task_for_prompt(args, payload)
             if _is_trivial_prompt(task):
@@ -292,22 +597,26 @@ def main() -> int:
             )
             print(json.dumps(_skip_output("skip duplicate stop within cooldown"), ensure_ascii=False))
             return 0
-        result = _run_expcap(
-            [
-                str(PROJECT_ROOT / "scripts" / "expcap"),
-                "auto-finish",
-                "--workspace",
-                str(workspace),
-                "--task",
-                task,
-                "--verification-status",
-                verification_status,
-                "--result-status",
-                result_status,
-                "--result-summary",
-                args.result_summary or result_summary or f"hook auto-finish from {args.host} stop event",
-            ]
-        )
+        command = [
+            str(PROJECT_ROOT / "scripts" / "expcap"),
+            "auto-finish",
+            "--workspace",
+            str(workspace),
+            "--task",
+            task,
+            "--verification-status",
+            verification_status,
+            "--result-status",
+            result_status,
+            "--result-summary",
+            args.result_summary or result_summary or f"hook auto-finish from {args.host} stop event",
+        ]
+        recent_commands, recent_errors = _recent_tool_evidence(workspace)
+        for recent_command in recent_commands:
+            command.extend(["--command", recent_command])
+        for recent_error in recent_errors:
+            command.extend(["--error", recent_error])
+        result = _run_expcap(command)
         _record(
             workspace,
             host=args.host,

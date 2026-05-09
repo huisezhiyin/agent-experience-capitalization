@@ -98,3 +98,14 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap <subcommand
 - 这是一个边用边改的原型项目
 - 允许半自动，不要求一开始就完美全自动
 - 但默认行为必须向“自动 get / 自动 save”方向靠拢
+
+<!-- EXPCAP START -->
+## Expcap Integration
+
+- 本项目额外启用经验资本化工作流，详细规则见 `AGENTS.expcap.md`
+- 不替换本项目原有 agent 约束，只补充经验 `get/save` 行为
+- 只要进入新 chat，就优先执行集中存储模式的 `expcap auto-start`
+- 任务收敛后优先执行集中存储模式的 `expcap auto-finish`
+- 高置信经验再继续 `promote`
+
+<!-- EXPCAP END -->

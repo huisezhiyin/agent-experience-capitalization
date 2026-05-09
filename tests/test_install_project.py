@@ -138,6 +138,10 @@ class InstallProjectTests(unittest.TestCase):
             hooks_path = workspace / ".codex" / "hooks.json"
             prompt_hook = workspace / ".codex" / "hooks" / "expcap_user_prompt_submit.sh"
             stop_hook = workspace / ".codex" / "hooks" / "expcap_stop.sh"
+            session_start_hook = workspace / ".codex" / "hooks" / "expcap_session_start.sh"
+            pre_tool_use_hook = workspace / ".codex" / "hooks" / "expcap_pre_tool_use.sh"
+            permission_request_hook = workspace / ".codex" / "hooks" / "expcap_permission_request.sh"
+            post_tool_use_hook = workspace / ".codex" / "hooks" / "expcap_post_tool_use.sh"
             hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
 
             self.assertEqual(Path(result["codex_hooks_path"]).resolve(), hooks_path.resolve())
@@ -145,15 +149,80 @@ class InstallProjectTests(unittest.TestCase):
             self.assertTrue(hooks_path.exists())
             self.assertTrue(prompt_hook.exists())
             self.assertTrue(stop_hook.exists())
+            self.assertTrue(session_start_hook.exists())
+            self.assertTrue(pre_tool_use_hook.exists())
+            self.assertTrue(permission_request_hook.exists())
+            self.assertTrue(post_tool_use_hook.exists())
+            self.assertIn("SessionStart", hooks["hooks"])
             self.assertIn("UserPromptSubmit", hooks["hooks"])
+            self.assertIn("PreToolUse", hooks["hooks"])
+            self.assertIn("PermissionRequest", hooks["hooks"])
+            self.assertIn("PostToolUse", hooks["hooks"])
             self.assertIn("Stop", hooks["hooks"])
             self.assertIn(
-                "bash .codex/hooks/expcap_user_prompt_submit.sh",
+                "expcap_user_prompt_submit.sh",
                 json.dumps(hooks["hooks"]["UserPromptSubmit"], ensure_ascii=False),
             )
+            self.assertIn("Bash|apply_patch", json.dumps(hooks["hooks"]["PreToolUse"], ensure_ascii=False))
+            self.assertIn("Bash|apply_patch", json.dumps(hooks["hooks"]["PermissionRequest"], ensure_ascii=False))
+            self.assertIn("Bash|apply_patch", json.dumps(hooks["hooks"]["PostToolUse"], ensure_ascii=False))
             self.assertIn("scripts/expcap-hook", prompt_hook.read_text(encoding="utf-8"))
             self.assertIn("--host codex", prompt_hook.read_text(encoding="utf-8"))
             self.assertIn("scripts/expcap-hook", stop_hook.read_text(encoding="utf-8"))
+            self.assertIn("session-start", session_start_hook.read_text(encoding="utf-8"))
+            self.assertIn("pre-tool-use", pre_tool_use_hook.read_text(encoding="utf-8"))
+            self.assertIn("permission-request", permission_request_hook.read_text(encoding="utf-8"))
+            self.assertIn("post-tool-use", post_tool_use_hook.read_text(encoding="utf-8"))
+
+    def test_install_project_codex_hooks_replace_stale_managed_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir(parents=True, exist_ok=True)
+            hooks_path = workspace / ".codex" / "hooks.json"
+            hooks_path.parent.mkdir(parents=True, exist_ok=True)
+            hooks_path.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "UserPromptSubmit": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "bash .codex/hooks/expcap_user_prompt_submit.sh",
+                                            "timeout": 20,
+                                        }
+                                    ]
+                                }
+                            ],
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "bash .codex/hooks/expcap_stop.sh",
+                                            "timeout": 30,
+                                        }
+                                    ]
+                                }
+                            ],
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            install_project_agents(workspace, integration_mode=INTEGRATION_MODE_CODEX_HOOKS)
+
+            hooks = json.loads(hooks_path.read_text(encoding="utf-8"))["hooks"]
+            encoded = json.dumps(hooks, ensure_ascii=False)
+            self.assertNotIn("bash .codex/hooks/expcap_user_prompt_submit.sh", encoded)
+            self.assertNotIn("bash .codex/hooks/expcap_stop.sh", encoded)
+            self.assertEqual(encoded.count("expcap_user_prompt_submit.sh"), 1)
+            self.assertEqual(encoded.count("expcap_stop.sh"), 1)
 
     def test_install_project_include_claude_maps_to_claude_hooks_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

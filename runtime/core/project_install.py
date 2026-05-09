@@ -167,15 +167,63 @@ def _claude_settings_payload(workspace: Path) -> dict[str, object]:
 def _codex_hooks_payload(workspace: Path) -> dict[str, object]:
     return {
         "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "startup|resume|clear",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/expcap_session_start.sh"',
+                            "timeout": 10,
+                        }
+                    ],
+                }
+            ],
             "UserPromptSubmit": [
                 {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "bash .codex/hooks/expcap_user_prompt_submit.sh",
+                            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/expcap_user_prompt_submit.sh"',
                             "timeout": 20,
                         }
                     ]
+                }
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": "Bash|apply_patch",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/expcap_pre_tool_use.sh"',
+                            "timeout": 10,
+                        }
+                    ],
+                }
+            ],
+            "PermissionRequest": [
+                {
+                    "matcher": "Bash|apply_patch",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/expcap_permission_request.sh"',
+                            "timeout": 10,
+                        }
+                    ],
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "Bash|apply_patch",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/expcap_post_tool_use.sh"',
+                            "timeout": 10,
+                        }
+                    ],
                 }
             ],
             "Stop": [
@@ -183,7 +231,7 @@ def _codex_hooks_payload(workspace: Path) -> dict[str, object]:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "bash .codex/hooks/expcap_stop.sh",
+                            "command": 'bash "$(git rev-parse --show-toplevel)/.codex/hooks/expcap_stop.sh"',
                             "timeout": 30,
                         }
                     ]
@@ -202,6 +250,13 @@ def _merge_hook_settings(existing: dict[str, object], update: dict[str, object])
         if not isinstance(current_entries, list):
             hooks[event_name] = entries
             continue
+        managed_names = _managed_codex_hook_names(entries)
+        if managed_names:
+            current_entries = [
+                entry
+                for entry in current_entries
+                if not (_managed_codex_hook_names([entry]) & managed_names)
+            ]
         normalized = [json.dumps(item, ensure_ascii=False, sort_keys=True) for item in current_entries]
         for entry in entries:
             encoded = json.dumps(entry, ensure_ascii=False, sort_keys=True)
@@ -211,6 +266,28 @@ def _merge_hook_settings(existing: dict[str, object], update: dict[str, object])
         hooks[event_name] = current_entries
     merged["hooks"] = hooks
     return merged
+
+
+def _managed_codex_hook_names(entries: object) -> set[str]:
+    names: set[str] = set()
+    if not isinstance(entries, list):
+        return names
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        hooks = entry.get("hooks")
+        if not isinstance(hooks, list):
+            continue
+        for hook in hooks:
+            if not isinstance(hook, dict):
+                continue
+            command = str(hook.get("command") or "")
+            marker = ".codex/hooks/expcap_"
+            if marker not in command:
+                continue
+            tail = command.split(marker, 1)[1]
+            names.add(tail.split('"', 1)[0].split("'", 1)[0].split()[0])
+    return names
 
 
 def _merge_claude_settings(existing: dict[str, object], update: dict[str, object]) -> dict[str, object]:
@@ -309,12 +386,16 @@ def _ensure_codex_hook_files(workspace: Path) -> dict[str, str | bool]:
 
     prompt_hook_path = hooks_dir / "expcap_user_prompt_submit.sh"
     stop_hook_path = hooks_dir / "expcap_stop.sh"
+    session_start_hook_path = hooks_dir / "expcap_session_start.sh"
+    pre_tool_use_hook_path = hooks_dir / "expcap_pre_tool_use.sh"
+    permission_request_hook_path = hooks_dir / "expcap_permission_request.sh"
+    post_tool_use_hook_path = hooks_dir / "expcap_post_tool_use.sh"
 
     runtime_hook = str(_runtime_hook_path())
-    prompt_hook = f"""#!/usr/bin/env bash
+    hook_preamble = f"""#!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="${{CODEX_PROJECT_DIR:-${{PWD}}}}"
+PROJECT_DIR="${{CODEX_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}}"
 export EXPCAP_STORAGE_PROFILE="${{EXPCAP_STORAGE_PROFILE:-user-cache}}"
 export EXPCAP_HOME="${{EXPCAP_HOME:-$HOME/.expcap}}"
 HOOK_SCRIPT="$PROJECT_DIR/scripts/expcap-hook"
@@ -322,23 +403,43 @@ if [[ ! -f "$HOOK_SCRIPT" ]]; then
   HOOK_SCRIPT="{runtime_hook}"
 fi
 
+"""
+    prompt_hook = hook_preamble + """\
 exec python3 "$HOOK_SCRIPT" user-prompt-submit --host codex --workspace "$PROJECT_DIR"
 """
-    stop_hook = f"""#!/usr/bin/env bash
-set -euo pipefail
-
-PROJECT_DIR="${{CODEX_PROJECT_DIR:-${{PWD}}}}"
-export EXPCAP_STORAGE_PROFILE="${{EXPCAP_STORAGE_PROFILE:-user-cache}}"
-export EXPCAP_HOME="${{EXPCAP_HOME:-$HOME/.expcap}}"
-HOOK_SCRIPT="$PROJECT_DIR/scripts/expcap-hook"
-if [[ ! -f "$HOOK_SCRIPT" ]]; then
-  HOOK_SCRIPT="{runtime_hook}"
-fi
-
+    stop_hook = hook_preamble + """\
 exec python3 "$HOOK_SCRIPT" stop --host codex --workspace "$PROJECT_DIR"
+"""
+    session_start_hook = hook_preamble + """\
+exec python3 "$HOOK_SCRIPT" session-start --host codex --workspace "$PROJECT_DIR"
+"""
+    pre_tool_use_hook = hook_preamble + """\
+exec python3 "$HOOK_SCRIPT" pre-tool-use --host codex --workspace "$PROJECT_DIR"
+"""
+    permission_request_hook = hook_preamble + """\
+exec python3 "$HOOK_SCRIPT" permission-request --host codex --workspace "$PROJECT_DIR"
+"""
+    post_tool_use_hook = hook_preamble + """\
+exec python3 "$HOOK_SCRIPT" post-tool-use --host codex --workspace "$PROJECT_DIR"
 """
     created_prompt_hook, updated_prompt_hook = _write_executable_script(prompt_hook_path, prompt_hook)
     created_stop_hook, updated_stop_hook = _write_executable_script(stop_hook_path, stop_hook)
+    created_session_start_hook, updated_session_start_hook = _write_executable_script(
+        session_start_hook_path,
+        session_start_hook,
+    )
+    created_pre_tool_use_hook, updated_pre_tool_use_hook = _write_executable_script(
+        pre_tool_use_hook_path,
+        pre_tool_use_hook,
+    )
+    created_permission_request_hook, updated_permission_request_hook = _write_executable_script(
+        permission_request_hook_path,
+        permission_request_hook,
+    )
+    created_post_tool_use_hook, updated_post_tool_use_hook = _write_executable_script(
+        post_tool_use_hook_path,
+        post_tool_use_hook,
+    )
 
     payload = _codex_hooks_payload(workspace)
     existing = {}
@@ -363,6 +464,14 @@ exec python3 "$HOOK_SCRIPT" stop --host codex --workspace "$PROJECT_DIR"
         "updated_codex_prompt_hook": updated_prompt_hook,
         "created_codex_stop_hook": created_stop_hook,
         "updated_codex_stop_hook": updated_stop_hook,
+        "created_codex_session_start_hook": created_session_start_hook,
+        "updated_codex_session_start_hook": updated_session_start_hook,
+        "created_codex_pre_tool_use_hook": created_pre_tool_use_hook,
+        "updated_codex_pre_tool_use_hook": updated_pre_tool_use_hook,
+        "created_codex_permission_request_hook": created_permission_request_hook,
+        "updated_codex_permission_request_hook": updated_permission_request_hook,
+        "created_codex_post_tool_use_hook": created_post_tool_use_hook,
+        "updated_codex_post_tool_use_hook": updated_post_tool_use_hook,
     }
 
 
@@ -466,6 +575,14 @@ def install_project_agents(
         "updated_codex_prompt_hook": False,
         "created_codex_stop_hook": False,
         "updated_codex_stop_hook": False,
+        "created_codex_session_start_hook": False,
+        "updated_codex_session_start_hook": False,
+        "created_codex_pre_tool_use_hook": False,
+        "updated_codex_pre_tool_use_hook": False,
+        "created_codex_permission_request_hook": False,
+        "updated_codex_permission_request_hook": False,
+        "created_codex_post_tool_use_hook": False,
+        "updated_codex_post_tool_use_hook": False,
     }
     if normalized_mode == INTEGRATION_MODE_CODEX_HOOKS:
         codex_hook_result = _ensure_codex_hook_files(workspace)

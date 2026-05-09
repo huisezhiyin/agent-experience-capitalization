@@ -1,0 +1,74 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/expcap_permission_request.sh\"",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|apply_patch"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/expcap_post_tool_use.sh\"",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|apply_patch"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/expcap_pre_tool_use.sh\"",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|apply_patch"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/expcap_session_start.sh\"",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "startup|resume|clear"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/expcap_stop.sh\"",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/expcap_user_prompt_submit.sh\"",
+            "timeout": 20,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

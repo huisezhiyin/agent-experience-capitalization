@@ -336,6 +336,14 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(activation["pipeline"]["kind"], "experience_rag_activation")
             self.assertEqual(activation["pipeline"]["stages"], ["retrieve", "rerank", "route_injection", "assemble"])
             self.assertIn("injection_plan", activation)
+            self.assertIn("injection_layers", activation["injection_plan"])
+            self.assertIn("layer_counts", activation["injection_plan"])
+            self.assertTrue(
+                any(
+                    item.get("injection_layer") == "task_start_runtime_injection"
+                    for item in activation["selected_assets"]
+                )
+            )
             self.assertTrue(any("最终是否采用由 LLM" in item for item in activation["why_selected"]))
             self.assertTrue(any("注入策略" in item for item in activation["why_selected"]))
             self.assertTrue(any("跨项目经验" in item for item in activation["selection_risks"]))
@@ -409,6 +417,7 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(activation["rendered_context"][0].startswith("[project/preference] 用户偏好："))
             runtime_items = activation["injection_plan"]["channels"]["runtime_context"]["items"]
             self.assertTrue(any(item["asset_id"] == "pattern_preference_001" for item in runtime_items))
+            self.assertEqual(runtime_items[0]["injection_layer"], "task_start_runtime_injection")
             self.assertIn("知识类型 preference 具有当前排序权重", activation["selected_assets"][0]["match_evidence"])
 
     def test_activate_assets_routes_stable_small_priors_to_system_prompt(self) -> None:
@@ -462,9 +471,11 @@ class EngineTests(unittest.TestCase):
             )
 
             self.assertEqual(activation["selected_assets"][0]["injection_channel"], "system_prompt")
+            self.assertEqual(activation["selected_assets"][0]["injection_layer"], "system_prompt_injection")
             system_items = activation["injection_plan"]["channels"]["system_prompt"]["items"]
             self.assertEqual(system_items[0]["asset_id"], "pattern_dont_repeat_001")
-            self.assertIn("减少重复提醒", system_items[0]["policy_reason"])
+            self.assertEqual(system_items[0]["injection_layer"], "system_prompt_injection")
+            self.assertIn("项目级提示词层", system_items[0]["policy_reason"])
 
     def test_activate_assets_routes_explicit_high_priority_prior_to_system_prompt(self) -> None:
         import json
@@ -626,8 +637,10 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(any("[project/codemap] 代码地图：" in item for item in activation["rendered_context"]))
             codemap_item = next(item for item in activation["selected_assets"] if item["knowledge_kind"] == "codemap")
             self.assertEqual(codemap_item["injection_channel"], "reference_summary")
+            self.assertEqual(codemap_item["injection_layer"], "continuous_runtime_recall_injection")
             reference_items = activation["injection_plan"]["channels"]["reference_summary"]["items"]
             self.assertTrue(any(item["asset_id"] == "context_doc_readme_001" for item in reference_items))
+            self.assertEqual(reference_items[0]["injection_layer"], "continuous_runtime_recall_injection")
 
     def test_build_asset_effectiveness_summary_marks_needs_review_for_cold_assets(self) -> None:
         summary = build_asset_effectiveness_summary(

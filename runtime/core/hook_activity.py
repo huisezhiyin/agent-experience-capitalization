@@ -9,7 +9,7 @@ from runtime.storage.fs_store import memory_root_for_workspace, save_json
 
 
 def _now_utc() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def parse_hook_timestamp(value: str | None) -> datetime | None:
@@ -46,7 +46,7 @@ def record_hook_event(workspace: Path, payload: dict[str, Any]) -> Path:
     workspace = workspace.resolve()
     created_at = str(payload.get("created_at") or _now_utc())
     event_name = str(payload.get("event") or "hook-event")
-    timestamp = created_at.replace(":", "").replace("-", "").replace("+00:00", "z")
+    timestamp = created_at.replace(":", "").replace("-", "").replace(".", "").replace("+00:00", "z")
     filename = f"{timestamp}_{_safe_slug(event_name)}.json"
     event_payload = {**payload, "workspace": str(workspace), "created_at": created_at}
     event_path = hook_events_dir(workspace) / filename

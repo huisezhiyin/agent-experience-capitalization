@@ -18,6 +18,22 @@ REFERENCE_SUMMARY = "reference_summary"
 
 INJECTION_CHANNELS = (SYSTEM_PROMPT, RUNTIME_CONTEXT, REFERENCE_SUMMARY)
 
+SYSTEM_PROMPT_INJECTION = "system_prompt_injection"
+TASK_START_RUNTIME_INJECTION = "task_start_runtime_injection"
+CONTINUOUS_RUNTIME_RECALL_INJECTION = "continuous_runtime_recall_injection"
+
+INJECTION_LAYERS = (
+    TASK_START_RUNTIME_INJECTION,
+    SYSTEM_PROMPT_INJECTION,
+    CONTINUOUS_RUNTIME_RECALL_INJECTION,
+)
+
+CHANNEL_TO_LAYER = {
+    SYSTEM_PROMPT: SYSTEM_PROMPT_INJECTION,
+    RUNTIME_CONTEXT: TASK_START_RUNTIME_INJECTION,
+    REFERENCE_SUMMARY: CONTINUOUS_RUNTIME_RECALL_INJECTION,
+}
+
 _SYSTEM_PROMPT_LIMIT = 3
 _RUNTIME_CONTEXT_LIMIT = 5
 _REFERENCE_SUMMARY_LIMIT = 5
@@ -35,18 +51,21 @@ def _asset_content(asset: dict[str, Any], *, limit: int) -> str:
 def _policy_reason(asset: dict[str, Any], channel: str) -> str:
     kind = str(asset.get("knowledge_kind") or asset.get("asset_type") or "pattern")
     if channel == SYSTEM_PROMPT:
-        return f"{kind} 是高优先级且体积较小的长期先验，适合减少重复提醒。"
+        return f"{kind} 是高优先级且体积较小的长期先验，适合沉到项目级提示词层减少重复提醒。"
     if channel == REFERENCE_SUMMARY:
-        return f"{kind} 更适合作为按需参考材料，由 LLM 在当前任务中再分析。"
-    return f"{kind} 与当前任务相关，适合作为运行时上下文注入。"
+        return f"{kind} 更适合作为持续运行时召回材料，在对话出现新信号时由 LLM 再分析。"
+    return f"{kind} 与当前任务相关，适合作为任务开始时的运行时输入增强。"
 
 
 def _plan_item(asset: dict[str, Any], *, channel: str, content_limit: int) -> dict[str, Any]:
+    layer = CHANNEL_TO_LAYER[channel]
     return {
         "asset_id": asset.get("asset_id"),
         "knowledge_scope": asset.get("knowledge_scope", "project"),
         "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
         "asset_type": asset.get("asset_type"),
+        "injection_channel": channel,
+        "injection_layer": layer,
         "title": asset.get("title"),
         "content": _asset_content(asset, limit=content_limit),
         "source_episode_ids": asset.get("source_episode_ids", []),
@@ -115,6 +134,8 @@ def build_injection_plan(
                 "knowledge_scope": "current_task",
                 "knowledge_kind": CONSTRAINT,
                 "asset_type": "constraint",
+                "injection_channel": RUNTIME_CONTEXT,
+                "injection_layer": CHANNEL_TO_LAYER[RUNTIME_CONTEXT],
                 "title": "Current explicit constraints",
                 "content": "；".join(constraints),
                 "source_episode_ids": [],
@@ -126,22 +147,57 @@ def build_injection_plan(
         )
 
     return {
-        "version": "2026-05-08",
-        "policy": "local_prior_injection_v1",
-        "principle": "Save repetition: inject habits, preferences, background, and raw references by stability and size.",
+        "version": "2026-05-09",
+        "policy": "layered_knowledge_injection_v1",
+        "legacy_policy": "local_prior_injection_v1",
+        "principle": "Inject knowledge by timing and carrier: project prompt priors, task-start input augmentation, and continuous runtime recall.",
         "channels": {
             SYSTEM_PROMPT: {
-                "purpose": "Tiny durable priors that should influence every compatible run.",
+                "purpose": "Legacy channel for tiny durable priors that should influence every compatible run.",
+                "injection_layer": CHANNEL_TO_LAYER[SYSTEM_PROMPT],
                 "items": buckets[SYSTEM_PROMPT],
             },
             RUNTIME_CONTEXT: {
-                "purpose": "Task-relevant priors and explicit constraints for the current run.",
+                "purpose": "Legacy channel for task-relevant priors and explicit constraints for the current run.",
+                "injection_layer": CHANNEL_TO_LAYER[RUNTIME_CONTEXT],
                 "items": buckets[RUNTIME_CONTEXT],
             },
             REFERENCE_SUMMARY: {
-                "purpose": "Retrieved codemap/raw/background evidence for LLM re-analysis.",
+                "purpose": "Legacy channel for retrieved codemap/raw/background evidence for LLM re-analysis.",
+                "injection_layer": CHANNEL_TO_LAYER[REFERENCE_SUMMARY],
                 "items": buckets[REFERENCE_SUMMARY],
             },
         },
         "channel_counts": {channel: len(items) for channel, items in buckets.items()},
+        "injection_layers": {
+            TASK_START_RUNTIME_INJECTION: {
+                "purpose": "Task input augmentation at SessionStart, UserPromptSubmit, and auto-start.",
+                "carrier": "runtime_additional_context",
+                "triggers": ["SessionStart", "UserPromptSubmit", "auto-start"],
+                "source_channels": [RUNTIME_CONTEXT],
+                "items": buckets[RUNTIME_CONTEXT],
+            },
+            SYSTEM_PROMPT_INJECTION: {
+                "purpose": "Durable project-level prompt material for AGENTS.md / AGENTS.expcap.md.",
+                "carrier": "project_prompt_files",
+                "triggers": ["install-project", "explicit_prior_review"],
+                "source_channels": [SYSTEM_PROMPT],
+                "items": buckets[SYSTEM_PROMPT],
+            },
+            CONTINUOUS_RUNTIME_RECALL_INJECTION: {
+                "purpose": "Conversation-time recall when new files, errors, phases, or topic drift appear.",
+                "carrier": "progressive_recall_delta_context",
+                "triggers": ["progressive-recall", "manual_recall"],
+                "source_channels": [REFERENCE_SUMMARY],
+                "items": buckets[REFERENCE_SUMMARY],
+            },
+        },
+        "layer_counts": {
+            layer: len(payload["items"])
+            for layer, payload in {
+                TASK_START_RUNTIME_INJECTION: {"items": buckets[RUNTIME_CONTEXT]},
+                SYSTEM_PROMPT_INJECTION: {"items": buckets[SYSTEM_PROMPT]},
+                CONTINUOUS_RUNTIME_RECALL_INJECTION: {"items": buckets[REFERENCE_SUMMARY]},
+            }.items()
+        },
     }

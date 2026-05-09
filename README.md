@@ -276,12 +276,18 @@ and `llm_use_guidance`. Retrieval provides sourced candidates; the coding agent
 is still responsible for deciding whether an asset fits the current task.
 
 Activation views also include an `injection_plan` that separates retrieval from
-injection. Tiny durable priors such as stable preferences, constraints, and
-`dont_repeat` instructions can be routed to `system_prompt`; task-relevant
-lessons and explicit constraints go to `runtime_context`; larger codemap or
-background chunks go to `reference_summary` so the LLM can re-analyze them on
-demand. `system_prompt` remains intentionally sparse: it is for tiny, durable
-project/team/user priors, not for bulk knowledge.
+injection. The injection architecture has three layers:
+
+- `task_start_runtime_injection`: task input augmentation at `SessionStart`,
+  `UserPromptSubmit`, and `auto-start`.
+- `system_prompt_injection`: durable project-level prompt material intended for
+  `AGENTS.md` / `AGENTS.expcap.md`.
+- `continuous_runtime_recall_injection`: event-driven recall during a
+  conversation, primarily through `progressive-recall`.
+
+For compatibility, runtime payloads still expose the legacy `system_prompt`,
+`runtime_context`, and `reference_summary` channel fields; those channels map
+onto the three injection layers above.
 
 Each `auto-start` / `activate` call also materializes the plan as host-friendly
 artifacts under the project memory root:
@@ -327,6 +333,16 @@ export EXPCAP_HOME="$HOME/.expcap"
 
 This keeps runtime data out of the project directory while preserving
 project-owned asset identity.
+
+Knowledge save has four layers:
+
+- `milvus`: semantic retrieval index for finding similar experience.
+- `sqlite`: lightweight state index for candidates, feedback, review queues,
+  activation logs, and metrics.
+- `markdown_files`: human-readable knowledge artifacts such as project prompts,
+  injection snapshots, and docs.
+- `logs`: raw execution evidence such as traces, episodes, hook events, and
+  activation views.
 
 Explicit local profile:
 
@@ -403,7 +419,9 @@ Copy the printed `saved_to` path into a browser, or use the macOS one-liner in
 Quickstart to generate and open it directly.
 
 `benchmark-milvus` pre-syncs the active embedding-profile Milvus index before
-querying, so profile switches do not look like retrieval failures.
+querying, so profile switches do not look like retrieval failures. If the
+Milvus runtime is unavailable, the benchmark reports that state clearly and can
+use a marked state-index fallback for expectation diagnostics.
 
 For codemap/doc recall checks, add expectations:
 

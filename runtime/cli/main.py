@@ -27,7 +27,14 @@ from runtime.core.engine import (
 )
 from runtime.core.hook_activity import load_recent_hook_events
 from runtime.core.injection_materializer import materialize_injection_artifacts
-from runtime.core.injection_policy import INJECTION_CHANNELS
+from runtime.core.injection_policy import (
+    CHANNEL_TO_LAYER,
+    CONTINUOUS_RUNTIME_RECALL_INJECTION,
+    INJECTION_CHANNELS,
+    INJECTION_LAYERS,
+    SYSTEM_PROMPT_INJECTION,
+    TASK_START_RUNTIME_INJECTION,
+)
 from runtime.core.knowledge_kinds import (
     CANONICAL_KNOWLEDGE_KINDS,
     CODEMAP,
@@ -374,10 +381,27 @@ def _activation_injection_channel_counts(activation: dict[str, Any]) -> dict[str
     return counts
 
 
+def _activation_injection_layer_counts(activation: dict[str, Any]) -> dict[str, int]:
+    counts = {layer: 0 for layer in INJECTION_LAYERS}
+    plan_counts = (activation.get("injection_plan") or {}).get("layer_counts")
+    if isinstance(plan_counts, dict):
+        for layer in INJECTION_LAYERS:
+            counts[layer] = int(plan_counts.get(layer, 0) or 0)
+        return counts
+
+    for channel, count in _activation_injection_channel_counts(activation).items():
+        layer = CHANNEL_TO_LAYER.get(channel)
+        if layer:
+            counts[layer] += int(count or 0)
+    return counts
+
+
 def _summarize_injection_policy(activations: list[dict[str, Any]]) -> dict[str, Any]:
     channel_counts = {channel: 0 for channel in INJECTION_CHANNELS}
+    layer_counts = {layer: 0 for layer in INJECTION_LAYERS}
     activations_with_plan = 0
     activations_with_channels = {channel: 0 for channel in INJECTION_CHANNELS}
+    activations_with_layers = {layer: 0 for layer in INJECTION_LAYERS}
     selected_with_channel = 0
     selected_without_channel = 0
 
@@ -391,6 +415,12 @@ def _summarize_injection_policy(activations: list[dict[str, Any]]) -> dict[str, 
             channel_counts[channel] += count
             if count:
                 activations_with_channels[channel] += 1
+        layer_activation_counts = _activation_injection_layer_counts(activation)
+        for layer in INJECTION_LAYERS:
+            count = int(layer_activation_counts.get(layer, 0) or 0)
+            layer_counts[layer] += count
+            if count:
+                activations_with_layers[layer] += 1
         for asset in activation.get("selected_assets", []):
             if asset.get("injection_channel") in INJECTION_CHANNELS:
                 selected_with_channel += 1
@@ -400,16 +430,99 @@ def _summarize_injection_policy(activations: list[dict[str, Any]]) -> dict[str, 
     activation_count = len(activations)
     total_injected_items = sum(channel_counts.values())
     return {
-        "policy": "local_prior_injection_v1",
+        "policy": "layered_knowledge_injection_v1",
+        "legacy_policy": "local_prior_injection_v1",
         "activation_count": activation_count,
         "activations_with_plan": activations_with_plan,
         "plan_coverage_ratio": round(activations_with_plan / activation_count, 4) if activation_count else 0.0,
         "channel_counts": channel_counts,
+        "layer_counts": layer_counts,
         "activations_with_channels": activations_with_channels,
+        "activations_with_layers": activations_with_layers,
         "total_injected_items": total_injected_items,
         "avg_items_per_activation": round(total_injected_items / activation_count, 4) if activation_count else 0.0,
         "selected_with_channel": selected_with_channel,
         "selected_without_channel": selected_without_channel,
+        "layers": {
+            TASK_START_RUNTIME_INJECTION: {
+                "purpose": "任务开始运行时注入：在 SessionStart/UserPromptSubmit/auto-start 时增强任务输入。",
+                "legacy_channels": [channel for channel, layer in CHANNEL_TO_LAYER.items() if layer == TASK_START_RUNTIME_INJECTION],
+            },
+            SYSTEM_PROMPT_INJECTION: {
+                "purpose": "系统提示词注入：沉淀到 AGENTS.md / AGENTS.expcap.md 的项目级稳定先验。",
+                "legacy_channels": [channel for channel, layer in CHANNEL_TO_LAYER.items() if layer == SYSTEM_PROMPT_INJECTION],
+            },
+            CONTINUOUS_RUNTIME_RECALL_INJECTION: {
+                "purpose": "持续运行时召回注入：对话中出现新错误、新文件、新阶段或 topic drift 时按需 progressive-recall。",
+                "legacy_channels": [channel for channel, layer in CHANNEL_TO_LAYER.items() if layer == CONTINUOUS_RUNTIME_RECALL_INJECTION],
+            },
+        },
+    }
+
+
+def _build_knowledge_save_layers(
+    *,
+    workspace: Path,
+    memory_root: Path,
+    db_path: Path,
+    sqlite_backend: dict[str, Any],
+    milvus_backend: dict[str, Any],
+    counts: dict[str, int],
+) -> dict[str, Any]:
+    injection_markdown_count = len(list((memory_root / "injections").glob("*.md")))
+    project_markdown_paths = [
+        path
+        for path in [
+            workspace / "AGENTS.md",
+            workspace / "AGENTS.expcap.md",
+            workspace / "README.md",
+            workspace / "README.zh-CN.md",
+        ]
+        if path.exists()
+    ]
+    docs_markdown_count = len(list((workspace / "docs").glob("*.md"))) if (workspace / "docs").exists() else 0
+    hook_event_count = len(list((memory_root / "hooks").glob("*.json"))) if (memory_root / "hooks").exists() else 0
+    activation_view_count = len(list((memory_root / "views").glob("*.json"))) if (memory_root / "views").exists() else 0
+    local_milvus = milvus_backend.get("local") if isinstance(milvus_backend.get("local"), dict) else {}
+
+    return {
+        "milvus": {
+            "role": "semantic_retrieval_index",
+            "purpose": "语义召回层：根据任务语义查找相似经验资产。",
+            "path": local_milvus.get("db_path") or str(default_milvus_db_path(workspace)),
+            "available": bool(milvus_backend.get("available")),
+            "status": local_milvus.get("status"),
+            "indexed_entities": local_milvus.get("indexed_entities"),
+        },
+        "sqlite": {
+            "role": "lightweight_state_index",
+            "purpose": "状态索引层：保存候选状态、反馈、review queue、activation log 与健康指标。",
+            "path": str(db_path),
+            "available": bool(sqlite_backend.get("available", sqlite_backend.get("db_exists", False))),
+            "asset_rows": sqlite_backend.get("asset_rows", 0),
+            "candidate_rows": sqlite_backend.get("candidate_rows", 0),
+            "activation_log_rows": sqlite_backend.get("activation_log_rows", 0),
+        },
+        "markdown_files": {
+            "role": "human_readable_knowledge_assets",
+            "purpose": "可读知识层：面向人和项目提示词的 MD 资产、注入快照和项目文档。",
+            "project_prompt_paths": [str(path) for path in project_markdown_paths],
+            "injection_markdown_count": injection_markdown_count,
+            "docs_markdown_count": docs_markdown_count,
+            "latest_injection_markdown": str(memory_root / "injections" / "latest.md"),
+        },
+        "logs": {
+            "role": "raw_execution_evidence",
+            "purpose": "原始证据层：trace、episode、hook event、activation view，用于后续 extract/review/promote。",
+            "trace_count": counts.get("traces", 0),
+            "episode_count": counts.get("episodes", 0),
+            "hook_event_count": hook_event_count,
+            "activation_view_count": activation_view_count,
+            "trace_dir": str(memory_root / "traces" / "bundles"),
+            "episode_dir": str(memory_root / "episodes"),
+            "hook_event_dir": str(memory_root / "hooks"),
+            "activation_view_dir": str(memory_root / "views"),
+        },
     }
 
 
@@ -1965,6 +2078,7 @@ def _handle_progressive_recall(args: argparse.Namespace) -> int:
     view["activation_id"] = f"{view['activation_id']}-progressive"
     view["progressive_recall"] = {
         "kind": "event_driven_delta",
+        "injection_layer": CONTINUOUS_RUNTIME_RECALL_INJECTION,
         "trigger_reasons": decision["reasons"],
         "phase": args.phase,
         "cooldown_minutes": args.cooldown_minutes,
@@ -2373,6 +2487,7 @@ def _build_milvus_benchmark_payload(
     ensure_db(db_path)
     bounded_sample_size = max(sample_size, 0)
     bounded_limit = max(limit, 1)
+    milvus_is_available = milvus_available()
     local_sync_report = sync_assets_directory_with_report(
         default_milvus_db_path(workspace),
         memory_root_for_workspace(workspace) / "assets",
@@ -2401,8 +2516,10 @@ def _build_milvus_benchmark_payload(
     expected_kind_top_hit_count = 0
     expected_source_document_hit_count = 0
     expected_source_document_top_hit_count = 0
+    fallback_sample_count = 0
 
     for sample in samples:
+        fallback_used = False
         local_results = search_asset_vectors(
             default_milvus_db_path(workspace),
             query_text=sample["query"],
@@ -2428,6 +2545,16 @@ def _build_milvus_benchmark_payload(
         results = sorted(results, key=lambda item: float(item.get("vector_score", 0.0) or 0.0), reverse=True)[
             :bounded_limit
         ]
+        if not results and not milvus_is_available:
+            results = _state_index_benchmark_fallback_results(
+                db_path=db_path,
+                workspace=workspace,
+                query_text=sample["query"],
+                limit=bounded_limit,
+            )
+            fallback_used = bool(results)
+            if fallback_used:
+                fallback_sample_count += 1
         result_ids = [str(item.get("asset_id")) for item in results if item.get("asset_id")]
         expected_ids = sample["expected_asset_ids"]
         hits = [asset_id for asset_id in expected_ids if asset_id in result_ids]
@@ -2470,6 +2597,7 @@ def _build_milvus_benchmark_payload(
                 "expected_kind_hit_count": len(kind_hits),
                 "expected_source_document_hit_asset_ids": source_document_hits,
                 "expected_source_document_hit_count": len(source_document_hits),
+                "retrieval_fallback": "state-index" if fallback_used else None,
                 "results": [
                     {
                         "asset_id": item.get("asset_id"),
@@ -2491,11 +2619,16 @@ def _build_milvus_benchmark_payload(
     return {
         "workspace": str(workspace),
         "generated_at": now_utc(),
-        "milvus_available": milvus_available(),
+        "milvus_available": milvus_is_available,
         "embedding": embedding_provider_config(),
         "preflight_sync": {
             "local": local_sync_report,
             "shared": shared_sync_report if include_shared else None,
+        },
+        "fallback_retrieval": {
+            "used": fallback_sample_count > 0,
+            "reason": "milvus_unavailable" if not milvus_is_available else None,
+            "sample_count": fallback_sample_count,
         },
         "limit": bounded_limit,
         "sample_size": bounded_sample_size,
@@ -2547,6 +2680,64 @@ def _result_matches_expected_source_document(item: dict[str, Any], expected_sour
         expected in source_document or expected in title or expected in content
         for expected in expected_source_documents
     )
+
+
+def _benchmark_tokens(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9_]+", value.lower()) if len(token) > 1}
+
+
+def _state_index_benchmark_fallback_results(
+    *,
+    db_path: Path,
+    workspace: Path,
+    query_text: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    query_tokens = _benchmark_tokens(query_text)
+    if not query_tokens:
+        return []
+    try:
+        assets = list_assets(db_path, workspace=str(workspace))
+    except sqlite3.Error:
+        return []
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for asset in assets:
+        if asset.get("status", "active") != "active":
+            continue
+        text = " ".join(
+            str(asset.get(key) or "")
+            for key in ("title", "content", "source_document", "knowledge_kind", "asset_type")
+        )
+        overlap = query_tokens & _benchmark_tokens(text)
+        if not overlap:
+            continue
+        score = len(overlap) / len(query_tokens)
+        if str(asset.get("source_document") or "").lower() in query_text.lower():
+            score += 0.1
+        scored.append((score, asset))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "asset_id": asset.get("asset_id"),
+            "title": asset.get("title"),
+            "knowledge_scope": asset.get("knowledge_scope", "project"),
+            "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
+            "asset_type": asset.get("asset_type", "pattern"),
+            "source_document": asset.get("source_document"),
+            "content": asset.get("content", ""),
+            "confidence": asset.get("confidence", 0.0),
+            "milvus_index": "state-index-fallback",
+            "vector_score": score,
+            "embedding": {
+                "provider": "state-index-fallback",
+                "model": "lexical-overlap",
+                "status": "fallback",
+            },
+        }
+        for score, asset in scored[:limit]
+    ]
 
 
 def _handle_benchmark_milvus(args: argparse.Namespace) -> int:
@@ -2788,6 +2979,7 @@ def _build_status_payload(
             "task_query": activation.get("task_query"),
             "selected_count": len(activation.get("selected_assets", [])),
             "injection_channel_counts": _activation_injection_channel_counts(activation),
+            "injection_layer_counts": _activation_injection_layer_counts(activation),
             "help_signal": activation.get("feedback", {}).get("help_signal"),
             "created_at": activation.get("created_at"),
         }
@@ -2830,6 +3022,32 @@ def _build_status_payload(
         and codex_stop_hook_path.exists()
     ) if integration_mode == INTEGRATION_MODE_CODEX_HOOKS else False
     last_hook_event = recent_hook_events[0] if recent_hook_events else None
+    milvus_backend_payload = {
+        "role": "core-semantic-retrieval",
+        "core_retrieval": backend_config["retrieval"] in {"milvus-lite", "milvus"},
+        "available": milvus_available(),
+        "embedding": embedding_provider_config(),
+        "legacy_local_path": str(legacy_milvus_db_path(workspace)),
+        "legacy_local_exists": legacy_milvus_db_path(workspace).exists(),
+        "legacy_shared_path": str(legacy_shared_milvus_db_path()),
+        "legacy_shared_exists": legacy_shared_milvus_db_path().exists(),
+        "local": local_milvus,
+        "shared": shared_milvus,
+        "asset_coverage": {
+            "indexed_entities": milvus_indexed_entities,
+            "asset_rows": len(assets),
+            "coverage_ratio": milvus_asset_coverage,
+            "possible_stale_entities": possible_stale_entities,
+            "deep_check_required": milvus_asset_coverage is None,
+        },
+    }
+    counts_payload = {
+        "traces": len(traces),
+        "episodes": len(episodes),
+        "candidates": len(candidates),
+        "assets": len(assets),
+        "activation_logs": len(activations),
+    }
 
     return {
         "workspace": str(workspace),
@@ -2867,35 +3085,19 @@ def _build_status_payload(
         "runtime_warnings": runtime_warnings,
         "retrieval_backends": {
             "sqlite": sqlite_backend,
-            "milvus": {
-                "role": "core-semantic-retrieval",
-                "core_retrieval": backend_config["retrieval"] in {"milvus-lite", "milvus"},
-                "available": milvus_available(),
-                "embedding": embedding_provider_config(),
-                "legacy_local_path": str(legacy_milvus_db_path(workspace)),
-                "legacy_local_exists": legacy_milvus_db_path(workspace).exists(),
-                "legacy_shared_path": str(legacy_shared_milvus_db_path()),
-                "legacy_shared_exists": legacy_shared_milvus_db_path().exists(),
-                "local": local_milvus,
-                "shared": shared_milvus,
-                "asset_coverage": {
-                    "indexed_entities": milvus_indexed_entities,
-                    "asset_rows": len(assets),
-                    "coverage_ratio": milvus_asset_coverage,
-                    "possible_stale_entities": possible_stale_entities,
-                    "deep_check_required": milvus_asset_coverage is None,
-                },
-            },
+            "milvus": milvus_backend_payload,
         },
+        "knowledge_save_layers": _build_knowledge_save_layers(
+            workspace=workspace,
+            memory_root=memory_root,
+            db_path=db_path,
+            sqlite_backend=sqlite_backend,
+            milvus_backend=milvus_backend_payload,
+            counts=counts_payload,
+        ),
         "milvus_retrieval_effectiveness": milvus_effectiveness,
         "injection_policy_summary": injection_policy_summary,
-        "counts": {
-            "traces": len(traces),
-            "episodes": len(episodes),
-            "candidates": len(candidates),
-            "assets": len(assets),
-            "activation_logs": len(activations),
-        },
+        "counts": counts_payload,
         "activation_feedback_summary": feedback_summary,
         "unresolved_activations": unresolved_activations,
         "asset_effectiveness_summary": {
@@ -3417,6 +3619,7 @@ def _build_dashboard_payload(
         "review_queue": status_payload["candidate_review_queue"],
         "knowledge_kind_summary": status_payload["knowledge_kind_summary"],
         "injection_policy_summary": status_payload["injection_policy_summary"],
+        "knowledge_save_layers": status_payload["knowledge_save_layers"],
         "retrieval": {
             "milvus": status_payload["retrieval_backends"]["milvus"],
             "effectiveness": status_payload["milvus_retrieval_effectiveness"],
@@ -3427,6 +3630,7 @@ def _build_dashboard_payload(
             "activation_feedback_summary": status_payload["activation_feedback_summary"],
             "knowledge_kind_summary": status_payload["knowledge_kind_summary"],
             "injection_policy_summary": status_payload["injection_policy_summary"],
+            "knowledge_save_layers": status_payload["knowledge_save_layers"],
         },
     }
 
@@ -3532,6 +3736,7 @@ def _render_effectiveness_snapshot(payload: dict[str, Any]) -> str:
 def _render_injection_policy_panel(payload: dict[str, Any]) -> str:
     summary = payload["injection_policy_summary"]
     channel_counts = summary.get("channel_counts", {})
+    layer_counts = summary.get("layer_counts", {})
     activations_with_channels = summary.get("activations_with_channels", {})
     rows = [
         [
@@ -3541,12 +3746,22 @@ def _render_injection_policy_panel(payload: dict[str, Any]) -> str:
         ]
         for channel in INJECTION_CHANNELS
     ]
+    layer_rows = [
+        [
+            layer,
+            layer_counts.get(layer, 0),
+            (summary.get("activations_with_layers") or {}).get(layer, 0),
+        ]
+        for layer in INJECTION_LAYERS
+    ]
     return f"""
     <section class="panel">
-      <h2>Injection Channels</h2>
+      <h2>Injection Layers</h2>
       <div class="metric-line"><span>Policy</span><strong>{_safe_text(summary.get("policy"))}</strong></div>
       <div class="metric-line"><span>Plan coverage</span><strong>{_safe_text(f"{float(summary.get('plan_coverage_ratio', 0.0) or 0.0):.0%}")}</strong></div>
       <div class="metric-line"><span>Average injected items</span><strong>{_safe_text(summary.get("avg_items_per_activation"))}</strong></div>
+      {_render_dashboard_table(["Layer", "Items", "Activations"], layer_rows)}
+      <h3>Legacy Injection Channels</h3>
       {_render_dashboard_table(["Channel", "Items", "Activations"], rows)}
     </section>
     """

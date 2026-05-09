@@ -1,0 +1,76 @@
+# AGENTS.expcap.md
+
+本文件由 `expcap install-project` 生成，用于把经验资本化工作流非破坏式接入当前项目。
+
+## 目标
+
+- 不替换原有 `AGENTS.md`
+- 只为当前项目补充经验 `get/save` 规则
+- 让 Codex 在这个项目中默认通过 `expcap` skill 执行经验 `get/save`
+- 默认把运行数据写入 `EXPCAP_HOME` 集中数据中心，而不是项目目录
+
+## 核心定位
+
+`expcap` 不和 Codex / Claude Code 的个人记忆竞争。它专注于项目级、团队级、公司级的工程经验资产：可共享、可审阅、可交割，不绑定某一个人的模型账号。
+
+## 默认行为
+
+### 0. 项目活跃状态
+
+- 当前项目状态：`active`
+- 只要这个项目里真的开了新 chat，默认仍然会执行 `auto-start`
+- `active / inactive` 主要用于统计、审阅和覆盖率口径，不用于阻断新 chat 激活
+- 如果项目暂停维护、只读或已归档，可以标成 `inactive`，这样日报和横向分析时更容易把它和活跃项目区分开
+- 需要切换状态时，可重新执行：
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap install-project --workspace "/Users/wuyue/github_project/agent-experience-capitalization" --project-status active
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap install-project --workspace "/Users/wuyue/github_project/agent-experience-capitalization" --project-status inactive
+```
+
+### 1. 任务开始前默认先做 get
+
+在开始实质性分析、改代码、跑命令之前，优先执行：
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap auto-start --task "<当前任务摘要>" --workspace "/Users/wuyue/github_project/agent-experience-capitalization"
+```
+
+如果命中经验，优先把命中结果作为当前执行策略的一部分。
+
+### 2. 任务收敛后默认尝试做 save
+
+当任务完成一轮收敛，或形成了稳定 lesson / pattern / anti-pattern 后，优先执行：
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap auto-finish --workspace "/Users/wuyue/github_project/agent-experience-capitalization" --task "<当前任务摘要>" ...
+```
+
+如果经验高置信且明显可复用，再继续：
+
+```bash
+EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap promote --candidate "<auto-finish 输出的 candidate path>"
+```
+
+### 3. 作用域策略
+
+- 默认把当前项目内沉淀的经验视为 project-owned 经验
+- 只有经过多个项目验证的稳定经验，才考虑后续晋升为 team-shared 经验
+- 不要把项目局部 workaround 误提升为团队共享经验
+- 默认先激活 `project` 资产，再补充 `cross-project` 资产
+- 项目规范、历史决策、目录约定等，也可以作为 `context / rule` 类型知识沉淀
+
+### 4. 什么时候不要自动 save
+
+- 任务尚未收敛
+- 只是临时 workaround
+- 缺少验证结果
+- 用户明确要求不要记录
+
+## 说明
+
+- `expcap` 是全局 skill + 本地 runtime 能力
+- skill 是推荐入口，CLI 是执行层
+- 当前项目经验默认落在 `EXPCAP_HOME/projects/...`
+- `.agent-memory/` 仅作为显式 `EXPCAP_STORAGE_PROFILE=local` 的兼容目录
+- 正文真源是 JSON 文件，Milvus 是核心语义召回层，SQLite 是轻量状态/日志索引

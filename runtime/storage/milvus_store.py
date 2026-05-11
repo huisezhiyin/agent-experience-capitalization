@@ -19,7 +19,7 @@ from runtime.storage.embeddings import (
     embedding_metadata,
     embedding_provider_config,
 )
-from runtime.storage.fs_store import iter_json_objects
+from runtime.storage.fs_store import iter_json_objects, milvus_runtime_db_path
 
 try:
     import fcntl
@@ -131,29 +131,86 @@ def _milvus_lock_wait_seconds() -> float:
         return 0.25
 
 
-@lru_cache(maxsize=1)
-def milvus_runtime_available() -> bool:
-    if not milvus_available():
-        return False
-    if not hasattr(socket, "AF_UNIX"):
-        return True
+def _milvus_runtime_probe_dirs(db_path: Path | None = None) -> list[Path]:
+    probe_dirs: list[Path] = []
+    runtime_db_path = milvus_runtime_db_path(db_path) if db_path is not None else None
+    for candidate in (
+        runtime_db_path.parent if runtime_db_path is not None else None,
+        Path(tempfile.gettempdir()),
+        Path.cwd(),
+    ):
+        if candidate is None:
+            continue
+        expanded = candidate.expanduser()
+        normalized = expanded if expanded.is_absolute() else (Path.cwd() / expanded)
+        if normalized not in probe_dirs:
+            probe_dirs.append(normalized)
+    return probe_dirs
 
-    probe_path = Path(tempfile.gettempdir()) / f"expcap_milvus_probe_{os.getpid()}.sock"
-    try:
-        if probe_path.exists():
-            probe_path.unlink()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.bind(str(probe_path))
-        return True
-    except Exception:
-        return False
-    finally:
+
+def _milvus_runtime_probe_socket_path(probe_dir: Path) -> Path:
+    return probe_dir / f"m{os.getpid():x}.sock"
+
+
+def milvus_runtime_probe(db_path: Path | None = None) -> dict[str, Any]:
+    if not milvus_available():
+        return {
+            "available": False,
+            "reason": "pymilvus_unavailable",
+            "successful_probe_path": None,
+            "probe_paths": [],
+            "errors": [],
+        }
+    if not hasattr(socket, "AF_UNIX"):
+        return {
+            "available": True,
+            "reason": None,
+            "successful_probe_path": None,
+            "probe_paths": [],
+            "errors": [],
+        }
+
+    errors: list[dict[str, str]] = []
+    for probe_dir in _milvus_runtime_probe_dirs(db_path):
+        probe_path = _milvus_runtime_probe_socket_path(probe_dir)
         try:
-            probe_path.unlink()
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+            probe_dir.mkdir(parents=True, exist_ok=True)
+            if probe_path.exists():
+                probe_path.unlink()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.bind(str(probe_path))
+            return {
+                "available": True,
+                "reason": None,
+                "successful_probe_path": str(probe_path),
+                "probe_paths": [str(path) for path in _milvus_runtime_probe_dirs(db_path)],
+                "errors": errors,
+            }
+        except Exception as error:
+            errors.append(
+                {
+                    "path": str(probe_dir),
+                    "error": _compact_error(error),
+                }
+            )
+        finally:
+            try:
+                probe_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+    return {
+        "available": False,
+        "reason": "unix_socket_bind_unavailable",
+        "successful_probe_path": None,
+        "probe_paths": [str(path) for path in _milvus_runtime_probe_dirs(db_path)],
+        "errors": errors,
+    }
+
+
+def milvus_runtime_available(db_path: Path | None = None) -> bool:
+    return bool(milvus_runtime_probe(db_path).get("available"))
 
 
 def _try_acquire_lock(lock_file: Any) -> bool:
@@ -308,13 +365,21 @@ def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[s
         return _remote_milvus_backend_summary(remote_uri, deep_check=deep_check)
 
     available = milvus_available()
-    runtime_available = milvus_runtime_available() if available else False
+    runtime_probe = milvus_runtime_probe(db_path) if available else {
+        "available": False,
+        "reason": "pymilvus_unavailable",
+        "successful_probe_path": None,
+        "probe_paths": [],
+        "errors": [],
+    }
+    runtime_available = bool(runtime_probe.get("available")) if available else False
     summary = {
         "backend": "milvus-lite",
         "mode": "local",
         "embedding": embedding_provider_config(),
         "available": available,
         "runtime_available": runtime_available,
+        "runtime_probe": runtime_probe,
         "status": "ready"
         if available and runtime_available and db_path.exists()
         else "not_initialized"
@@ -323,9 +388,11 @@ def milvus_backend_summary(db_path: Path, *, deep_check: bool = False) -> dict[s
         if available
         else "unavailable",
         "deep_check": deep_check,
-        "degraded_reason": None if runtime_available or not available else "unix_socket_bind_unavailable",
+        "degraded_reason": None if runtime_available or not available else runtime_probe.get("reason"),
         "last_error": None,
         "db_path": str(db_path),
+        "runtime_db_path": str(milvus_runtime_db_path(db_path)),
+        "runtime_db_aliased": milvus_runtime_db_path(db_path) != db_path,
         "db_exists": db_path.exists(),
         "remote_uri": None,
         "remote_configured": False,
@@ -443,14 +510,15 @@ def _client(db_path: Path) -> Any:
             raise ValueError("EXPCAP_RETRIEVAL_INDEX_URI is required when EXPCAP_RETRIEVAL_BACKEND=milvus")
         return MilvusClient(uri=remote_uri, **_remote_milvus_client_kwargs())
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    return MilvusClient(str(db_path))
+    runtime_db_path = milvus_runtime_db_path(db_path)
+    runtime_db_path.parent.mkdir(parents=True, exist_ok=True)
+    return MilvusClient(str(runtime_db_path))
 
 
 def _safe_client_unlocked(db_path: Path) -> Any | None:
     if not milvus_available():
         return None
-    if not _remote_milvus_requested() and not milvus_runtime_available():
+    if not _remote_milvus_requested() and not milvus_runtime_available(db_path):
         return None
     with warnings.catch_warnings():
         warnings.filterwarnings(

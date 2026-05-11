@@ -57,6 +57,8 @@ from runtime.core.project_policy import (
     load_project_policy,
 )
 from runtime.storage.fs_store import (
+    fallback_memory_root_for_workspace,
+    fallback_db_path,
     default_activation_view_path,
     default_db_path,
     default_milvus_db_path,
@@ -66,6 +68,7 @@ from runtime.storage.fs_store import (
     iter_json_objects,
     load_json,
     memory_root_for_workspace,
+    memory_roots_for_workspace,
     save_json,
     default_shared_asset_path,
     project_storage_key,
@@ -527,9 +530,12 @@ def _build_knowledge_save_layers(
 
 
 def _update_activation_view_file(workspace: Path, activation: dict[str, Any]) -> None:
-    activation_view_path = memory_root_for_workspace(workspace) / "views" / f"{activation['activation_id']}.json"
-    if activation_view_path.exists():
-        save_json(activation_view_path, activation)
+    activation_name = f"{activation['activation_id']}.json"
+    for memory_root in memory_roots_for_workspace(workspace):
+        activation_view_path = memory_root / "views" / activation_name
+        if activation_view_path.exists():
+            save_json(activation_view_path, activation)
+            return
 
 
 def _auto_resolve_stale_activation_feedback(
@@ -581,6 +587,12 @@ def _safe_feedback_cleanup(
     try:
         return _auto_resolve_stale_activation_feedback(workspace=workspace, db_path=db_path), None
     except (OSError, sqlite3.Error) as error:
+        fallback_path = fallback_db_path(workspace)
+        if fallback_path != db_path:
+            try:
+                return _auto_resolve_stale_activation_feedback(workspace=workspace, db_path=fallback_path), None
+            except (OSError, sqlite3.Error):
+                pass
         return None, _sqlite_degraded_warning(db_path=db_path, error=error)
 
 
@@ -591,12 +603,27 @@ def _find_unresolved_activation_for_task(
     task: str,
 ) -> dict[str, Any] | None:
     task_key = " ".join(task.casefold().split())
-    for activation in list_activation_logs(db_path, workspace=str(workspace)):
+    activations = _load_activation_logs_with_fallback(workspace=workspace)
+    for activation in activations:
         if activation.get("feedback", {}).get("help_signal"):
             continue
         activation_task_key = " ".join(str(activation.get("task_query") or "").casefold().split())
         if activation_task_key == task_key:
             return activation
+    for memory_root in memory_roots_for_workspace(workspace):
+        views_dir = memory_root / "views"
+        if not views_dir.exists():
+            continue
+        for activation in sorted(
+            iter_json_objects(views_dir),
+            key=lambda item: item.get("created_at") or "",
+            reverse=True,
+        ):
+            if activation.get("feedback", {}).get("help_signal"):
+                continue
+            activation_task_key = " ".join(str(activation.get("task_query") or "").casefold().split())
+            if activation_task_key == task_key:
+                return activation
     return None
 
 
@@ -984,6 +1011,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Filter queue by kind; also used as an override when --action promote is selected.",
     )
     review_candidates.add_argument("--output", help="Optional output path for the review queue JSON.")
+
+    validation_plan = subparsers.add_parser(
+        "validation-plan",
+        help="Build a focused validation plan from the top unproven asset queue.",
+    )
+    validation_plan.add_argument("--workspace", required=True, help="Workspace path for the validation plan.")
+    validation_plan.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="How many top unproven assets to include. Defaults to 5.",
+    )
+    validation_plan.add_argument("--output", help="Optional output path for the validation plan JSON.")
 
     save_prior = subparsers.add_parser(
         "save-prior",
@@ -1440,11 +1480,15 @@ def _prune_existing_doc_assets(*, workspace: Path, memory_root: Path, db_path: P
     if pruned_asset_ids:
         ensure_db(db_path)
         placeholders = ", ".join("?" for _ in pruned_asset_ids)
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                f"DELETE FROM assets WHERE workspace = ? AND asset_id IN ({placeholders})",
-                (str(workspace), *pruned_asset_ids),
-            )
+        conn = sqlite3.connect(db_path)
+        try:
+            with conn:
+                conn.execute(
+                    f"DELETE FROM assets WHERE workspace = ? AND asset_id IN ({placeholders})",
+                    (str(workspace), *pruned_asset_ids),
+                )
+        finally:
+            conn.close()
     return len(pruned_asset_ids)
 
 
@@ -1517,16 +1561,21 @@ def _handle_ingest_docs(args: argparse.Namespace) -> int:
 
 
 def _fallback_activation_view_path(workspace: Path, view: dict[str, Any]) -> Path:
-    return (
-        Path(tempfile.gettempdir())
-        / "expcap-activation-views"
-        / project_storage_key(workspace)
-        / f"{view['activation_id']}.json"
-    )
+    requested_path = default_activation_view_path(workspace, view)
+    return _fallback_memory_output_path(workspace, requested_path)
 
 
 def _fallback_review_output_path(workspace: Path, requested_path: Path) -> Path:
     return Path(tempfile.gettempdir()) / "expcap-reviews" / project_storage_key(workspace) / requested_path.name
+
+
+def _fallback_memory_output_path(workspace: Path, requested_path: Path) -> Path:
+    memory_root = memory_root_for_workspace(workspace)
+    try:
+        relative_path = requested_path.relative_to(memory_root)
+    except ValueError:
+        return fallback_memory_root_for_workspace(workspace) / requested_path.name
+    return fallback_memory_root_for_workspace(workspace) / relative_path
 
 
 def _fallback_warning(
@@ -1538,11 +1587,38 @@ def _fallback_warning(
 ) -> dict[str, str]:
     return {
         "kind": "fallback_output",
+        "severity": "warn",
+        "category": "storage_write",
+        "runtime_state": "fallback_active",
         "reason": reason,
         "requested_path": str(requested_path),
         "fallback_path": str(fallback_path),
         "error": str(error),
     }
+
+
+def _save_workspace_json(
+    *,
+    workspace: Path,
+    output_path: Path,
+    payload: dict[str, Any],
+    requested_output: str | None,
+    reason: str,
+) -> tuple[Path, dict[str, str] | None]:
+    try:
+        save_json(output_path, payload)
+        return output_path, None
+    except OSError as error:
+        if requested_output:
+            raise
+        fallback_path = _fallback_memory_output_path(workspace, output_path)
+        save_json(fallback_path, payload)
+        return fallback_path, _fallback_warning(
+            reason=reason,
+            requested_path=output_path,
+            fallback_path=fallback_path,
+            error=error,
+        )
 
 
 def _save_activation_view(
@@ -1577,6 +1653,10 @@ def _safe_materialize_injection_artifacts(
         return materialize_injection_artifacts(workspace=workspace, activation=view), None
     except OSError as error:
         return {}, {
+            "kind": "fallback_output",
+            "severity": "warn",
+            "category": "artifact_write",
+            "runtime_state": "degraded_primary",
             "reason": "injection_artifact_unwritable",
             "error": str(error),
         }
@@ -1606,31 +1686,129 @@ def _save_review_json(
         )
 
 
+def _upsert_warning(*, kind: str, path: Path, error: BaseException) -> dict[str, str]:
+    return {
+        "kind": kind,
+        "severity": "warn",
+        "category": "state_index",
+        "runtime_state": "degraded_primary",
+        "reason": "sqlite_index_unavailable",
+        "db_path": str(path),
+        "fallback": "filesystem_json",
+        "error": str(error),
+    }
+
+
+def _safe_sqlite_write(
+    *,
+    db_path: Path,
+    kind: str,
+    action: Any,
+) -> dict[str, str] | None:
+    try:
+        action()
+    except (OSError, sqlite3.Error) as error:
+        return _upsert_warning(kind=kind, path=db_path, error=error)
+    return None
+
+
+def _workspace_db_paths(workspace: Path) -> tuple[Path, ...]:
+    primary_path = default_db_path(workspace)
+    fallback_path = fallback_db_path(workspace)
+    if fallback_path == primary_path:
+        return (primary_path,)
+    return (primary_path, fallback_path)
+
+
+def _load_activation_logs_with_fallback(
+    *,
+    workspace: Path,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    activations_by_id: dict[str, dict[str, Any]] = {}
+    for db_path in _workspace_db_paths(workspace):
+        try:
+            activations = list_activation_logs(db_path, workspace=str(workspace), limit=limit)
+        except (OSError, sqlite3.Error):
+            continue
+        for activation in activations:
+            activation_id = str(activation.get("activation_id") or "")
+            if activation_id and activation_id not in activations_by_id:
+                activations_by_id[activation_id] = activation
+    return sorted(activations_by_id.values(), key=lambda item: item.get("created_at") or "", reverse=True)[:limit]
+
+
+def _find_latest_activation_with_fallback(
+    *,
+    workspace: Path,
+    unresolved_only: bool = False,
+) -> dict[str, Any] | None:
+    for db_path in _workspace_db_paths(workspace):
+        try:
+            activation = find_latest_activation(
+                db_path,
+                workspace=str(workspace),
+                unresolved_only=unresolved_only,
+            )
+        except (OSError, sqlite3.Error):
+            activation = None
+        if activation:
+            return activation
+    activations = _load_activation_logs_with_fallback(workspace=workspace, limit=20)
+    for activation in activations:
+        if unresolved_only and activation.get("feedback", {}).get("help_signal"):
+            continue
+        return activation
+    return None
+
+
+def _record_activation_usage_with_fallback(
+    *,
+    workspace: Path,
+    view: dict[str, Any],
+) -> tuple[dict[str, str] | None, Path | None]:
+    primary_db_path = default_db_path(workspace)
+    fallback_db = fallback_db_path(workspace)
+    last_error: BaseException | None = None
+    for db_path in _workspace_db_paths(workspace):
+        try:
+            ensure_db(db_path)
+            log_activation(db_path, view)
+            touch_assets_last_used(
+                db_path,
+                [item["asset_id"] for item in view.get("selected_assets", [])],
+                view["created_at"],
+            )
+            return None, db_path
+        except (OSError, sqlite3.Error) as error:
+            last_error = error
+    return {
+        "kind": "activation_log_unwritable",
+        "severity": "error",
+        "category": "state_index",
+        "runtime_state": "hard_failure",
+        "reason": "sqlite_activation_log_unwritable",
+        "db_path": str(fallback_db if fallback_db != primary_db_path else primary_db_path),
+        "error": str(last_error or "unknown sqlite write error"),
+    }, None
+
+
 def _record_activation_usage(
     *,
+    workspace: Path,
     db_path: Path,
     view: dict[str, Any],
 ) -> dict[str, str] | None:
-    try:
-        log_activation(db_path, view)
-        touch_assets_last_used(
-            db_path,
-            [item["asset_id"] for item in view.get("selected_assets", [])],
-            view["created_at"],
-        )
-    except (OSError, sqlite3.Error) as error:
-        return {
-            "kind": "activation_log_unwritable",
-            "reason": "sqlite_activation_log_unwritable",
-            "db_path": str(db_path),
-            "error": str(error),
-        }
-    return None
+    warning, _ = _record_activation_usage_with_fallback(workspace=workspace, view=view)
+    return warning
 
 
 def _sqlite_degraded_warning(*, db_path: Path, error: BaseException) -> dict[str, str]:
     return {
         "kind": "storage_degraded",
+        "severity": "warn",
+        "category": "state_index",
+        "runtime_state": "degraded_primary",
         "reason": "sqlite_index_unavailable",
         "db_path": str(db_path),
         "fallback": "filesystem_json",
@@ -1638,26 +1816,68 @@ def _sqlite_degraded_warning(*, db_path: Path, error: BaseException) -> dict[str
     }
 
 
+def _milvus_probe_warning(*, backend_name: str, backend_summary: dict[str, Any]) -> dict[str, Any] | None:
+    runtime_probe = backend_summary.get("runtime_probe") or {}
+    errors = runtime_probe.get("errors") or []
+    if not runtime_probe.get("available") or not errors:
+        return None
+    return {
+        "kind": "runtime_degraded",
+        "severity": "warn",
+        "category": "retrieval_runtime",
+        "runtime_state": "degraded_primary",
+        "reason": "milvus_runtime_probe_fallback",
+        "backend": backend_name,
+        "status": backend_summary.get("status"),
+        "db_path": backend_summary.get("db_path"),
+        "successful_probe_path": runtime_probe.get("successful_probe_path"),
+        "probe_paths": runtime_probe.get("probe_paths") or [],
+        "errors": errors,
+    }
+
+
 def _filesystem_status_records(
     *,
-    memory_root: Path,
+    workspace: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    assets = [
-        asset
-        for asset in iter_json_objects(memory_root / "assets")
-        if asset.get("status", "active") == "active"
-    ]
-    candidates = [
-        candidate
-        for candidate in iter_json_objects(memory_root / "candidates")
-        if candidate.get("status", "new") in ALL_CANDIDATE_STATUSES
-    ]
-    activations = sorted(
-        list(iter_json_objects(memory_root / "views")),
-        key=lambda item: item.get("created_at") or "",
-        reverse=True,
-    )
+    assets_by_id: dict[str, dict[str, Any]] = {}
+    candidates_by_id: dict[str, dict[str, Any]] = {}
+    activations_by_id: dict[str, dict[str, Any]] = {}
+    for memory_root in memory_roots_for_workspace(workspace):
+        for asset in iter_json_objects(memory_root / "assets"):
+            if asset.get("status", "active") != "active":
+                continue
+            asset_id = str(asset.get("asset_id") or "")
+            if asset_id:
+                assets_by_id[asset_id] = asset
+        for candidate in iter_json_objects(memory_root / "candidates"):
+            if candidate.get("status", "new") not in ALL_CANDIDATE_STATUSES:
+                continue
+            candidate_id = str(candidate.get("candidate_id") or "")
+            if candidate_id:
+                candidates_by_id[candidate_id] = candidate
+        for activation in iter_json_objects(memory_root / "views"):
+            activation_id = str(activation.get("activation_id") or "")
+            if activation_id:
+                activations_by_id[activation_id] = activation
+    assets = list(assets_by_id.values())
+    candidates = list(candidates_by_id.values())
+    activations = sorted(activations_by_id.values(), key=lambda item: item.get("created_at") or "", reverse=True)
     return assets, candidates, activations
+
+
+def _merge_records_by_key(
+    records: list[dict[str, Any]],
+    fallback_records: list[dict[str, Any]],
+    *,
+    key: str,
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for record in [*records, *fallback_records]:
+        record_key = str(record.get(key) or "")
+        if record_key:
+            merged[record_key] = record
+    return list(merged.values())
 
 
 def _load_status_records(
@@ -1665,7 +1885,8 @@ def _load_status_records(
     workspace: Path,
     db_path: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, str]]]:
-    memory_root = memory_root_for_workspace(workspace)
+    primary_db_path = db_path
+    fallback_db = fallback_db_path(workspace)
     try:
         ensure_db(db_path)
         assets = list_assets(db_path, workspace=str(workspace))
@@ -1681,6 +1902,11 @@ def _load_status_records(
             "core_retrieval": False,
             "available": True,
             "degraded": False,
+            "source_mode": "primary_sqlite",
+            "active_db_path": str(primary_db_path),
+            "primary_db_path": str(primary_db_path),
+            "fallback_db_path": str(fallback_db),
+            "fallback_in_use": False,
             "db_path": str(db_path),
             "db_exists": db_path.exists(),
             "asset_rows": len(assets),
@@ -1689,8 +1915,48 @@ def _load_status_records(
         }
         return assets, candidates, activations, sqlite_backend, []
     except (OSError, sqlite3.Error) as error:
-        assets, candidates, activations = _filesystem_status_records(memory_root=memory_root)
+        fs_assets, fs_candidates, fs_activations = _filesystem_status_records(workspace=workspace)
         warning = _sqlite_degraded_warning(db_path=db_path, error=error)
+        if fallback_db != primary_db_path:
+            try:
+                ensure_db(fallback_db)
+                fallback_assets = list_assets(fallback_db, workspace=str(workspace))
+                fallback_candidates = list_candidates(
+                    fallback_db,
+                    workspace=str(workspace),
+                    statuses=ALL_CANDIDATE_STATUSES,
+                )
+                fallback_activations = list_activation_logs(fallback_db, workspace=str(workspace))
+                assets = _merge_records_by_key(fallback_assets, fs_assets, key="asset_id")
+                candidates = _merge_records_by_key(fallback_candidates, fs_candidates, key="candidate_id")
+                activations = sorted(
+                    _merge_records_by_key(fallback_activations, fs_activations, key="activation_id"),
+                    key=lambda item: item.get("created_at") or "",
+                    reverse=True,
+                )
+                sqlite_backend = {
+                    "backend": "sqlite",
+                    "role": "lightweight-state-index",
+                    "core_retrieval": False,
+                    "available": True,
+                    "degraded": True,
+                    "degraded_reason": warning["reason"],
+                    "fallback": "fallback_sqlite",
+                    "source_mode": "fallback_sqlite",
+                    "active_db_path": str(fallback_db),
+                    "primary_db_path": str(primary_db_path),
+                    "fallback_db_path": str(fallback_db),
+                    "fallback_in_use": True,
+                    "db_path": str(fallback_db),
+                    "db_exists": fallback_db.exists(),
+                    "asset_rows": len(assets),
+                    "candidate_rows": len(candidates),
+                    "activation_log_rows": len(activations),
+                }
+                return assets, candidates, activations, sqlite_backend, [warning]
+            except (OSError, sqlite3.Error):
+                pass
+        assets, candidates, activations = fs_assets, fs_candidates, fs_activations
         sqlite_backend = {
             "backend": "sqlite",
             "role": "lightweight-state-index",
@@ -1699,6 +1965,11 @@ def _load_status_records(
             "degraded": True,
             "degraded_reason": warning["reason"],
             "fallback": warning["fallback"],
+            "source_mode": "filesystem_json",
+            "active_db_path": None,
+            "primary_db_path": str(primary_db_path),
+            "fallback_db_path": str(fallback_db),
+            "fallback_in_use": False,
             "db_path": str(db_path),
             "db_exists": db_path.exists(),
             "asset_rows": len(assets),
@@ -1717,6 +1988,18 @@ def _activation_source_dirs(
     memory_root = memory_root_for_workspace(workspace)
     resolved_assets_dir = Path(assets_dir) if assets_dir else memory_root / "assets"
     resolved_candidates_dir = Path(candidates_dir) if candidates_dir else memory_root / "candidates"
+    if not assets_dir and not resolved_assets_dir.exists():
+        try:
+            resolved_assets_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            resolved_assets_dir = fallback_memory_root_for_workspace(workspace) / "assets"
+            resolved_assets_dir.mkdir(parents=True, exist_ok=True)
+    if not candidates_dir and not resolved_candidates_dir.exists():
+        try:
+            resolved_candidates_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            resolved_candidates_dir = fallback_memory_root_for_workspace(workspace) / "candidates"
+            resolved_candidates_dir.mkdir(parents=True, exist_ok=True)
     return resolved_assets_dir, resolved_candidates_dir
 
 
@@ -1736,19 +2019,49 @@ def _apply_activation_feedback(
     activation_id: str,
     feedback: dict[str, Any],
 ) -> dict[str, Any] | None:
-    updated_activation = record_activation_feedback(
-        db_path,
-        activation_id=activation_id,
-        feedback=feedback,
-    )
+    updated_activation = None
+    for candidate_db_path in _workspace_db_paths(workspace):
+        try:
+            updated_activation = record_activation_feedback(
+                candidate_db_path,
+                activation_id=activation_id,
+                feedback=feedback,
+            )
+        except (OSError, sqlite3.Error):
+            updated_activation = None
+        if updated_activation:
+            break
+    if not updated_activation:
+        unresolved_activation = _find_unresolved_activation_for_task(
+            db_path=db_path,
+            workspace=workspace,
+            task=str(feedback.get("task_query") or ""),
+        ) if feedback.get("task_query") else None
+        if unresolved_activation and unresolved_activation.get("activation_id") == activation_id:
+            updated_activation = dict(unresolved_activation)
+            updated_activation["feedback"] = feedback
+        else:
+            for memory_root in memory_roots_for_workspace(workspace):
+                activation_view_path = memory_root / "views" / f"{activation_id}.json"
+                if activation_view_path.exists():
+                    updated_activation = load_json(activation_view_path)
+                    updated_activation["feedback"] = feedback
+                    break
     if not updated_activation:
         return None
     _update_activation_view_file(workspace, updated_activation)
     linked_asset_ids = _linked_asset_ids_from_activation(updated_activation)
-    feedback_stats = summarize_asset_feedback(
-        db_path,
-        asset_ids=linked_asset_ids,
-    )
+    feedback_stats = {}
+    for candidate_db_path in _workspace_db_paths(workspace):
+        try:
+            feedback_stats = summarize_asset_feedback(
+                candidate_db_path,
+                asset_ids=linked_asset_ids,
+            )
+        except (OSError, sqlite3.Error):
+            feedback_stats = {}
+        if feedback_stats:
+            break
     memory_root = memory_root_for_workspace(workspace)
     for selected_asset in updated_activation.get("selected_assets", []):
         asset_id = selected_asset.get("asset_id")
@@ -1756,7 +2069,6 @@ def _apply_activation_feedback(
             continue
         selected_scope = selected_asset.get("knowledge_scope", "project")
         asset_db_path = shared_db_path() if selected_scope == "cross-project" else db_path
-        asset = get_asset(asset_db_path, asset_id=asset_id)
         asset_path = (
             default_shared_asset_path(
                 {
@@ -1767,6 +2079,10 @@ def _apply_activation_feedback(
             if selected_scope == "cross-project"
             else memory_root / "assets" / f"{selected_asset['asset_type']}s" / f"{asset_id}.json"
         )
+        try:
+            asset = get_asset(asset_db_path, asset_id=asset_id)
+        except (OSError, sqlite3.Error):
+            asset = None
         if not asset and asset_path.exists():
             asset = load_json(asset_path)
         if not asset:
@@ -1776,7 +2092,11 @@ def _apply_activation_feedback(
             feedback_stats.get(asset_id, {}),
             updated_at=feedback.get("feedback_at"),
         )
-        upsert_asset(asset_db_path, asset)
+        _safe_sqlite_write(
+            db_path=asset_db_path,
+            kind="asset_effectiveness_unwritten",
+            action=lambda asset_db_path=asset_db_path, asset=asset: upsert_asset(asset_db_path, asset),
+        )
         save_json(asset_path, asset)
     return {
         "activation_id": updated_activation["activation_id"],
@@ -1790,7 +2110,11 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     project_activity = load_project_policy(workspace)
     db_path = default_db_path(workspace)
-    ensure_db(db_path)
+    bootstrap_warning = _safe_sqlite_write(
+        db_path=db_path,
+        kind="sqlite_bootstrap_unwritable",
+        action=lambda: ensure_db(db_path),
+    )
     feedback_cleanup, feedback_cleanup_warning = _safe_feedback_cleanup(
         workspace=workspace,
         db_path=db_path,
@@ -1823,7 +2147,7 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
     if injection_artifacts:
         view["injection_artifacts"] = injection_artifacts
     save_json(output_path, view)
-    log_warning = _record_activation_usage(db_path=db_path, view=view)
+    log_warning = _record_activation_usage(workspace=workspace, db_path=db_path, view=view)
     payload = {
         "saved_to": str(output_path),
         "injection_artifacts": injection_artifacts,
@@ -1841,6 +2165,8 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
         payload["injection_artifact_warning"] = injection_artifact_warning
     if feedback_cleanup_warning:
         payload["feedback_cleanup_warning"] = feedback_cleanup_warning
+    if bootstrap_warning:
+        payload["sqlite_warning"] = bootstrap_warning
     _print_json(payload)
     return 0
 
@@ -2018,10 +2344,13 @@ def _progressive_delta_retrieval_summary(
 def _handle_progressive_recall(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
-    ensure_db(db_path)
-    recent_activations = list_activation_logs(
-        db_path,
-        workspace=str(workspace),
+    _safe_sqlite_write(
+        db_path=db_path,
+        kind="sqlite_bootstrap_unwritable",
+        action=lambda: ensure_db(db_path),
+    )
+    recent_activations = _load_activation_logs_with_fallback(
+        workspace=workspace,
         limit=max(args.lookback, 1),
     )
     decision = _progressive_trigger_decision(
@@ -2098,7 +2427,7 @@ def _handle_progressive_recall(args: argparse.Namespace) -> int:
         view=view,
         requested_output=args.output,
     )
-    log_warning = _record_activation_usage(db_path=db_path, view=view)
+    log_warning = _record_activation_usage(workspace=workspace, db_path=db_path, view=view)
     payload = {
         "triggered": True,
         "saved_to": str(output_path),
@@ -2119,22 +2448,25 @@ def _handle_progressive_recall(args: argparse.Namespace) -> int:
 def _handle_feedback(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
-    ensure_db(db_path)
+    _safe_sqlite_write(
+        db_path=db_path,
+        kind="sqlite_bootstrap_unwritable",
+        action=lambda: ensure_db(db_path),
+    )
     activation = None
     activation_id = args.activation_id
     if activation_id:
         activation = next(
             (
                 item
-                for item in list_activation_logs(db_path, workspace=str(workspace))
+                for item in _load_activation_logs_with_fallback(workspace=workspace)
                 if item.get("activation_id") == activation_id
             ),
             None,
         )
     else:
-        activation = find_latest_activation(
-            db_path,
-            workspace=str(workspace),
+        activation = _find_latest_activation_with_fallback(
+            workspace=workspace,
             unresolved_only=True,
         )
         activation_id = activation.get("activation_id") if activation else None
@@ -2200,7 +2532,16 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     memory_root = memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
-    ensure_db(db_path)
+    sqlite_warnings: list[dict[str, str]] = []
+    write_warnings: list[dict[str, str]] = []
+    vector_warnings: list[dict[str, str]] = []
+    bootstrap_warning = _safe_sqlite_write(
+        db_path=db_path,
+        kind="sqlite_bootstrap_unwritable",
+        action=lambda: ensure_db(db_path),
+    )
+    if bootstrap_warning:
+        sqlite_warnings.append(bootstrap_warning)
     feedback_cleanup, feedback_cleanup_warning = _safe_feedback_cleanup(
         workspace=workspace,
         db_path=db_path,
@@ -2230,13 +2571,41 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
         trace_id=args.trace_id,
     )
     trace_path = default_trace_bundle_path(workspace, trace)
-    save_json(trace_path, trace)
-    upsert_trace(db_path, trace)
+    trace_path, trace_save_warning = _save_workspace_json(
+        workspace=workspace,
+        output_path=trace_path,
+        payload=trace,
+        requested_output=None,
+        reason="default_trace_output_unwritable",
+    )
+    if trace_save_warning:
+        write_warnings.append(trace_save_warning)
+    trace_upsert_warning = _safe_sqlite_write(
+        db_path=db_path,
+        kind="trace_index_unwritten",
+        action=lambda: upsert_trace(db_path, trace),
+    )
+    if trace_upsert_warning:
+        sqlite_warnings.append(trace_upsert_warning)
 
     episode = review_trace_bundle(trace)
     episode_path = memory_root / "episodes" / f"{episode['episode_id']}.json"
-    save_json(episode_path, episode)
-    upsert_episode(db_path, episode)
+    episode_path, episode_save_warning = _save_workspace_json(
+        workspace=workspace,
+        output_path=episode_path,
+        payload=episode,
+        requested_output=None,
+        reason="default_episode_output_unwritable",
+    )
+    if episode_save_warning:
+        write_warnings.append(episode_save_warning)
+    episode_upsert_warning = _safe_sqlite_write(
+        db_path=db_path,
+        kind="episode_index_unwritten",
+        action=lambda: upsert_episode(db_path, episode),
+    )
+    if episode_upsert_warning:
+        sqlite_warnings.append(episode_upsert_warning)
 
     activation_feedback = None
     target_activation = _find_unresolved_activation_for_task(
@@ -2275,8 +2644,22 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             activation_feedback=activation_feedback,
         )
         candidate_path = memory_root / "candidates" / f"{candidate['candidate_id']}.json"
-        save_json(candidate_path, candidate)
-        upsert_candidate(db_path, candidate)
+        candidate_path, candidate_save_warning = _save_workspace_json(
+            workspace=workspace,
+            output_path=candidate_path,
+            payload=candidate,
+            requested_output=None,
+            reason="default_candidate_output_unwritable",
+        )
+        if candidate_save_warning:
+            write_warnings.append(candidate_save_warning)
+        candidate_upsert_warning = _safe_sqlite_write(
+            db_path=db_path,
+            kind="candidate_index_unwritten",
+            action=lambda candidate=candidate: upsert_candidate(db_path, candidate),
+        )
+        if candidate_upsert_warning:
+            sqlite_warnings.append(candidate_upsert_warning)
 
         if not args.no_promote and should_promote_candidate(
             candidate,
@@ -2285,8 +2668,22 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             min_score=args.promote_threshold,
         ):
             candidate["status"] = "promoted"
-            save_json(candidate_path, candidate)
-            upsert_candidate(db_path, candidate)
+            candidate_path, candidate_promote_save_warning = _save_workspace_json(
+                workspace=workspace,
+                output_path=candidate_path,
+                payload=candidate,
+                requested_output=None,
+                reason="default_candidate_output_unwritable",
+            )
+            if candidate_promote_save_warning:
+                write_warnings.append(candidate_promote_save_warning)
+            candidate_promote_warning = _safe_sqlite_write(
+                db_path=db_path,
+                kind="candidate_index_unwritten",
+                action=lambda candidate=candidate: upsert_candidate(db_path, candidate),
+            )
+            if candidate_promote_warning:
+                sqlite_warnings.append(candidate_promote_warning)
             asset = promote_candidate(
                 candidate,
                 knowledge_scope=args.knowledge_scope,
@@ -2297,17 +2694,64 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
                 if args.knowledge_scope == "cross-project"
                 else memory_root / "assets" / f"{asset['asset_type']}s" / f"{asset['asset_id']}.json"
             )
-            save_json(asset_path, asset)
+            asset_path, asset_save_warning = _save_workspace_json(
+                workspace=workspace,
+                output_path=asset_path,
+                payload=asset,
+                requested_output=None,
+                reason="default_asset_output_unwritable",
+            )
+            if asset_save_warning:
+                write_warnings.append(asset_save_warning)
             asset_db_path = shared_db_path() if args.knowledge_scope == "cross-project" else db_path
-            ensure_db(asset_db_path)
-            upsert_asset(asset_db_path, asset)
+            asset_bootstrap_warning = _safe_sqlite_write(
+                db_path=asset_db_path,
+                kind="sqlite_bootstrap_unwritable",
+                action=lambda asset_db_path=asset_db_path: ensure_db(asset_db_path),
+            )
+            if asset_bootstrap_warning:
+                sqlite_warnings.append(asset_bootstrap_warning)
+            asset_upsert_warning = _safe_sqlite_write(
+                db_path=asset_db_path,
+                kind="asset_index_unwritten",
+                action=lambda asset_db_path=asset_db_path, asset=asset: upsert_asset(asset_db_path, asset),
+            )
+            if asset_upsert_warning:
+                sqlite_warnings.append(asset_upsert_warning)
             asset_milvus_db = shared_milvus_db_path() if args.knowledge_scope == "cross-project" else default_milvus_db_path(workspace)
-            upsert_asset_vector(asset_milvus_db, asset)
+            try:
+                upsert_asset_vector(asset_milvus_db, asset)
+            except (OSError, sqlite3.Error) as error:
+                vector_warnings.append(
+                    {
+                        "kind": "vector_index_unwritten",
+                        "severity": "warn",
+                        "category": "retrieval_index",
+                        "runtime_state": "degraded_primary",
+                        "reason": "milvus_unavailable",
+                        "db_path": str(asset_milvus_db),
+                        "error": str(error),
+                    }
+                )
             promoted_assets.append({"asset_id": asset["asset_id"], "path": str(asset_path)})
         elif candidate.get("promotion_readiness") in {"boosted", "encouraging"}:
             candidate["status"] = "needs_review"
-            save_json(candidate_path, candidate)
-            upsert_candidate(db_path, candidate)
+            candidate_path, candidate_review_save_warning = _save_workspace_json(
+                workspace=workspace,
+                output_path=candidate_path,
+                payload=candidate,
+                requested_output=None,
+                reason="default_candidate_output_unwritable",
+            )
+            if candidate_review_save_warning:
+                write_warnings.append(candidate_review_save_warning)
+            candidate_review_warning = _safe_sqlite_write(
+                db_path=db_path,
+                kind="candidate_index_unwritten",
+                action=lambda candidate=candidate: upsert_candidate(db_path, candidate),
+            )
+            if candidate_review_warning:
+                sqlite_warnings.append(candidate_review_warning)
 
         saved_candidates.append(
             {
@@ -2317,19 +2761,24 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             }
         )
 
-    _print_json(
-        {
-            "trace": {"trace_id": trace["trace_id"], "path": str(trace_path)},
-            "episode": {"episode_id": episode["episode_id"], "path": str(episode_path)},
-            "candidates": saved_candidates,
-            "promoted_assets": promoted_assets,
-            "activation_feedback": activation_feedback,
-            "feedback_cleanup": feedback_cleanup,
-            "auto_promote_enabled": not args.no_promote,
-            "promote_threshold": args.promote_threshold,
-            "feedback_cleanup_warning": feedback_cleanup_warning,
-        }
-    )
+    payload = {
+        "trace": {"trace_id": trace["trace_id"], "path": str(trace_path)},
+        "episode": {"episode_id": episode["episode_id"], "path": str(episode_path)},
+        "candidates": saved_candidates,
+        "promoted_assets": promoted_assets,
+        "activation_feedback": activation_feedback,
+        "feedback_cleanup": feedback_cleanup,
+        "auto_promote_enabled": not args.no_promote,
+        "promote_threshold": args.promote_threshold,
+        "feedback_cleanup_warning": feedback_cleanup_warning,
+    }
+    if write_warnings:
+        payload["write_warnings"] = write_warnings
+    if sqlite_warnings:
+        payload["sqlite_warnings"] = sqlite_warnings
+    if vector_warnings:
+        payload["vector_warnings"] = vector_warnings
+    _print_json(payload)
     return 0
 
 
@@ -2799,7 +3248,7 @@ def _handle_activate(args: argparse.Namespace) -> int:
     if injection_artifacts:
         view["injection_artifacts"] = injection_artifacts
     save_json(output_path, view)
-    log_warning = _record_activation_usage(db_path=db_path, view=view)
+    log_warning = _record_activation_usage(workspace=workspace, db_path=db_path, view=view)
     payload = {
         "saved_to": str(output_path),
         "injection_artifacts": injection_artifacts,
@@ -2864,6 +3313,67 @@ def _handle_review_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_validation_plan(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    status_payload = _build_status_payload(
+        workspace=workspace,
+        limit=max(int(args.limit or 5), 1),
+        deep_retrieval_check=False,
+    )
+    queue = status_payload["unproven_validation_queue"]
+    top_items = queue.get("top_items", [])[: max(int(args.limit or 5), 1)]
+    plan_items = [
+        {
+            "rank": index,
+            "asset_id": item.get("asset_id"),
+            "title": item.get("title"),
+            "knowledge_kind": item.get("knowledge_kind"),
+            "knowledge_scope": item.get("knowledge_scope"),
+            "priority_score": item.get("priority_score"),
+            "recent_topic_hits": item.get("recent_topic_hits", []),
+            "validation_hint": item.get("validation_hint"),
+            "recommended_followup": (
+                f"优先在下一次涉及 {', '.join(item.get('recent_topic_hits', [])[:3])} 的真实任务中激活并回写 feedback。"
+                if item.get("recent_topic_hits")
+                else "优先挑一次真实任务显式验证这条资产，并补 help feedback。"
+            ),
+            "updated_at": item.get("updated_at"),
+        }
+        for index, item in enumerate(top_items, start=1)
+    ]
+    plan = {
+        "kind": "unproven_validation_plan",
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "asset_count": queue.get("asset_count", 0),
+        "recent_topics": queue.get("recent_topics", []),
+        "plan_count": len(plan_items),
+        "items": plan_items,
+        "summary": {
+            "top_priority_asset_id": plan_items[0]["asset_id"] if plan_items else None,
+            "top_priority_score": plan_items[0]["priority_score"] if plan_items else None,
+            "recommended_batch_size": min(len(plan_items), 3),
+        },
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "unproven_validation_plan.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=plan,
+        requested_output=args.output,
+        reason="default_validation_plan_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "validation_plan": plan}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
 def _build_status_payload(
     *,
     workspace: Path,
@@ -2873,6 +3383,7 @@ def _build_status_payload(
     runtime_warnings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     memory_root = memory_root_for_workspace(workspace)
+    fallback_root = fallback_memory_root_for_workspace(workspace)
     db_path = default_db_path(workspace)
     backend_config = resolve_backend_config()
     project_activity = load_project_policy(workspace)
@@ -2993,6 +3504,15 @@ def _build_status_payload(
         shared_milvus_db_path(),
         deep_check=deep_retrieval_check,
     )
+    milvus_runtime_warnings = [
+        warning
+        for warning in (
+            _milvus_probe_warning(backend_name="local", backend_summary=local_milvus),
+            _milvus_probe_warning(backend_name="shared", backend_summary=shared_milvus),
+        )
+        if warning is not None
+    ]
+    runtime_warnings.extend(milvus_runtime_warnings)
     milvus_indexed_entities = local_milvus.get("indexed_entities")
     possible_stale_entities = (
         max(milvus_indexed_entities - len(assets), 0)
@@ -3048,6 +3568,18 @@ def _build_status_payload(
         "assets": len(assets),
         "activation_logs": len(activations),
     }
+    fallback_runtime_present = fallback_root.exists() and fallback_root != memory_root
+    backend_runtime = {
+        "memory_root_mode": "fallback_active" if fallback_runtime_present else "primary_only",
+        "primary_memory_root": str(memory_root),
+        "fallback_memory_root": str(fallback_root),
+        "fallback_memory_root_present": fallback_runtime_present,
+        "state_index_mode": sqlite_backend.get("source_mode", "primary_sqlite"),
+        "primary_state_index_path": sqlite_backend.get("primary_db_path", str(db_path)),
+        "fallback_state_index_path": sqlite_backend.get("fallback_db_path", str(fallback_db_path(workspace))),
+        "active_state_index_path": sqlite_backend.get("active_db_path"),
+        "fallback_state_index_in_use": bool(sqlite_backend.get("fallback_in_use", False)),
+    }
 
     return {
         "workspace": str(workspace),
@@ -3074,6 +3606,7 @@ def _build_status_payload(
             "last_event": last_hook_event,
             "recent_events": recent_hook_events,
         },
+        "backend_runtime": backend_runtime,
         "feedback_cleanup": feedback_cleanup
         or {
             "auto_resolved_count": 0,
@@ -3184,6 +3717,13 @@ def _build_doctor_payload(
                 f"{sqlite_backend['candidate_rows']} candidates, and "
                 f"{sqlite_backend['activation_log_rows']} activation logs."
                 if sqlite_backend.get("available", sqlite_backend.get("db_exists", False))
+                and sqlite_backend.get("source_mode") != "fallback_sqlite"
+                else (
+                    "Primary SQLite is unavailable; fallback SQLite is serving state with "
+                    f"{sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, "
+                    f"and {sqlite_backend['activation_log_rows']} activation logs."
+                )
+                if sqlite_backend.get("source_mode") == "fallback_sqlite"
                 else (
                     "SQLite index is unavailable; status used filesystem JSON fallback with "
                     f"{sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, "
@@ -3192,7 +3732,12 @@ def _build_doctor_payload(
             ),
             None
             if sqlite_backend.get("available", sqlite_backend.get("db_exists", False))
-            else "Check SQLite permissions/locks; Milvus recall can continue, but state metrics are degraded.",
+            and sqlite_backend.get("source_mode") != "fallback_sqlite"
+            else (
+                "Check primary SQLite permissions/locks; fallback SQLite is active, but primary storage still needs repair."
+                if sqlite_backend.get("source_mode") == "fallback_sqlite"
+                else "Check SQLite permissions/locks; Milvus recall can continue, but state metrics are degraded."
+            ),
         )
     )
     checks.append(
@@ -3294,6 +3839,22 @@ def _build_doctor_payload(
             else milvus_recommendation,
         )
     )
+    local_probe = local_milvus.get("runtime_probe") or {}
+    local_probe_errors = local_probe.get("errors") or []
+    if local_milvus_status == "pass" and local_probe_errors:
+        first_error = local_probe_errors[0]
+        checks.append(
+            _diagnostic_check(
+                "local_milvus_probe",
+                "warn",
+                (
+                    "Local Milvus Lite is ready, but runtime probe had to fall back after "
+                    f"{first_error.get('path')} failed with {first_error.get('error')}; active probe path is "
+                    f"{local_probe.get('successful_probe_path') or 'unknown'}."
+                ),
+                "Keep the shorter fallback probe path available, or introduce a shorter Milvus runtime working path if this starts affecting real client startup.",
+            )
+        )
     milvus_selected_ratio = float(milvus_effectiveness.get("milvus_selected_ratio", 0.0) or 0.0)
     milvus_activation_ratio = float(milvus_effectiveness.get("activation_selected_ratio", 0.0) or 0.0)
     milvus_contribution_status = (
@@ -3677,14 +4238,25 @@ def _render_runtime_warnings(payload: dict[str, Any]) -> str:
     warnings = payload.get("status", {}).get("runtime_warnings", [])
     if not warnings:
         return ""
+    runtime_states = {str(item.get("runtime_state") or "") for item in warnings}
+    if "hard_failure" in runtime_states:
+        summary = "Some runtime writes failed without a usable fallback. Review the warnings below before trusting persistence-related metrics."
+    elif "fallback_active" in runtime_states:
+        summary = "Primary outputs hit write constraints, but fallback runtime storage is active so the session can continue."
+    elif "degraded_primary" in runtime_states:
+        summary = "Primary runtime components degraded, but the session is still running with a reduced or alternate path."
+    else:
+        summary = "Runtime warnings were recorded. Review the items below for the active degradation mode."
     rows = "".join(
-        f"<li><strong>{_safe_text(item.get('reason'))}</strong>: {_safe_text(item.get('error'))}</li>"
+        f"<li><strong>{_safe_text(item.get('reason'))}</strong>"
+        f" <em>({_safe_text(item.get('runtime_state') or 'unknown')})</em>: "
+        f"{_safe_text(item.get('error') or item.get('status') or 'no details')}</li>"
         for item in warnings
     )
     return f"""
     <section class="warning-banner">
       <h2>Degraded Mode</h2>
-      <p>Some state-index data came from fallback storage. Milvus semantic recall can continue, but SQLite-derived metrics may be incomplete.</p>
+      <p>{_safe_text(summary)}</p>
       <ul>{rows}</ul>
     </section>
     """
@@ -3763,6 +4335,37 @@ def _render_injection_policy_panel(payload: dict[str, Any]) -> str:
       {_render_dashboard_table(["Layer", "Items", "Activations"], layer_rows)}
       <h3>Legacy Injection Channels</h3>
       {_render_dashboard_table(["Channel", "Items", "Activations"], rows)}
+    </section>
+    """
+
+
+def _render_backend_runtime_panel(payload: dict[str, Any]) -> str:
+    status = payload["status"]
+    backend_runtime = status.get("backend_runtime") or {}
+    sqlite_backend = (status.get("retrieval_backends") or {}).get("sqlite") or {}
+    primary_root = backend_runtime.get("primary_memory_root")
+    fallback_root = backend_runtime.get("fallback_memory_root")
+    primary_index = backend_runtime.get("primary_state_index_path")
+    active_index = backend_runtime.get("active_state_index_path") or "none"
+    state_index_mode = backend_runtime.get("state_index_mode") or "unknown"
+    fallback_in_use = "yes" if backend_runtime.get("fallback_state_index_in_use") else "no"
+    fallback_root_present = "yes" if backend_runtime.get("fallback_memory_root_present") else "no"
+    summary = {
+        "primary_only": "Running on primary storage only.",
+        "fallback_active": "Primary storage is degraded; fallback runtime storage is active.",
+    }.get(backend_runtime.get("memory_root_mode"), "Runtime storage state is unknown.")
+    return f"""
+    <section class="panel">
+      <h2>Backend Runtime</h2>
+      <div class="metric-line"><span>Status</span><strong>{_safe_text(summary)}</strong></div>
+      <div class="metric-line"><span>State index mode</span><strong>{_safe_text(state_index_mode)}</strong></div>
+      <div class="metric-line"><span>Fallback state index in use</span><strong>{fallback_in_use}</strong></div>
+      <div class="metric-line"><span>SQLite available</span><strong>{_safe_text(sqlite_backend.get("available"))}</strong></div>
+      <div class="metric-line"><span>Primary memory root</span><strong><code>{_safe_text(primary_root)}</code></strong></div>
+      <div class="metric-line"><span>Fallback memory root present</span><strong>{fallback_root_present}</strong></div>
+      <div class="metric-line"><span>Fallback memory root</span><strong><code>{_safe_text(fallback_root)}</code></strong></div>
+      <div class="metric-line"><span>Primary state index</span><strong><code>{_safe_text(primary_index)}</code></strong></div>
+      <div class="metric-line"><span>Active state index</span><strong><code>{_safe_text(active_index)}</code></strong></div>
     </section>
     """
 
@@ -3951,6 +4554,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
   {_render_effectiveness_snapshot(payload)}
 
   <section class="split">
+    {_render_backend_runtime_panel(payload)}
     <div class="panel">
       <h2>Retrieval Effectiveness</h2>
       <div class="metric-line"><span>Milvus selected assets</span><strong>{_safe_text(retrieval.get("selected_from_milvus"))}/{_safe_text(retrieval.get("selected_total"))}</strong></div>
@@ -4172,6 +4776,8 @@ def main() -> int:
         return _handle_explain(args)
     if args.command == "review-candidates":
         return _handle_review_candidates(args)
+    if args.command == "validation-plan":
+        return _handle_validation_plan(args)
     if args.command == "status":
         return _handle_status(args)
     if args.command == "doctor":

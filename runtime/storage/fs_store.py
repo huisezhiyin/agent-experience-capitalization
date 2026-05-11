@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tempfile
 from typing import Any, Iterator
 
 from runtime.backends import resolve_backend_config
@@ -45,7 +46,7 @@ def shared_memory_root() -> Path:
     return codex_home() / "expcap-memory"
 
 
-def memory_root_for_workspace(workspace: Path) -> Path:
+def configured_memory_root_for_workspace(workspace: Path) -> Path:
     profile = str(resolve_backend_config().get("storage_profile", "local"))
     if profile == "local":
         return workspace / ".agent-memory"
@@ -54,12 +55,71 @@ def memory_root_for_workspace(workspace: Path) -> Path:
     return expcap_home() / "cache" / project_storage_key(workspace)
 
 
+def memory_root_for_workspace(workspace: Path) -> Path:
+    return configured_memory_root_for_workspace(workspace)
+
+
+def fallback_memory_root_for_workspace(workspace: Path) -> Path:
+    profile = str(resolve_backend_config().get("storage_profile", "local"))
+    if profile == "local":
+        return workspace / ".agent-memory"
+    return Path(tempfile.gettempdir()) / "expcap-runtime" / "projects" / project_storage_key(workspace)
+
+
+def memory_roots_for_workspace(workspace: Path) -> tuple[Path, ...]:
+    primary_root = configured_memory_root_for_workspace(workspace)
+    fallback_root = fallback_memory_root_for_workspace(workspace)
+    if fallback_root == primary_root or not fallback_root.exists():
+        return (primary_root,)
+    return (primary_root, fallback_root)
+
+
+def milvus_runtime_root() -> Path:
+    return codex_home() / "expcap-milvus"
+
+
+def _milvus_runtime_storage_key(db_path: Path) -> str:
+    return hashlib.sha1(str(db_path.parent.expanduser().resolve()).encode("utf-8")).hexdigest()[:10]
+
+
+def milvus_runtime_directory(db_path: Path) -> Path:
+    return milvus_runtime_root() / _milvus_runtime_storage_key(db_path)
+
+
+def milvus_runtime_db_path(db_path: Path) -> Path:
+    if len(str(db_path.parent)) <= 60:
+        return db_path
+
+    actual_dir = db_path.parent.expanduser().resolve()
+    runtime_dir = milvus_runtime_directory(db_path)
+    try:
+        actual_dir.mkdir(parents=True, exist_ok=True)
+        runtime_dir.parent.mkdir(parents=True, exist_ok=True)
+        if runtime_dir.exists() or runtime_dir.is_symlink():
+            try:
+                if runtime_dir.resolve() == actual_dir:
+                    return runtime_dir / db_path.name
+            except OSError:
+                pass
+            if runtime_dir.is_symlink():
+                runtime_dir.unlink()
+            else:
+                return db_path
+        os.symlink(actual_dir, runtime_dir, target_is_directory=True)
+        return runtime_dir / db_path.name
+    except OSError:
+        return db_path
+
+
 def storage_layout_for_workspace(workspace: Path) -> dict[str, Any]:
     config = resolve_backend_config()
     memory_root = memory_root_for_workspace(workspace)
+    fallback_root = fallback_memory_root_for_workspace(workspace)
     shared_root = shared_memory_root()
     active_milvus_path = default_milvus_db_path(workspace)
     active_shared_milvus_path = shared_milvus_db_path()
+    runtime_milvus_path = milvus_runtime_db_path(active_milvus_path)
+    runtime_shared_milvus_path = milvus_runtime_db_path(active_shared_milvus_path)
     legacy_milvus_path = memory_root / "milvus.db"
     legacy_shared_milvus_path = shared_root / "milvus.db"
     return {
@@ -69,9 +129,13 @@ def storage_layout_for_workspace(workspace: Path) -> dict[str, Any]:
         "local_runtime_data_in_project": config["local_runtime_data_in_project"],
         "project_storage_key": project_storage_key(workspace),
         "memory_root": str(memory_root),
+        "fallback_memory_root": str(fallback_root),
         "asset_root": str(memory_root / "assets"),
         "state_index_path": str(memory_root / "index.sqlite3"),
+        "fallback_state_index_path": str(fallback_root / "index.sqlite3"),
         "retrieval_index_path": str(active_milvus_path),
+        "retrieval_runtime_path": str(runtime_milvus_path),
+        "retrieval_runtime_aliased": runtime_milvus_path != active_milvus_path,
         "retrieval_index_profile": embedding_provider_config()["profile"],
         "legacy_retrieval_index_path": str(legacy_milvus_path),
         "legacy_retrieval_index_exists": legacy_milvus_path.exists(),
@@ -79,6 +143,8 @@ def storage_layout_for_workspace(workspace: Path) -> dict[str, Any]:
         "shared_asset_root": str(shared_root / "assets"),
         "shared_state_index_path": str(shared_root / "index.sqlite3"),
         "shared_retrieval_index_path": str(active_shared_milvus_path),
+        "shared_retrieval_runtime_path": str(runtime_shared_milvus_path),
+        "shared_retrieval_runtime_aliased": runtime_shared_milvus_path != active_shared_milvus_path,
         "shared_legacy_retrieval_index_path": str(legacy_shared_milvus_path),
         "shared_legacy_retrieval_index_exists": legacy_shared_milvus_path.exists(),
         "remote_uris": config["backend_uris"],
@@ -87,6 +153,10 @@ def storage_layout_for_workspace(workspace: Path) -> dict[str, Any]:
 
 def default_db_path(workspace: Path) -> Path:
     return memory_root_for_workspace(workspace) / "index.sqlite3"
+
+
+def fallback_db_path(workspace: Path) -> Path:
+    return fallback_memory_root_for_workspace(workspace) / "index.sqlite3"
 
 
 def shared_db_path() -> Path:

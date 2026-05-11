@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from typing import Iterator
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -13,8 +15,18 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _connection(db_path: Path) -> Iterator[sqlite3.Connection]:
+    conn = _connect(db_path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def ensure_db(db_path: Path) -> None:
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS traces (
@@ -98,7 +110,7 @@ def _dump(payload: dict[str, Any]) -> str:
 def upsert_trace(db_path: Path, trace: dict[str, Any]) -> None:
     ensure_db(db_path)
     timestamps = trace.get("timestamps", {})
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO traces (
@@ -127,7 +139,7 @@ def upsert_trace(db_path: Path, trace: dict[str, Any]) -> None:
 
 def upsert_episode(db_path: Path, episode: dict[str, Any]) -> None:
     ensure_db(db_path)
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO episodes (
@@ -160,7 +172,7 @@ def upsert_episode(db_path: Path, episode: dict[str, Any]) -> None:
 def upsert_candidate(db_path: Path, candidate: dict[str, Any]) -> None:
     ensure_db(db_path)
     scope = candidate.get("scope", {})
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO candidates (
@@ -202,7 +214,7 @@ def upsert_candidate(db_path: Path, candidate: dict[str, Any]) -> None:
 def upsert_asset(db_path: Path, asset: dict[str, Any]) -> None:
     ensure_db(db_path)
     scope = asset.get("scope", {})
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO assets (
@@ -243,7 +255,7 @@ def log_activation(db_path: Path, activation_view: dict[str, Any]) -> None:
     selected_asset_ids = [item["asset_id"] for item in activation_view.get("selected_assets", [])]
     payload = dict(activation_view)
     payload["selected_asset_ids"] = selected_asset_ids
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO activation_logs (
@@ -277,7 +289,7 @@ def find_latest_activation(
     if not db_path.exists():
         return None
     ensure_db(db_path)
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         rows = conn.execute(
             """
             SELECT payload_json
@@ -304,7 +316,7 @@ def record_activation_feedback(
     if not db_path.exists():
         return None
     ensure_db(db_path)
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         row = conn.execute(
             "SELECT payload_json FROM activation_logs WHERE activation_id = ?",
             (activation_id,),
@@ -342,7 +354,7 @@ def list_activation_logs(
     if limit is not None:
         query += " LIMIT ?"
         params.append(limit)
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
     return [json.loads(row["payload_json"]) for row in rows]
 
@@ -367,7 +379,7 @@ def summarize_asset_feedback(
         }
         for asset_id in asset_ids
     }
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         rows = conn.execute("SELECT payload_json FROM activation_logs ORDER BY created_at DESC").fetchall()
     for row in rows:
         payload = json.loads(row["payload_json"])
@@ -409,7 +421,7 @@ def get_asset(db_path: Path, *, asset_id: str) -> dict[str, Any] | None:
     if not db_path.exists():
         return None
     ensure_db(db_path)
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         row = conn.execute(
             "SELECT payload_json FROM assets WHERE asset_id = ?",
             (asset_id,),
@@ -423,7 +435,7 @@ def get_candidate(db_path: Path, *, candidate_id: str) -> dict[str, Any] | None:
     if not db_path.exists():
         return None
     ensure_db(db_path)
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         row = conn.execute(
             "SELECT payload_json FROM candidates WHERE candidate_id = ?",
             (candidate_id,),
@@ -438,7 +450,7 @@ def touch_assets_last_used(db_path: Path, asset_ids: list[str], used_at: str) ->
         return
     ensure_db(db_path)
     placeholders = ", ".join("?" for _ in asset_ids)
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         conn.execute(
             f"""
             UPDATE assets
@@ -459,7 +471,7 @@ def list_assets(db_path: Path, *, workspace: str | None = None) -> list[dict[str
         query += " AND (workspace = ? OR workspace IS NULL)"
         params.append(workspace)
     query += " ORDER BY confidence DESC, updated_at DESC"
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
     return [json.loads(row["payload_json"]) for row in rows]
 
@@ -480,6 +492,6 @@ def list_candidates(
         query += " AND (workspace = ? OR workspace IS NULL)"
         params.append(workspace)
     query += " ORDER BY confidence_score DESC, reusability_score DESC, created_at DESC"
-    with _connect(db_path) as conn:
+    with _connection(db_path) as conn:
         rows = conn.execute(query, params).fetchall()
     return [json.loads(row["payload_json"]) for row in rows]

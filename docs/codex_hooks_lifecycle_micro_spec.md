@@ -15,8 +15,16 @@ Move `expcap` Codex integration beyond skill-only activation by using Codex life
 
 - `install-project --integration-mode codex-hooks` writes lifecycle hook config and scripts.
 - `scripts/expcap-hook post-tool-use` records compact command/error evidence.
+- Failed `PostToolUse` events can trigger `progressive-recall` and return continuous runtime recall `additionalContext`.
 - `scripts/expcap-hook stop` passes recent evidence as `--command` / `--error`.
 - Focused tests prove install output and trace evidence behavior.
+
+## PostToolUse Progressive Recall v1
+
+- Successful tool calls stay quiet and only record compact evidence.
+- Failed tool calls or stderr signals invoke `progressive-recall --phase fix`.
+- The hook forwards failed command text, error text, and file path hints.
+- Identical failure signals are de-duplicated by hook cooldown to avoid repeated recall noise.
 
 ## SessionStart Follow-up
 

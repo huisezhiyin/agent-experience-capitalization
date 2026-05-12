@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from runtime.cli import main as cli_main
-from runtime.storage.fs_store import default_db_path
+from runtime.storage.fs_store import default_db_path, fallback_memory_root_for_workspace
 from runtime.storage.sqlite_store import list_assets, upsert_asset
 from runtime.storage.sqlite_store import ensure_db, list_activation_logs, log_activation
 
@@ -64,6 +64,179 @@ def _write_candidate(
 
 
 class CliFlowTests(unittest.TestCase):
+    def test_filesystem_status_records_merge_primary_and_fallback_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            primary_root = cli_main.memory_root_for_workspace(workspace)
+            fallback_root = fallback_memory_root_for_workspace(workspace)
+            (primary_root / "assets" / "patterns").mkdir(parents=True, exist_ok=True)
+            (fallback_root / "candidates").mkdir(parents=True, exist_ok=True)
+            (fallback_root / "views").mkdir(parents=True, exist_ok=True)
+
+            (primary_root / "assets" / "patterns" / "pattern_primary.json").write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_primary",
+                        "asset_type": "pattern",
+                        "status": "active",
+                        "created_at": "2026-05-11T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (fallback_root / "candidates" / "cand_fallback.json").write_text(
+                json.dumps(
+                    {
+                        "candidate_id": "cand_fallback",
+                        "status": "needs_review",
+                        "created_at": "2026-05-11T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (fallback_root / "views" / "act_fallback.json").write_text(
+                json.dumps(
+                    {
+                        "activation_id": "act_fallback",
+                        "task_query": "repair user-cache fallback",
+                        "created_at": "2026-05-11T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            assets, candidates, activations = cli_main._filesystem_status_records(workspace=workspace)
+
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(assets[0]["asset_id"], "pattern_primary")
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["candidate_id"], "cand_fallback")
+            self.assertEqual(len(activations), 1)
+            self.assertEqual(activations[0]["activation_id"], "act_fallback")
+
+    def test_find_unresolved_activation_falls_back_to_activation_views(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            fallback_root = fallback_memory_root_for_workspace(workspace)
+            views_dir = fallback_root / "views"
+            views_dir.mkdir(parents=True, exist_ok=True)
+            (views_dir / "act_fix-user-cache.json").write_text(
+                json.dumps(
+                    {
+                        "activation_id": "act_fix-user-cache",
+                        "task_query": "fix user-cache writes",
+                        "created_at": "2026-05-11T00:00:00+00:00",
+                        "selected_assets": [{"asset_id": "pattern_001"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            activation = cli_main._find_unresolved_activation_for_task(
+                db_path=default_db_path(workspace),
+                workspace=workspace,
+                task="fix user-cache writes",
+            )
+
+            assert activation is not None
+            self.assertEqual(activation["activation_id"], "act_fix-user-cache")
+
+    def test_cli_auto_start_uses_fallback_sqlite_and_injection_paths_when_primary_root_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            primary_root = cli_main.memory_root_for_workspace(workspace)
+            fallback_root = fallback_memory_root_for_workspace(workspace)
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                try:
+                    Path(path).relative_to(primary_root)
+                except ValueError:
+                    original_save_json(path, payload)
+                    return
+                raise PermissionError("operation not permitted for primary user-cache root")
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="repair readonly auto-start fallback",
+                constraints=[],
+                output=None,
+            )
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "save_json", side_effect=flaky_save_json), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_auto_start(args)
+
+            self.assertEqual(result, 0)
+            self.assertNotIn("log_warning", captured)
+            self.assertNotIn("injection_artifact_warning", captured)
+            self.assertTrue(str(captured["saved_to"]).startswith(str(fallback_root)))
+            injection_artifacts = captured["injection_artifacts"]
+            assert isinstance(injection_artifacts, dict)
+            self.assertTrue(Path(injection_artifacts["json_path"]).exists())
+            self.assertTrue(Path(injection_artifacts["markdown_path"]).exists())
+
+    def test_cli_feedback_can_update_activation_from_fallback_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            fallback_db = fallback_memory_root_for_workspace(workspace) / "index.sqlite3"
+            ensure_db(fallback_db)
+            activation = {
+                "activation_id": "act_fallback_feedback",
+                "workspace": str(workspace),
+                "task_query": "repair readonly auto-start fallback",
+                "selected_assets": [{"asset_id": "pattern_001", "asset_type": "pattern", "knowledge_scope": "project"}],
+                "selected_asset_ids": ["pattern_001"],
+                "created_at": "2026-05-11T00:00:00+00:00",
+            }
+            log_activation(fallback_db, activation)
+            views_dir = fallback_memory_root_for_workspace(workspace) / "views"
+            views_dir.mkdir(parents=True, exist_ok=True)
+            (views_dir / "act_fallback_feedback.json").write_text(
+                json.dumps(activation, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                activation_id=None,
+                help_signal="supported_strong",
+                feedback_summary="fallback feedback recorded",
+                feedback_at="2026-05-11T00:01:00+00:00",
+                signal_source="manual_feedback",
+            )
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_feedback(args)
+
+            self.assertEqual(result, 0)
+            self.assertTrue(captured["updated"])
+            activation_feedback = captured["activation_feedback"]
+            assert isinstance(activation_feedback, dict)
+            self.assertEqual(activation_feedback["activation_id"], "act_fallback_feedback")
+
     def test_cli_ingest_review_extract_promote_activate_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()
@@ -362,7 +535,10 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue(any("当前约束" in item for item in activation["rendered_context"]))
 
     def test_cli_auto_start_falls_back_when_default_activation_view_path_is_unwritable(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str((Path(tmpdir) / "expcap-home").resolve())},
+        ):
             workspace = (Path(tmpdir) / "workspace").resolve()
             workspace.mkdir(parents=True, exist_ok=True)
             captured: dict[str, object] = {}
@@ -402,6 +578,8 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("save_warning", captured)
             warning = captured["save_warning"]
             assert isinstance(warning, dict)
+            self.assertEqual(warning["runtime_state"], "fallback_active")
+            self.assertEqual(warning["severity"], "warn")
             self.assertEqual(warning["reason"], "default_activation_view_unwritable")
             self.assertEqual(warning["requested_path"], str(default_path))
             fallback_path = Path(captured["saved_to"])
@@ -841,21 +1019,25 @@ class CliFlowTests(unittest.TestCase):
             activation_id = json.loads(started.stdout)["activation_id"]
             db_path = workspace / ".agent-memory" / "index.sqlite3"
 
-            with sqlite3.connect(db_path) as conn:
-                row = conn.execute(
-                    "SELECT payload_json FROM activation_logs WHERE activation_id = ?",
-                    (activation_id,),
-                ).fetchone()
-                payload = json.loads(row[0])
-                payload["created_at"] = "2026-04-10T00:00:00+00:00"
-                conn.execute(
-                    "UPDATE activation_logs SET created_at = ?, payload_json = ? WHERE activation_id = ?",
-                    (
-                        payload["created_at"],
-                        json.dumps(payload, ensure_ascii=False),
-                        activation_id,
-                    ),
-                )
+            conn = sqlite3.connect(db_path)
+            try:
+                with conn:
+                    row = conn.execute(
+                        "SELECT payload_json FROM activation_logs WHERE activation_id = ?",
+                        (activation_id,),
+                    ).fetchone()
+                    payload = json.loads(row[0])
+                    payload["created_at"] = "2026-04-10T00:00:00+00:00"
+                    conn.execute(
+                        "UPDATE activation_logs SET created_at = ?, payload_json = ? WHERE activation_id = ?",
+                        (
+                            payload["created_at"],
+                            json.dumps(payload, ensure_ascii=False),
+                            activation_id,
+                        ),
+                    )
+            finally:
+                conn.close()
 
             activation_path = workspace / ".agent-memory" / "views" / f"{activation_id}.json"
             activation_view = json.loads(activation_path.read_text(encoding="utf-8"))
@@ -940,6 +1122,163 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(cleanup["auto_resolved_count"], 0)
             self.assertEqual(warning["reason"], "sqlite_index_unavailable")
             self.assertIn("readonly database", warning["error"])
+
+    def test_cli_auto_finish_falls_back_when_primary_memory_root_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            primary_root = cli_main.memory_root_for_workspace(workspace)
+            fallback_root = fallback_memory_root_for_workspace(workspace)
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                try:
+                    Path(path).relative_to(primary_root)
+                except ValueError:
+                    original_save_json(path, payload)
+                    return
+                raise PermissionError("operation not permitted for primary user-cache root")
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="repair user-cache write path",
+                user_request=None,
+                constraints=[],
+                commands=[],
+                errors=[],
+                files_changed=[],
+                verification_status="passed",
+                verification_summary="1 passed",
+                result_status="success",
+                result_summary="write fallback works",
+                host=None,
+                session_id=None,
+                trace_id="trace_user_cache_fallback",
+                no_promote=False,
+                promote_threshold=0.75,
+                knowledge_scope="project",
+                knowledge_kind="pattern",
+            )
+
+            with patch.object(cli_main, "save_json", side_effect=flaky_save_json), patch.object(
+                cli_main,
+                "upsert_trace",
+                side_effect=sqlite3.OperationalError("attempt to write a readonly database"),
+            ), patch.object(
+                cli_main,
+                "upsert_episode",
+                side_effect=sqlite3.OperationalError("attempt to write a readonly database"),
+            ), patch.object(
+                cli_main,
+                "upsert_candidate",
+                side_effect=sqlite3.OperationalError("attempt to write a readonly database"),
+            ), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_auto_finish(args)
+
+            self.assertEqual(result, 0)
+            self.assertTrue(str(captured["trace"]["path"]).startswith(str(fallback_root)))
+            self.assertTrue(str(captured["episode"]["path"]).startswith(str(fallback_root)))
+            self.assertIn("write_warnings", captured)
+            self.assertIn("sqlite_warnings", captured)
+            self.assertTrue(Path(captured["trace"]["path"]).exists())
+
+    def test_cli_auto_finish_falls_back_when_feedback_asset_write_hits_primary_user_cache_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            primary_root = cli_main.memory_root_for_workspace(workspace)
+            fallback_root = fallback_memory_root_for_workspace(workspace)
+            asset = {
+                "asset_id": "pattern_feedback_fallback_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "feedback fallback pattern",
+                "content": "keep auto-finish feedback writes alive when the primary user-cache root is readonly.",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "source_episode_ids": ["ep_feedback_fallback_001"],
+                "source_candidate_ids": ["cand_feedback_fallback_001"],
+                "confidence": 0.88,
+                "status": "active",
+                "last_used_at": None,
+                "created_at": "2026-04-13T00:00:00+00:00",
+                "updated_at": "2026-04-13T00:00:00+00:00",
+            }
+            asset_path = primary_root / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            cli_main.save_json(asset_path, asset)
+
+            start_payload: dict[str, object] = {}
+            finish_payload: dict[str, object] = {}
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                try:
+                    relative = Path(path).relative_to(primary_root)
+                except ValueError:
+                    original_save_json(path, payload)
+                    return
+                if relative.parts[:2] == ("assets", "patterns"):
+                    raise PermissionError("operation not permitted for primary user-cache asset path")
+                original_save_json(path, payload)
+
+            start_args = argparse.Namespace(
+                workspace=str(workspace),
+                task="repair feedback asset fallback",
+                constraints=[],
+                output=None,
+            )
+            finish_args = argparse.Namespace(
+                workspace=str(workspace),
+                task="repair feedback asset fallback",
+                user_request=None,
+                constraints=[],
+                commands=[],
+                errors=[],
+                files_changed=[],
+                verification_status="passed",
+                verification_summary="1 passed",
+                result_status="success",
+                result_summary="feedback asset fallback works",
+                host=None,
+                session_id=None,
+                trace_id="trace_feedback_asset_fallback",
+                no_promote=False,
+                promote_threshold=0.75,
+                knowledge_scope="project",
+                knowledge_kind="pattern",
+            )
+
+            with patch.object(cli_main, "save_json", side_effect=flaky_save_json), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: start_payload.update(payload) if "activation_view" in payload else finish_payload.update(payload),
+            ):
+                self.assertEqual(cli_main._handle_auto_start(start_args), 0)
+                self.assertEqual(cli_main._handle_auto_finish(finish_args), 0)
+
+            fallback_asset_path = fallback_root / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            self.assertEqual(finish_payload["activation_feedback"]["help_signal"], "supported_strong")
+            self.assertIn("write_warnings", finish_payload)
+            self.assertTrue(any(
+                warning["reason"] == "default_asset_output_unwritable"
+                for warning in finish_payload["write_warnings"]
+            ))
+            self.assertTrue(fallback_asset_path.exists())
+            fallback_asset = json.loads(fallback_asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(fallback_asset["historical_help"]["supported_count"], 1)
+            self.assertEqual(fallback_asset["review_status"], "healthy")
 
     def test_cli_doctor_reports_workspace_health_and_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1097,6 +1436,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("Retrieval Effectiveness", html)
             self.assertIn("Write Frequency", html)
             self.assertIn("Effectiveness Snapshot", html)
+            self.assertIn("Backend Runtime", html)
             self.assertIn("Unproven Validation Queue", html)
             self.assertIn("Local Prior Distribution", html)
             self.assertIn("Injection Channels", html)
@@ -1124,6 +1464,84 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(dashboard["retrieval"]["effectiveness"]["selected_from_milvus"], 1)
             self.assertEqual(dashboard["activations"][0]["help_signal"], "supported_strong")
             self.assertEqual(dashboard["unproven_validation_queue"]["asset_count"], 0)
+
+    def test_dashboard_html_shows_backend_runtime_panel_for_fallback_sqlite(self) -> None:
+        payload = {
+            "workspace": "/tmp/workspace",
+            "generated_at": "2026-05-11T00:00:00+00:00",
+            "cards": {
+                "assets": 0,
+                "candidates": 0,
+                "activation_logs": 1,
+                "healthy_assets": 0,
+                "unproven_assets": 0,
+                "local_prior_assets": 0,
+                "high_priority_prior_assets": 0,
+                "system_prompt_items": 0,
+                "reference_summary_items": 0,
+                "milvus_selected_ratio": 0.0,
+                "activation_selected_ratio": 0.0,
+                "stale_missing_feedback": 0,
+            },
+            "effectiveness_snapshot": {
+                "overall_score": 50,
+                "verdict": "watch",
+                "signals": [
+                    {"label": "Asset quality", "ratio": 0.0, "value": "0/0 healthy"},
+                    {"label": "Activation help", "ratio": 0.0, "value": "0/1 helpful"},
+                    {"label": "Milvus contribution", "ratio": 0.0, "value": "0% activations"},
+                    {"label": "Write activity", "ratio": 0.0, "value": "0 writes / 14d"},
+                ],
+            },
+            "write_frequency": [],
+            "assets": [],
+            "activations": [],
+            "candidates": [],
+            "review_queue": {"candidate_count": 0, "top_items": []},
+            "unproven_assets": [],
+            "knowledge_kind_summary": {
+                "assets": {"local_prior_count": 0, "high_priority_count": 0, "by_kind": {}, "high_priority_by_kind": {}},
+                "candidates": {"local_prior_count": 0, "high_priority_count": 0, "by_kind": {}, "high_priority_by_kind": {}},
+                "review_queue": {"local_prior_count": 0, "high_priority_count": 0, "by_kind": {}, "high_priority_by_kind": {}},
+            },
+            "injection_policy_summary": {
+                "policy": "layered_knowledge_injection_v1",
+                "plan_coverage_ratio": 0.0,
+                "avg_items_per_activation": 0.0,
+                "channel_counts": {"system_prompt": 0, "runtime_context": 0, "reference_summary": 0},
+                "layer_counts": {"task_start_runtime_injection": 0, "system_prompt_injection": 0, "continuous_runtime_recall_injection": 0},
+                "activations_with_channels": {"system_prompt": 0, "runtime_context": 0, "reference_summary": 0},
+                "activations_with_layers": {"task_start_runtime_injection": 0, "system_prompt_injection": 0, "continuous_runtime_recall_injection": 0},
+            },
+            "retrieval": {"effectiveness": {"selected_from_milvus": 0, "selected_total": 0, "milvus_selected_ratio": 0.0, "activation_selected_ratio": 0.0, "avg_selected_vector_score": 0.0}},
+            "quality": {
+                "asset_effectiveness_summary": {"review_status": {}, "temperature": {}},
+                "activation_feedback_summary": {},
+            },
+            "status": {
+                "backend_runtime": {
+                    "memory_root_mode": "fallback_active",
+                    "primary_memory_root": "/readonly/root",
+                    "fallback_memory_root": "/tmp/expcap-runtime",
+                    "fallback_memory_root_present": True,
+                    "state_index_mode": "fallback_sqlite",
+                    "primary_state_index_path": "/readonly/root/index.sqlite3",
+                    "active_state_index_path": "/tmp/expcap-runtime/index.sqlite3",
+                    "fallback_state_index_in_use": True,
+                },
+                "retrieval_backends": {
+                    "sqlite": {
+                        "available": True,
+                    }
+                },
+                "runtime_warnings": [],
+            },
+        }
+
+        html = cli_main._render_dashboard_html(payload)
+        self.assertIn("Backend Runtime", html)
+        self.assertIn("fallback_sqlite", html)
+        self.assertIn("/tmp/expcap-runtime/index.sqlite3", html)
 
     def test_cli_dashboard_falls_back_when_default_json_sidecar_is_unwritable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1306,6 +1724,7 @@ class CliFlowTests(unittest.TestCase):
             assert isinstance(status, dict)
             self.assertFalse(status["retrieval_backends"]["sqlite"]["available"])
             self.assertEqual(status["retrieval_backends"]["sqlite"]["fallback"], "filesystem_json")
+            self.assertEqual(status["backend_runtime"]["state_index_mode"], "filesystem_json")
             self.assertIn("knowledge_save_layers", status)
             self.assertEqual(status["knowledge_save_layers"]["sqlite"]["role"], "lightweight_state_index")
             self.assertEqual(status["knowledge_save_layers"]["milvus"]["role"], "semantic_retrieval_index")
@@ -1341,11 +1760,158 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(sqlite_check["status"], "warn")
             self.assertIn("filesystem JSON fallback", sqlite_check["summary"])
 
+    def test_cli_status_marks_fallback_sqlite_as_active_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            fallback_db = fallback_memory_root_for_workspace(workspace) / "index.sqlite3"
+            ensure_db(fallback_db)
+            log_activation(
+                fallback_db,
+                {
+                    "activation_id": "act_fallback_sqlite_status",
+                    "workspace": str(workspace),
+                    "task_query": "status with fallback sqlite",
+                    "selected_assets": [],
+                    "created_at": "2026-05-11T00:00:00+00:00",
+                },
+            )
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.object(
+                cli_main,
+                "ensure_db",
+                side_effect=lambda path: (_ for _ in ()).throw(sqlite3.OperationalError("primary sqlite unavailable"))
+                if Path(path) == default_db_path(workspace)
+                else None,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_status(args)
+
+            self.assertEqual(result, 0)
+            status = captured["status"]
+            assert isinstance(status, dict)
+            self.assertTrue(status["retrieval_backends"]["sqlite"]["available"])
+            self.assertTrue(status["retrieval_backends"]["sqlite"]["degraded"])
+            self.assertEqual(status["retrieval_backends"]["sqlite"]["source_mode"], "fallback_sqlite")
+            self.assertTrue(status["backend_runtime"]["fallback_state_index_in_use"])
+            self.assertEqual(status["backend_runtime"]["state_index_mode"], "fallback_sqlite")
+            self.assertEqual(status["counts"]["activation_logs"], 1)
+
+    def test_cli_status_surfaces_milvus_probe_fallback_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+            local_summary = {
+                "backend": "milvus-lite",
+                "mode": "local",
+                "available": True,
+                "runtime_available": True,
+                "status": "ready",
+                "degraded_reason": None,
+                "db_path": str(workspace / "milvus.db"),
+                "runtime_probe": {
+                    "available": True,
+                    "successful_probe_path": "/tmp/m123.sock",
+                    "probe_paths": [str(workspace), "/tmp"],
+                    "errors": [{"path": str(workspace), "error": "AF_UNIX path too long"}],
+                },
+                "indexed_entities": None,
+            }
+            shared_summary = {
+                "backend": "milvus-lite",
+                "mode": "local",
+                "available": True,
+                "runtime_available": True,
+                "status": "not_initialized",
+                "degraded_reason": None,
+                "db_path": "/tmp/shared-milvus.db",
+                "runtime_probe": {
+                    "available": True,
+                    "successful_probe_path": "/tmp/m456.sock",
+                    "probe_paths": ["/tmp"],
+                    "errors": [],
+                },
+                "indexed_entities": None,
+            }
+
+            with patch.object(cli_main, "milvus_backend_summary", side_effect=[local_summary, shared_summary]), patch.object(
+                cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)
+            ):
+                result = cli_main._handle_status(args)
+
+            self.assertEqual(result, 0)
+            status = captured["status"]
+            assert isinstance(status, dict)
+            warning = next(item for item in status["runtime_warnings"] if item["reason"] == "milvus_runtime_probe_fallback")
+            self.assertEqual(warning["backend"], "local")
+            self.assertEqual(warning["successful_probe_path"], "/tmp/m123.sock")
+            self.assertIn("AF_UNIX path too long", warning["errors"][0]["error"])
+            self.assertEqual(warning["runtime_state"], "degraded_primary")
+
+    def test_cli_doctor_describes_fallback_sqlite_without_calling_it_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            fallback_db = fallback_memory_root_for_workspace(workspace) / "index.sqlite3"
+            ensure_db(fallback_db)
+            log_activation(
+                fallback_db,
+                {
+                    "activation_id": "act_fallback_sqlite_doctor",
+                    "workspace": str(workspace),
+                    "task_query": "doctor with fallback sqlite",
+                    "selected_assets": [],
+                    "created_at": "2026-05-11T00:00:00+00:00",
+                },
+            )
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.object(
+                cli_main,
+                "ensure_db",
+                side_effect=lambda path: (_ for _ in ()).throw(sqlite3.OperationalError("primary sqlite unavailable"))
+                if Path(path) == default_db_path(workspace)
+                else None,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_doctor(args)
+
+            self.assertEqual(result, 0)
+            doctor = captured["doctor"]
+            assert isinstance(doctor, dict)
+            sqlite_check = next(item for item in doctor["checks"] if item["name"] == "sqlite_index")
+            self.assertIn("fallback SQLite is serving state", sqlite_check["summary"])
+
     def test_dashboard_html_shows_degraded_banner_when_sqlite_unavailable(self) -> None:
         payload = {
             "status": {
                 "runtime_warnings": [
                     {
+                        "runtime_state": "degraded_primary",
                         "reason": "sqlite_index_unavailable",
                         "error": "readonly sqlite index",
                     }
@@ -1358,6 +1924,25 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("Degraded Mode", html)
         self.assertIn("sqlite_index_unavailable", html)
         self.assertIn("readonly sqlite index", html)
+        self.assertIn("degraded_primary", html)
+
+    def test_dashboard_html_shows_hard_failure_runtime_warning_summary(self) -> None:
+        payload = {
+            "status": {
+                "runtime_warnings": [
+                    {
+                        "runtime_state": "hard_failure",
+                        "reason": "sqlite_activation_log_unwritable",
+                        "error": "all writes failed",
+                    }
+                ]
+            }
+        }
+
+        html = cli_main._render_runtime_warnings(payload)
+
+        self.assertIn("failed without a usable fallback", html)
+        self.assertIn("hard_failure", html)
 
     def test_cli_status_builds_unproven_validation_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1507,6 +2092,75 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(queue["top_items"][0]["asset_id"], "pattern_activation_feedback")
             self.assertIn("activation", queue["top_items"][0]["recent_topic_hits"])
             self.assertIn("Recent task overlap", queue["top_items"][0]["validation_hint"])
+
+    def test_cli_validation_plan_emits_ranked_unproven_followups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_validation_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "validation target pattern",
+                    "content": "use feedback after activation to validate this pattern",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.91,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "updated_at": "2026-04-28T00:00:00+00:00",
+                },
+            )
+            log_activation(
+                db_path,
+                {
+                    "activation_id": "act_validation_target",
+                    "workspace": str(workspace),
+                    "task_query": "continue activation feedback validation workflow",
+                    "selected_asset_ids": [],
+                    "selected_assets": [],
+                    "feedback": {"help_signal": "supported_strong"},
+                    "created_at": "2026-04-28T00:30:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "validation-plan",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            plan = payload["validation_plan"]
+            saved_path = Path(payload["saved_to"])
+            saved_plan = json.loads(saved_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(plan["kind"], "unproven_validation_plan")
+            self.assertEqual(plan["plan_count"], 1)
+            self.assertEqual(plan["summary"]["top_priority_asset_id"], "pattern_validation_target")
+            self.assertEqual(plan["items"][0]["rank"], 1)
+            self.assertIn("activation", plan["items"][0]["recent_topic_hits"])
+            self.assertIn("真实任务", plan["items"][0]["recommended_followup"])
+            self.assertEqual(saved_plan["items"][0]["asset_id"], "pattern_validation_target")
 
     def test_cli_feedback_records_signal_and_refreshes_asset_effectiveness(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1663,6 +2317,86 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("stale pid", lock_check["summary"])
         self.assertIn("safe cleanup/reset", lock_check["recommendation"])
         self.assertIn("2 assets", validation_check["summary"])
+
+    def test_build_doctor_payload_warns_when_milvus_probe_requires_fallback_path(self) -> None:
+        status_payload = {
+            "counts": {
+                "traces": 0,
+                "episodes": 0,
+                "candidates": 0,
+                "assets": 0,
+                "activation_logs": 0,
+            },
+            "retrieval_backends": {
+                "sqlite": {
+                    "available": True,
+                    "source_mode": "primary_sqlite",
+                    "asset_rows": 0,
+                    "candidate_rows": 0,
+                    "activation_log_rows": 0,
+                },
+                "milvus": {
+                    "local": {
+                        "mode": "local",
+                        "status": "ready",
+                        "degraded_reason": None,
+                        "runtime_probe": {
+                            "available": True,
+                            "successful_probe_path": "/tmp/m123.sock",
+                            "errors": [{"path": "/very/long/path", "error": "AF_UNIX path too long"}],
+                        },
+                    }
+                },
+            },
+            "milvus_retrieval_effectiveness": {
+                "selected_from_milvus": 0,
+                "selected_total": 0,
+                "activations_with_milvus_selected": 0,
+                "activation_count": 0,
+                "avg_selected_vector_score": 0.0,
+                "milvus_selected_ratio": 0.0,
+                "activation_selected_ratio": 0.0,
+            },
+            "activation_feedback_summary": {"supported_strong": 0, "supported_weak": 0, "pending": 0, "missing": 0},
+            "unresolved_activations": [],
+            "candidate_review_queue": {"candidate_count": 0, "top_items": []},
+            "asset_effectiveness_summary": {"review_status": {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}},
+            "asset_review_backlog": {"healthy_count": 0, "total_assets": 0, "unproven_count": 0, "unproven_ratio": 0.0},
+            "unproven_validation_queue": {"asset_count": 0, "top_items": []},
+            "hook_integration": {
+                "integration_mode": cli_main.DEFAULT_INTEGRATION_MODE,
+                "recent_events": [],
+                "last_event": None,
+                "codex": {"files_present": False},
+                "claude": {"files_present": False},
+            },
+        }
+        local_lock = {
+            "lock_path": "/tmp/local.lock",
+            "lock_exists": False,
+            "locked": False,
+            "lock_error": None,
+            "metadata_raw": "",
+            "metadata": {},
+            "pid_exists": None,
+            "age_seconds": None,
+            "stale_hint": False,
+        }
+        shared_lock = dict(local_lock, lock_path="/tmp/shared.lock")
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            cli_main, "_build_status_payload", return_value=status_payload
+        ), patch.object(cli_main, "milvus_lock_summary", side_effect=[local_lock, shared_lock]):
+            doctor = cli_main._build_doctor_payload(
+                workspace=(Path(tmpdir) / "workspace").resolve(),
+                limit=3,
+                deep_retrieval_check=False,
+            )
+
+        probe_check = next(item for item in doctor["checks"] if item["name"] == "local_milvus_probe")
+        self.assertEqual(probe_check["status"], "warn")
+        self.assertIn("AF_UNIX path too long", probe_check["summary"])
+        self.assertIn("/tmp/m123.sock", probe_check["summary"])
 
     def test_cli_auto_start_still_runs_for_inactive_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2033,6 +2767,81 @@ class CliFlowTests(unittest.TestCase):
                 {"type": "error", "content": "AssertionError: lifecycle evidence missing", "important": True},
                 events,
             )
+            self.assertNotIn(
+                {"type": "command", "content": "progressive-recall", "important": True},
+                events,
+            )
+
+    def test_expcap_hook_post_tool_use_injects_progressive_recall_on_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            env = {**dict(os.environ), "EXPCAP_STORAGE_PROFILE": "local"}
+
+            with patch.dict(os.environ, {"EXPCAP_STORAGE_PROFILE": "local"}):
+                db_path = default_db_path(workspace)
+                ensure_db(db_path)
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": "pattern_hook_progressive_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "hook progressive WebSocketTimeoutError repair",
+                        "content": "When WebSocketTimeoutError appears in tests/test_websocket.py after a tool run, trigger continuous runtime recall and focus on the new stderr signal.",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "source_episode_ids": ["ep_hook_progressive_001"],
+                        "source_candidate_ids": ["cand_hook_progressive_001"],
+                        "confidence": 0.84,
+                        "status": "active",
+                        "review_status": "healthy",
+                        "temperature": "warm",
+                        "created_at": "2026-05-09T00:00:00+00:00",
+                        "updated_at": "2026-05-09T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "expcap-hook"),
+                    "post-tool-use",
+                    "--host",
+                    "codex",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                input=json.dumps(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "cwd": str(workspace),
+                        "tool_name": "Bash",
+                        "tool_input": {"command": "python -m pytest tests/test_websocket.py"},
+                        "tool_response": {"exit_code": 1, "stderr": "WebSocketTimeoutError in tests/test_websocket.py"},
+                    },
+                    ensure_ascii=False,
+                ),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            context = payload["hookSpecificOutput"]["additionalContext"]
+            latest = json.loads((workspace / ".agent-memory" / "hooks" / "latest.json").read_text(encoding="utf-8"))
+            view_path = next((workspace / ".agent-memory" / "views").glob("*progressive.json"))
+            view = json.loads(view_path.read_text(encoding="utf-8"))
+
+            self.assertIn("continuous_runtime_recall_injection", context)
+            self.assertIn("hook progressive WebSocketTimeoutError repair", context)
+            self.assertEqual(latest["event"], "post-tool-use")
+            self.assertEqual(latest["status"], "progressive-recall")
+            self.assertIn("selected_count=1", latest["result_summary"])
+            self.assertEqual(view["progressive_recall"]["injection_layer"], "continuous_runtime_recall_injection")
 
     def test_expcap_hook_pre_tool_use_blocks_destructive_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

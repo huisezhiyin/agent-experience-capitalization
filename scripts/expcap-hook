@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -183,6 +184,21 @@ def _tool_error(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _file_signals(*values: str | None) -> list[str]:
+    seen: set[str] = set()
+    files: list[str] = []
+    pattern = re.compile(r"[\w./~$-]+\.(?:py|md|json|toml|ya?ml|txt|sh|lock|sqlite3|db)")
+    for value in values:
+        if not value:
+            continue
+        for match in pattern.findall(value):
+            normalized = match.strip(".,:;()[]{}\"'")
+            if normalized and normalized not in seen:
+                files.append(normalized)
+                seen.add(normalized)
+    return files[:5]
+
+
 def _guardrail_reason(tool_name: str | None, command: str | None) -> str | None:
     if not command:
         return None
@@ -268,6 +284,8 @@ def _recent_tool_evidence(workspace: Path) -> tuple[list[str], list[str]]:
     for item in load_recent_hook_events(workspace, limit=50):
         if item.get("event") != "post-tool-use":
             continue
+        if item.get("command") == "progressive-recall":
+            continue
         command = _truncate(str(item.get("command") or ""), limit=800)
         if command and command not in seen_commands:
             commands.append(command)
@@ -323,6 +341,14 @@ def _cooldown_minutes(event: str) -> float:
         return float(default)
 
 
+def _progressive_recall_cooldown_minutes() -> float:
+    raw = os.environ.get("EXPCAP_HOOK_PROGRESSIVE_COOLDOWN_MINUTES", "10")
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 10.0
+
+
 def _contains_no_save_signal(*values: str | None) -> bool:
     haystack = " ".join(value for value in values if value).casefold()
     return any(marker.casefold() in haystack for marker in NO_SAVE_MARKERS)
@@ -339,6 +365,25 @@ def _recent_duplicate_event(workspace: Path, *, event: str, task: str | None) ->
         if item.get("status") != "success":
             continue
         if _normalize_task(str(item.get("task") or "")) != task:
+            continue
+        created_at = parse_hook_timestamp(item.get("created_at"))
+        if created_at is None:
+            continue
+        age_minutes = (now - created_at).total_seconds() / 60.0
+        if age_minutes <= cooldown:
+            return {**item, "age_minutes": round(age_minutes, 2), "cooldown_minutes": cooldown}
+    return None
+
+
+def _recent_progressive_recall_duplicate(workspace: Path, *, signal: str) -> dict[str, Any] | None:
+    now = datetime.now(timezone.utc)
+    cooldown = _progressive_recall_cooldown_minutes()
+    for item in load_recent_hook_events(workspace, limit=30):
+        if item.get("event") != "post-tool-use":
+            continue
+        if item.get("status") != "progressive-recall":
+            continue
+        if item.get("reason") != signal:
             continue
         created_at = parse_hook_timestamp(item.get("created_at"))
         if created_at is None:
@@ -395,6 +440,68 @@ def _skip_output(reason: str, *, hook_event_name: str | None = None) -> dict[str
             "additionalContext": "",
         }
     return output
+
+
+def _progressive_recall_context(view: dict[str, Any]) -> str:
+    progressive = view.get("progressive_recall") if isinstance(view.get("progressive_recall"), dict) else {}
+    reasons = progressive.get("trigger_reasons") if isinstance(progressive.get("trigger_reasons"), list) else []
+    header = [
+        "# expcap continuous runtime recall",
+        "",
+        "- injection_layer: `continuous_runtime_recall_injection`",
+    ]
+    if reasons:
+        header.append("- trigger_reasons: " + ", ".join(str(reason) for reason in reasons))
+    header.append("")
+    return "\n".join(header) + render_hook_additional_context(view)
+
+
+def _run_post_tool_progressive_recall(
+    *,
+    workspace: Path,
+    command: str | None,
+    error: str | None,
+    tool_status: str,
+) -> tuple[str, dict[str, Any] | None, str | None]:
+    if tool_status != "failed" and not error:
+        return "", None, None
+    signal = _truncate(error or command or tool_status, limit=300)
+    if not signal:
+        return "", None, None
+    duplicate = _recent_progressive_recall_duplicate(workspace, signal=signal)
+    if duplicate:
+        return "", {"triggered": False, "decision": {"skip_reason": "hook_duplicate_cooldown", **duplicate}}, signal
+
+    task = _latest_activation_task(workspace) or _truncate(command, limit=180) or "post tool failure"
+    recall_command = [
+        str(PROJECT_ROOT / "scripts" / "expcap"),
+        "progressive-recall",
+        "--workspace",
+        str(workspace),
+        "--task",
+        task,
+        "--phase",
+        "fix",
+        "--cooldown-minutes",
+        str(_progressive_recall_cooldown_minutes()),
+        "--message",
+        _truncate(f"PostToolUse observed failed command: {command}", limit=600) or "PostToolUse observed failed command.",
+    ]
+    if error:
+        recall_command.extend(["--error", error])
+    for file_signal in _file_signals(command, error):
+        recall_command.extend(["--file", file_signal])
+
+    try:
+        result = _run_expcap(recall_command)
+    except subprocess.CalledProcessError as exc:
+        return "", {"triggered": False, "error": exc.stderr.strip() or exc.stdout.strip() or str(exc)}, signal
+
+    view = result.get("activation_view") if isinstance(result.get("activation_view"), dict) else None
+    selected_count = int(result.get("selected_count", 0) or 0)
+    if result.get("triggered") and view and selected_count > 0:
+        return _progressive_recall_context(view), result, signal
+    return "", result, signal
 
 
 def _record(
@@ -490,7 +597,33 @@ def main() -> int:
                 tool_status=tool_status,
                 error=error,
             )
-            print(json.dumps(_json_continue_output("PostToolUse"), ensure_ascii=False))
+            additional_context, recall_result, recall_signal = _run_post_tool_progressive_recall(
+                workspace=workspace,
+                command=command,
+                error=error,
+                tool_status=tool_status,
+            )
+            if recall_result is not None:
+                recall_status = "progressive-recall" if additional_context else "progressive-recall-skipped"
+                result_summary = (
+                    f"triggered={bool(recall_result.get('triggered'))};"
+                    f"selected_count={recall_result.get('selected_count', 0)}"
+                )
+                decision = recall_result.get("decision") if isinstance(recall_result.get("decision"), dict) else {}
+                _record(
+                    workspace,
+                    host=args.host,
+                    event=args.event,
+                    status=recall_status,
+                    task=_latest_activation_task(workspace),
+                    reason=recall_signal or decision.get("skip_reason") or recall_result.get("error"),
+                    command="progressive-recall",
+                    tool_name=tool_name,
+                    tool_status=tool_status,
+                    error=error,
+                    result_summary=result_summary,
+                )
+            print(json.dumps(_json_continue_output("PostToolUse", additional_context=additional_context), ensure_ascii=False))
             return 0
 
         if args.event == "pre-tool-use":

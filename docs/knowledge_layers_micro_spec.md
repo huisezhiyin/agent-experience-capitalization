@@ -10,6 +10,13 @@ Make expcap's knowledge injection and knowledge save architecture explicit in ru
 - `system_prompt_injection`: durable project-level prompt material intended for `AGENTS.md` / `AGENTS.expcap.md`.
 - `continuous_runtime_recall_injection`: event-driven recall during a conversation, primarily through `progressive-recall`.
 
+## Continuous Runtime Recall Trigger v1
+
+- `PostToolUse` failures and stderr signals trigger `progressive-recall` with phase `fix`.
+- The hook passes the failed command, stderr, and file path hints as delta evidence.
+- When delta recall returns new assets, the hook returns Codex `additionalContext` headed by `continuous_runtime_recall_injection`.
+- Repeated identical failure signals are suppressed by a hook-level cooldown before calling `progressive-recall` again.
+
 ## Save Layers
 
 - `milvus`: semantic retrieval index.
@@ -21,6 +28,7 @@ Make expcap's knowledge injection and knowledge save architecture explicit in ru
 
 - Activation views expose both legacy `injection_channel` and new `injection_layer` metadata.
 - Injection plans expose `injection_layers` with the three-layer architecture.
+- Post-tool failure hooks can inject progressive recall output as `continuous_runtime_recall_injection`.
 - Status output exposes `knowledge_save_layers` with the four save layers and current paths/counts.
 - Focused tests cover the new layer metadata without breaking legacy fields.
 

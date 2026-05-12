@@ -5,7 +5,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from runtime.backends import resolve_backend_config
-from runtime.storage.fs_store import default_milvus_db_path, memory_root_for_workspace, storage_layout_for_workspace
+from runtime.storage.fs_store import (
+    default_milvus_db_path,
+    memory_root_for_workspace,
+    milvus_runtime_db_path,
+    storage_layout_for_workspace,
+)
 
 
 class BackendConfigTests(unittest.TestCase):
@@ -161,6 +166,33 @@ class BackendConfigTests(unittest.TestCase):
             self.assertLess(len(openai_path.name), 36)
             self.assertTrue(hash_path.name.startswith("milvus.hash-token-sha25-"))
             self.assertTrue(openai_path.name.startswith("milvus.openai-text-embe-"))
+
+    def test_user_cache_milvus_runtime_path_uses_short_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            expcap_home = (Path(tmpdir) / "very-long-expcap-home-root" / "nested" / "storage").resolve()
+            codex_home = (Path(tmpdir) / "codex-home").resolve()
+            workspace.mkdir()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "EXPCAP_STORAGE_PROFILE": "user-cache",
+                    "EXPCAP_HOME": str(expcap_home),
+                    "CODEX_HOME": str(codex_home),
+                    "EXPCAP_PROJECT_ID": "github:org/repo-with-a-very-long-name",
+                },
+            ):
+                db_path = default_milvus_db_path(workspace)
+                runtime_path = milvus_runtime_db_path(db_path)
+                layout = storage_layout_for_workspace(workspace)
+
+            self.assertNotEqual(runtime_path, db_path)
+            self.assertLess(len(str(runtime_path.parent)), len(str(db_path.parent)))
+            self.assertTrue(runtime_path.parent.is_symlink())
+            self.assertEqual(runtime_path.parent.resolve(), db_path.parent.resolve())
+            self.assertEqual(layout["retrieval_runtime_path"], str(runtime_path))
+            self.assertTrue(layout["retrieval_runtime_aliased"])
 
     def test_openai_missing_key_fallback_reuses_hash_profile_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

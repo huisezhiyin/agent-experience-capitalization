@@ -11,7 +11,7 @@ from runtime.core.injection_policy import (
     SYSTEM_PROMPT_INJECTION,
     TASK_START_RUNTIME_INJECTION,
 )
-from runtime.storage.fs_store import memory_root_for_workspace, save_json
+from runtime.storage.fs_store import fallback_memory_root_for_workspace, memory_root_for_workspace, save_json
 
 
 CHANNEL_TITLES = {
@@ -151,25 +151,30 @@ def render_hook_additional_context(activation: dict[str, Any], *, max_chars: int
 
 
 def materialize_injection_artifacts(*, workspace: Path, activation: dict[str, Any]) -> dict[str, str]:
-    injection_dir = memory_root_for_workspace(workspace) / "injections"
     activation_id = str(activation.get("activation_id") or "activation")
     payload = injection_artifact_payload(activation)
     markdown = render_injection_markdown(activation)
 
-    json_path = injection_dir / f"{activation_id}.json"
-    markdown_path = injection_dir / f"{activation_id}.md"
-    latest_json_path = injection_dir / "latest.json"
-    latest_markdown_path = injection_dir / "latest.md"
-
-    save_json(json_path, payload)
-    save_json(latest_json_path, payload)
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
-    markdown_path.write_text(markdown, encoding="utf-8")
-    latest_markdown_path.write_text(markdown, encoding="utf-8")
-
-    return {
-        "json_path": str(json_path),
-        "markdown_path": str(markdown_path),
-        "latest_json_path": str(latest_json_path),
-        "latest_markdown_path": str(latest_markdown_path),
-    }
+    for injection_dir in (
+        memory_root_for_workspace(workspace) / "injections",
+        fallback_memory_root_for_workspace(workspace) / "injections",
+    ):
+        json_path = injection_dir / f"{activation_id}.json"
+        markdown_path = injection_dir / f"{activation_id}.md"
+        latest_json_path = injection_dir / "latest.json"
+        latest_markdown_path = injection_dir / "latest.md"
+        try:
+            save_json(json_path, payload)
+            save_json(latest_json_path, payload)
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(markdown, encoding="utf-8")
+            latest_markdown_path.write_text(markdown, encoding="utf-8")
+            return {
+                "json_path": str(json_path),
+                "markdown_path": str(markdown_path),
+                "latest_json_path": str(latest_json_path),
+                "latest_markdown_path": str(latest_markdown_path),
+            }
+        except OSError:
+            continue
+    raise OSError("unable to materialize injection artifacts in primary or fallback memory root")

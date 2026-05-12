@@ -14,6 +14,22 @@ from runtime.storage import milvus_store
 
 @unittest.skipIf(milvus_store.fcntl is None, "fcntl is required for Milvus Lite lock tests")
 class MilvusStoreLockTests(unittest.TestCase):
+    def _runtime_probe(
+        self,
+        *,
+        available: bool = True,
+        reason: str | None = None,
+        successful_probe_path: str | None = None,
+        errors: list[dict[str, str]] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "available": available,
+            "reason": reason,
+            "successful_probe_path": successful_probe_path,
+            "probe_paths": [],
+            "errors": errors or [],
+        }
+
     def _hold_lock(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = db_path.with_name(f"{db_path.name}.lock")
@@ -28,8 +44,8 @@ class MilvusStoreLockTests(unittest.TestCase):
             try:
                 with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
                     milvus_store,
-                    "milvus_runtime_available",
-                    return_value=True,
+                    "milvus_runtime_probe",
+                    return_value=self._runtime_probe(),
                 ):
                     summary = milvus_store.milvus_backend_summary(db_path, deep_check=True)
             finally:
@@ -48,8 +64,8 @@ class MilvusStoreLockTests(unittest.TestCase):
             try:
                 with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
                     milvus_store,
-                    "milvus_runtime_available",
-                    return_value=True,
+                    "milvus_runtime_probe",
+                    return_value=self._runtime_probe(),
                 ), patch.object(
                     milvus_store,
                     "_safe_client_unlocked",
@@ -82,8 +98,8 @@ class MilvusStoreLockTests(unittest.TestCase):
                     return_value=True,
                 ), patch.object(
                     milvus_store,
-                    "milvus_runtime_available",
-                    return_value=True,
+                    "milvus_runtime_probe",
+                    return_value=self._runtime_probe(),
                 ):
                     summary = milvus_store.milvus_backend_summary(db_path)
             finally:
@@ -116,12 +132,35 @@ class MilvusStoreLockTests(unittest.TestCase):
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             lock_path.write_text("pid=999999 acquired_at=1.0\n", encoding="utf-8")
 
-            with patch.object(milvus_store, "_process_exists", return_value=False):
+            with patch.object(
+                milvus_store,
+                "_process_exists",
+                side_effect=lambda pid: False if pid == 999999 else None,
+            ):
                 summary = milvus_store.milvus_lock_summary(db_path)
 
             self.assertTrue(summary["lock_exists"])
-            self.assertFalse(summary["pid_exists"])
-            self.assertTrue(summary["stale_hint"])
+            self.assertIsNone(summary["pid_exists"])
+            self.assertFalse(summary["stale_hint"])
+            self.assertTrue(summary["stale_metadata_cleared"])
+            self.assertEqual(summary["metadata_raw"], "")
+            self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
+
+    def test_milvus_lock_summary_preserves_live_lock_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            lock_file = self._hold_lock(db_path)
+            milvus_store._write_lock_metadata(lock_file)
+            try:
+                summary = milvus_store.milvus_lock_summary(db_path)
+            finally:
+                milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
+                lock_file.close()
+
+            self.assertTrue(summary["lock_exists"])
+            self.assertTrue(summary["locked"])
+            self.assertFalse(summary["stale_metadata_cleared"])
+            self.assertEqual(summary["metadata"]["pid"], os.getpid())
 
     def test_milvus_db_lock_clears_metadata_after_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -141,8 +180,8 @@ class MilvusStoreLockTests(unittest.TestCase):
             db_path.touch()
             with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
                 milvus_store,
-                "milvus_runtime_available",
-                return_value=True,
+                "milvus_runtime_probe",
+                return_value=self._runtime_probe(),
             ), patch.object(
                 milvus_store,
                 "_safe_client_unlocked",
@@ -275,8 +314,8 @@ class MilvusStoreLockTests(unittest.TestCase):
             db_path = Path(tmpdir) / "milvus.db"
             with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
                 milvus_store,
-                "milvus_runtime_available",
-                return_value=True,
+                "milvus_runtime_probe",
+                return_value=self._runtime_probe(),
             ), patch.object(
                 milvus_store,
                 "_safe_client_unlocked",
@@ -295,8 +334,12 @@ class MilvusStoreLockTests(unittest.TestCase):
             db_path.touch()
             with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
                 milvus_store,
-                "milvus_runtime_available",
-                return_value=False,
+                "milvus_runtime_probe",
+                return_value=self._runtime_probe(
+                    available=False,
+                    reason="unix_socket_bind_unavailable",
+                    errors=[{"path": tmpdir, "error": "permission denied"}],
+                ),
             ), patch.object(
                 milvus_store,
                 "_safe_client_unlocked",
@@ -307,14 +350,15 @@ class MilvusStoreLockTests(unittest.TestCase):
             self.assertEqual(summary["status"], "degraded")
             self.assertFalse(summary["runtime_available"])
             self.assertEqual(summary["degraded_reason"], "unix_socket_bind_unavailable")
+            self.assertEqual(summary["runtime_probe"]["errors"][0]["error"], "permission denied")
 
     def test_backend_summary_degrades_when_lock_file_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "milvus.db"
             with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
                 milvus_store,
-                "milvus_runtime_available",
-                return_value=True,
+                "milvus_runtime_probe",
+                return_value=self._runtime_probe(),
             ), patch.object(Path, "open", side_effect=PermissionError("denied")):
                 summary = milvus_store.milvus_backend_summary(db_path, deep_check=True)
 
@@ -331,8 +375,8 @@ class MilvusStoreLockTests(unittest.TestCase):
             try:
                 with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
                     milvus_store,
-                    "milvus_runtime_available",
-                    return_value=True,
+                    "milvus_runtime_probe",
+                    return_value=self._runtime_probe(),
                 ), patch.object(
                     milvus_store,
                     "_safe_client_unlocked",
@@ -347,6 +391,58 @@ class MilvusStoreLockTests(unittest.TestCase):
             finally:
                 milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
                 lock_file.close()
+
+    def test_runtime_probe_tries_multiple_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            blocked_dir = Path(tmpdir) / "blocked"
+            healthy_dir = Path(tmpdir) / "healthy"
+            bind_calls: list[str] = []
+
+            class FakeSocket:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb) -> None:
+                    return None
+
+                def bind(self, path: str) -> None:
+                    bind_calls.append(path)
+                    if "blocked" in path:
+                        raise PermissionError("blocked")
+
+            with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "_milvus_runtime_probe_dirs",
+                return_value=[blocked_dir, healthy_dir],
+            ), patch.object(milvus_store.socket, "socket", side_effect=lambda *args, **kwargs: FakeSocket()):
+                probe = milvus_store.milvus_runtime_probe(healthy_dir / "milvus.db")
+
+            self.assertTrue(probe["available"])
+            self.assertEqual(len(bind_calls), 2)
+            self.assertIn("blocked", probe["errors"][0]["path"])
+            self.assertIn("healthy", str(probe["successful_probe_path"]))
+
+    def test_client_uses_runtime_alias_path_for_local_milvus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "very" / "long" / "nested" / "milvus.db"
+            runtime_db_path = Path(tmpdir) / "alias" / "milvus.db"
+            captured: dict[str, object] = {}
+
+            class FakeMilvusClient:
+                def __init__(self, *args, **kwargs) -> None:
+                    captured["args"] = args
+                    captured["kwargs"] = kwargs
+
+            fake_pymilvus = types.SimpleNamespace(MilvusClient=FakeMilvusClient)
+            with patch.dict(sys.modules, {"pymilvus": fake_pymilvus}), patch.object(
+                milvus_store,
+                "milvus_runtime_db_path",
+                return_value=runtime_db_path,
+            ):
+                milvus_store._client(db_path)
+
+            self.assertEqual(captured["args"], (str(runtime_db_path),))
+            self.assertEqual(captured["kwargs"], {})
 
     def test_sync_assets_directory_with_report_prunes_stale_vectors(self) -> None:
         class FakeClient:

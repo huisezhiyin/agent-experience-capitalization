@@ -2018,7 +2018,8 @@ def _apply_activation_feedback(
     db_path: Path,
     activation_id: str,
     feedback: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+    write_warnings: list[dict[str, str]] = []
     updated_activation = None
     for candidate_db_path in _workspace_db_paths(workspace):
         try:
@@ -2048,7 +2049,7 @@ def _apply_activation_feedback(
                     updated_activation["feedback"] = feedback
                     break
     if not updated_activation:
-        return None
+        return None, write_warnings
     _update_activation_view_file(workspace, updated_activation)
     linked_asset_ids = _linked_asset_ids_from_activation(updated_activation)
     feedback_stats = {}
@@ -2097,13 +2098,21 @@ def _apply_activation_feedback(
             kind="asset_effectiveness_unwritten",
             action=lambda asset_db_path=asset_db_path, asset=asset: upsert_asset(asset_db_path, asset),
         )
-        save_json(asset_path, asset)
+        asset_path, asset_save_warning = _save_workspace_json(
+            workspace=workspace,
+            output_path=asset_path,
+            payload=asset,
+            requested_output=None,
+            reason="default_asset_output_unwritable",
+        )
+        if asset_save_warning:
+            write_warnings.append(asset_save_warning)
     return {
         "activation_id": updated_activation["activation_id"],
         "help_signal": feedback["help_signal"],
         "linked_asset_ids": linked_asset_ids,
         "feedback_summary": feedback.get("feedback_summary"),
-    }
+    }, write_warnings
 
 
 def _handle_auto_start(args: argparse.Namespace) -> int:
@@ -2487,7 +2496,7 @@ def _handle_feedback(args: argparse.Namespace) -> int:
         "feedback_summary": args.feedback_summary or f"Recorded {args.help_signal} via expcap feedback command.",
         "feedback_at": args.feedback_at or now_utc(),
     }
-    activation_feedback = _apply_activation_feedback(
+    activation_feedback, write_warnings = _apply_activation_feedback(
         workspace=workspace,
         db_path=db_path,
         activation_id=activation_id,
@@ -2498,6 +2507,7 @@ def _handle_feedback(args: argparse.Namespace) -> int:
             "updated": bool(activation_feedback),
             "workspace": str(workspace),
             "activation_feedback": activation_feedback,
+            "write_warnings": write_warnings,
         }
     )
     return 0
@@ -2629,12 +2639,13 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             "trace_id": trace["trace_id"],
             "episode_id": episode["episode_id"],
         }
-        activation_feedback = _apply_activation_feedback(
+        activation_feedback, activation_feedback_write_warnings = _apply_activation_feedback(
             workspace=workspace,
             db_path=db_path,
             activation_id=target_activation["activation_id"],
             feedback=feedback,
         )
+        write_warnings.extend(activation_feedback_write_warnings)
 
     saved_candidates = []
     promoted_assets = []

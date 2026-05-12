@@ -1190,6 +1190,96 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("sqlite_warnings", captured)
             self.assertTrue(Path(captured["trace"]["path"]).exists())
 
+    def test_cli_auto_finish_falls_back_when_feedback_asset_write_hits_primary_user_cache_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            primary_root = cli_main.memory_root_for_workspace(workspace)
+            fallback_root = fallback_memory_root_for_workspace(workspace)
+            asset = {
+                "asset_id": "pattern_feedback_fallback_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "feedback fallback pattern",
+                "content": "keep auto-finish feedback writes alive when the primary user-cache root is readonly.",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "source_episode_ids": ["ep_feedback_fallback_001"],
+                "source_candidate_ids": ["cand_feedback_fallback_001"],
+                "confidence": 0.88,
+                "status": "active",
+                "last_used_at": None,
+                "created_at": "2026-04-13T00:00:00+00:00",
+                "updated_at": "2026-04-13T00:00:00+00:00",
+            }
+            asset_path = primary_root / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            cli_main.save_json(asset_path, asset)
+
+            start_payload: dict[str, object] = {}
+            finish_payload: dict[str, object] = {}
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                try:
+                    relative = Path(path).relative_to(primary_root)
+                except ValueError:
+                    original_save_json(path, payload)
+                    return
+                if relative.parts[:2] == ("assets", "patterns"):
+                    raise PermissionError("operation not permitted for primary user-cache asset path")
+                original_save_json(path, payload)
+
+            start_args = argparse.Namespace(
+                workspace=str(workspace),
+                task="repair feedback asset fallback",
+                constraints=[],
+                output=None,
+            )
+            finish_args = argparse.Namespace(
+                workspace=str(workspace),
+                task="repair feedback asset fallback",
+                user_request=None,
+                constraints=[],
+                commands=[],
+                errors=[],
+                files_changed=[],
+                verification_status="passed",
+                verification_summary="1 passed",
+                result_status="success",
+                result_summary="feedback asset fallback works",
+                host=None,
+                session_id=None,
+                trace_id="trace_feedback_asset_fallback",
+                no_promote=False,
+                promote_threshold=0.75,
+                knowledge_scope="project",
+                knowledge_kind="pattern",
+            )
+
+            with patch.object(cli_main, "save_json", side_effect=flaky_save_json), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: start_payload.update(payload) if "activation_view" in payload else finish_payload.update(payload),
+            ):
+                self.assertEqual(cli_main._handle_auto_start(start_args), 0)
+                self.assertEqual(cli_main._handle_auto_finish(finish_args), 0)
+
+            fallback_asset_path = fallback_root / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            self.assertEqual(finish_payload["activation_feedback"]["help_signal"], "supported_strong")
+            self.assertIn("write_warnings", finish_payload)
+            self.assertTrue(any(
+                warning["reason"] == "default_asset_output_unwritable"
+                for warning in finish_payload["write_warnings"]
+            ))
+            self.assertTrue(fallback_asset_path.exists())
+            fallback_asset = json.loads(fallback_asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(fallback_asset["historical_help"]["supported_count"], 1)
+            self.assertEqual(fallback_asset["review_status"], "healthy")
+
     def test_cli_doctor_reports_workspace_health_and_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"

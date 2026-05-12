@@ -132,12 +132,35 @@ class MilvusStoreLockTests(unittest.TestCase):
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             lock_path.write_text("pid=999999 acquired_at=1.0\n", encoding="utf-8")
 
-            with patch.object(milvus_store, "_process_exists", return_value=False):
+            with patch.object(
+                milvus_store,
+                "_process_exists",
+                side_effect=lambda pid: False if pid == 999999 else None,
+            ):
                 summary = milvus_store.milvus_lock_summary(db_path)
 
             self.assertTrue(summary["lock_exists"])
-            self.assertFalse(summary["pid_exists"])
-            self.assertTrue(summary["stale_hint"])
+            self.assertIsNone(summary["pid_exists"])
+            self.assertFalse(summary["stale_hint"])
+            self.assertTrue(summary["stale_metadata_cleared"])
+            self.assertEqual(summary["metadata_raw"], "")
+            self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
+
+    def test_milvus_lock_summary_preserves_live_lock_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            lock_file = self._hold_lock(db_path)
+            milvus_store._write_lock_metadata(lock_file)
+            try:
+                summary = milvus_store.milvus_lock_summary(db_path)
+            finally:
+                milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
+                lock_file.close()
+
+            self.assertTrue(summary["lock_exists"])
+            self.assertTrue(summary["locked"])
+            self.assertFalse(summary["stale_metadata_cleared"])
+            self.assertEqual(summary["metadata"]["pid"], os.getpid())
 
     def test_milvus_db_lock_clears_metadata_after_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

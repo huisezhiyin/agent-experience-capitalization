@@ -288,12 +288,18 @@ def milvus_lock_summary(db_path: Path) -> dict[str, Any]:
 
     locked: bool | None = None
     lock_error = None
+    stale_metadata_cleared = False
     if fcntl is not None:
         try:
             db_path.parent.mkdir(parents=True, exist_ok=True)
             with lock_path.open("a+", encoding="utf-8") as lock_file:
                 if _try_acquire_lock(lock_file):
                     locked = False
+                    if lock_path.exists() and _process_exists(metadata.get("pid")) is False:
+                        _clear_lock_metadata(lock_file)
+                        raw_value = ""
+                        metadata = {}
+                        stale_metadata_cleared = True
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
                 else:
                     locked = True
@@ -315,6 +321,7 @@ def milvus_lock_summary(db_path: Path) -> dict[str, Any]:
         "pid_exists": pid_exists,
         "age_seconds": age_seconds,
         "stale_hint": bool(lock_path.exists() and pid_exists is False),
+        "stale_metadata_cleared": stale_metadata_cleared,
     }
 
 

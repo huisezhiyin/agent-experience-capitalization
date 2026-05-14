@@ -306,6 +306,20 @@ def _recent_validation_topics(activations: list[dict[str, Any]], *, limit: int =
     return topics[:24]
 
 
+def _validation_age_bucket(timestamp: str | None) -> str:
+    parsed = _parse_datetime(timestamp)
+    if not parsed:
+        return "unknown"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    age_days = max((datetime.now(timezone.utc) - parsed).total_seconds() / 86400.0, 0.0)
+    if age_days <= 7.0:
+        return "0_7d"
+    if age_days <= 30.0:
+        return "8_30d"
+    return "31d_plus"
+
+
 def _build_unproven_validation_queue(
     assets: list[dict[str, Any]],
     *,
@@ -314,23 +328,31 @@ def _build_unproven_validation_queue(
 ) -> dict[str, Any]:
     recent_topics = _recent_validation_topics(activations)
     queue_items: list[dict[str, Any]] = []
+    kind_summary: dict[str, int] = {}
+    age_summary = {"0_7d": 0, "8_30d": 0, "31d_plus": 0, "unknown": 0}
     for asset in assets:
         if asset.get("review_status", "unproven") != "unproven":
             continue
         title = str(asset.get("title") or "")
         content = str(asset.get("content") or "")
+        knowledge_kind = asset.get("knowledge_kind", asset.get("asset_type", "pattern"))
+        updated_at = asset.get("updated_at") or asset.get("created_at")
         topic_hits = [token for token in recent_topics if token in title.lower() or token in content.lower()]
         relevance_bonus = round(min(len(topic_hits), 4) * 0.08, 4)
         priority_score = round(_asset_validation_priority(asset) + relevance_bonus, 4)
+        age_bucket = _validation_age_bucket(updated_at)
+        kind_summary[str(knowledge_kind or "pattern")] = kind_summary.get(str(knowledge_kind or "pattern"), 0) + 1
+        age_summary[age_bucket] = age_summary.get(age_bucket, 0) + 1
         queue_items.append(
             {
                 "asset_id": asset.get("asset_id"),
                 "title": asset.get("title"),
-                "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
+                "knowledge_kind": knowledge_kind,
                 "knowledge_scope": asset.get("knowledge_scope", "project"),
                 "confidence": asset.get("confidence"),
-                "updated_at": asset.get("updated_at") or asset.get("created_at"),
+                "updated_at": updated_at,
                 "priority_score": priority_score,
+                "age_bucket": age_bucket,
                 "recent_topic_hits": topic_hits[:6],
                 "validation_hint": (
                     f"Recent task overlap: {', '.join(topic_hits[:3])}."
@@ -349,6 +371,10 @@ def _build_unproven_validation_queue(
     return {
         "asset_count": len(queue_items),
         "recent_topics": recent_topics,
+        "kind_summary": dict(sorted(kind_summary.items())),
+        "age_summary": age_summary,
+        "top_kind": sorted(kind_summary.items(), key=lambda item: (-item[1], item[0]))[0][0] if kind_summary else None,
+        "recommended_batch_size": min(len(queue_items), 3),
         "top_items": queue_items[:limit],
     }
 
@@ -3465,12 +3491,17 @@ def _handle_validation_plan(args: argparse.Namespace) -> int:
             "knowledge_kind": item.get("knowledge_kind"),
             "knowledge_scope": item.get("knowledge_scope"),
             "priority_score": item.get("priority_score"),
+            "age_bucket": item.get("age_bucket"),
             "recent_topic_hits": item.get("recent_topic_hits", []),
             "validation_hint": item.get("validation_hint"),
             "recommended_followup": (
                 f"优先在下一次涉及 {', '.join(item.get('recent_topic_hits', [])[:3])} 的真实任务中激活并回写 feedback。"
                 if item.get("recent_topic_hits")
-                else "优先挑一次真实任务显式验证这条资产，并补 help feedback。"
+                else (
+                    "这条资产已积压超过 30 天；优先挑一次真实任务显式验证，若继续无命中则考虑降温或复审。"
+                    if item.get("age_bucket") == "31d_plus"
+                    else "优先挑一次真实任务显式验证这条资产，并补 help feedback。"
+                )
             ),
             "updated_at": item.get("updated_at"),
         }
@@ -3487,7 +3518,10 @@ def _handle_validation_plan(args: argparse.Namespace) -> int:
         "summary": {
             "top_priority_asset_id": plan_items[0]["asset_id"] if plan_items else None,
             "top_priority_score": plan_items[0]["priority_score"] if plan_items else None,
-            "recommended_batch_size": min(len(plan_items), 3),
+            "recommended_batch_size": queue.get("recommended_batch_size", min(len(plan_items), 3)),
+            "top_kind": queue.get("top_kind"),
+            "kind_summary": queue.get("kind_summary", {}),
+            "age_summary": queue.get("age_summary", {}),
         },
     }
     output_path = (
@@ -4639,6 +4673,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
     quality = payload["quality"]
     kind_summary = payload["knowledge_kind_summary"]
     injection_summary = payload["injection_policy_summary"]
+    unproven_queue = payload.get("unproven_validation_queue") or {"asset_count": 0, "top_kind": None, "recommended_batch_size": 0, "age_summary": {}, "kind_summary": {}}
     raw_json = html_escape(json.dumps(payload, ensure_ascii=False, indent=2), quote=False)
     write_rows = [
         [item["date"], item["assets"], item["candidates"], item["activations"]]
@@ -4873,6 +4908,11 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
 
   <section class="panel">
     <h2>Unproven Validation Queue</h2>
+    <div class="metric-line"><span>Backlog</span><strong>{_safe_text(unproven_queue.get("asset_count", 0))}</strong></div>
+    <div class="metric-line"><span>Top kind</span><strong>{_safe_text(unproven_queue.get("top_kind") or "none")}</strong></div>
+    <div class="metric-line"><span>Recommended batch</span><strong>{_safe_text(unproven_queue.get("recommended_batch_size", 0))}</strong></div>
+    <div class="metric-line"><span>Age buckets</span><strong>{_safe_text(unproven_queue.get("age_summary"))}</strong></div>
+    <div class="metric-line"><span>Kind summary</span><strong>{_safe_text(unproven_queue.get("kind_summary"))}</strong></div>
     {_render_dashboard_table(["Title", "Kind", "Confidence", "Priority", "Validation Hint", "Updated"], unproven_rows)}
   </section>
 

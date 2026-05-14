@@ -2263,7 +2263,12 @@ class CliFlowTests(unittest.TestCase):
             queue = payload["unproven_validation_queue"]
             self.assertEqual(queue["asset_count"], 1)
             self.assertEqual(queue["top_items"][0]["asset_id"], "pattern_unproven_priority")
+            self.assertEqual(queue["top_kind"], "pattern")
+            self.assertEqual(queue["kind_summary"]["pattern"], 1)
+            self.assertEqual(queue["recommended_batch_size"], 1)
             self.assertIn("Needs first real activation", queue["top_items"][0]["validation_hint"])
+            self.assertEqual(queue["top_items"][0]["age_bucket"], "8_30d")
+            self.assertEqual(queue["age_summary"]["8_30d"], 1)
 
     def test_cli_status_prioritizes_unproven_assets_relevant_to_recent_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2410,10 +2415,61 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(plan["kind"], "unproven_validation_plan")
             self.assertEqual(plan["plan_count"], 1)
             self.assertEqual(plan["summary"]["top_priority_asset_id"], "pattern_validation_target")
+            self.assertEqual(plan["summary"]["top_kind"], "pattern")
+            self.assertEqual(plan["summary"]["kind_summary"]["pattern"], 1)
             self.assertEqual(plan["items"][0]["rank"], 1)
             self.assertIn("activation", plan["items"][0]["recent_topic_hits"])
             self.assertIn("真实任务", plan["items"][0]["recommended_followup"])
             self.assertEqual(saved_plan["items"][0]["asset_id"], "pattern_validation_target")
+
+    def test_cli_validation_plan_marks_stale_unproven_assets_for_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_stale_validation_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "stale validation target pattern",
+                    "content": "old unproven backlog item",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.88,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "validation-plan",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            plan = json.loads(completed.stdout)["validation_plan"]
+            self.assertEqual(plan["items"][0]["age_bucket"], "31d_plus")
+            self.assertEqual(plan["summary"]["age_summary"]["31d_plus"], 1)
+            self.assertIn("降温或复审", plan["items"][0]["recommended_followup"])
 
     def test_cli_feedback_records_signal_and_refreshes_asset_effectiveness(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

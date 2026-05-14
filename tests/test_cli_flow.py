@@ -27,34 +27,41 @@ def _write_candidate(
     promotion_readiness: str = "boosted",
     help_signal: str = "supported_strong",
     knowledge_kind: str = "pattern",
+    source_context: dict[str, object] | None = None,
+    content_policy: dict[str, object] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "candidate_id": candidate_id,
+        "source_episode_ids": ["ep_manual_review_001"],
+        "workspace": str(workspace),
+        "candidate_type": "pattern",
+        "knowledge_kind": knowledge_kind,
+        "title": "manual review candidate",
+        "content": "promote stable manual review experience into reusable guidance.",
+        "reusability_score": 0.8,
+        "stability_score": 0.79,
+        "confidence_score": 0.81,
+        "constraint_value_score": 0.78,
+        "scope": {"level": "workspace", "value": "general-coding-task"},
+        "promotion_feedback": {
+            "help_signal": help_signal,
+            "signal_bonus": 0.05 if help_signal == "supported_strong" else 0.02,
+            "activation_id": "act_manual_review_001",
+            "linked_asset_ids": ["pattern_manual_support_001"],
+            "feedback_summary": "manual review looked helpful",
+        },
+        "promotion_readiness": promotion_readiness,
+        "status": status,
+        "created_at": "2026-04-17T00:00:00+00:00",
+    }
+    if source_context:
+        payload["source_context"] = source_context
+    if content_policy:
+        payload["content_policy"] = content_policy
     path.write_text(
         json.dumps(
-            {
-                "candidate_id": candidate_id,
-                "source_episode_ids": ["ep_manual_review_001"],
-                "workspace": str(workspace),
-                "candidate_type": "pattern",
-                "knowledge_kind": knowledge_kind,
-                "title": "manual review candidate",
-                "content": "promote stable manual review experience into reusable guidance.",
-                "reusability_score": 0.8,
-                "stability_score": 0.79,
-                "confidence_score": 0.81,
-                "constraint_value_score": 0.78,
-                "scope": {"level": "workspace", "value": "general-coding-task"},
-                "promotion_feedback": {
-                    "help_signal": help_signal,
-                    "signal_bonus": 0.05 if help_signal == "supported_strong" else 0.02,
-                    "activation_id": "act_manual_review_001",
-                    "linked_asset_ids": ["pattern_manual_support_001"],
-                    "feedback_summary": "manual review looked helpful",
-                },
-                "promotion_readiness": promotion_readiness,
-                "status": status,
-                "created_at": "2026-04-17T00:00:00+00:00",
-            },
+            payload,
             ensure_ascii=False,
             indent=2,
         )
@@ -1190,6 +1197,113 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("sqlite_warnings", captured)
             self.assertTrue(Path(captured["trace"]["path"]).exists())
 
+    def test_cli_auto_finish_writes_state_index_to_fallback_sqlite_when_primary_is_readonly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            primary_db = default_db_path(workspace)
+            fallback_db = fallback_memory_root_for_workspace(workspace) / "index.sqlite3"
+            original_ensure_db = cli_main.ensure_db
+            original_upsert_trace = cli_main.upsert_trace
+            original_upsert_episode = cli_main.upsert_episode
+            original_upsert_candidate = cli_main.upsert_candidate
+            original_upsert_asset = cli_main.upsert_asset
+
+            def fail_on_primary(path: Path) -> None:
+                if Path(path) == primary_db:
+                    raise sqlite3.OperationalError("attempt to write a readonly database")
+                original_ensure_db(path)
+
+            def fail_upsert_trace(path: Path, trace: dict[str, object]) -> None:
+                if Path(path) == primary_db:
+                    raise sqlite3.OperationalError("attempt to write a readonly database")
+                original_upsert_trace(path, trace)
+
+            def fail_upsert_episode(path: Path, episode: dict[str, object]) -> None:
+                if Path(path) == primary_db:
+                    raise sqlite3.OperationalError("attempt to write a readonly database")
+                original_upsert_episode(path, episode)
+
+            def fail_upsert_candidate(path: Path, candidate: dict[str, object]) -> None:
+                if Path(path) == primary_db:
+                    raise sqlite3.OperationalError("attempt to write a readonly database")
+                original_upsert_candidate(path, candidate)
+
+            def fail_upsert_asset(path: Path, asset: dict[str, object]) -> None:
+                if Path(path) == primary_db:
+                    raise sqlite3.OperationalError("attempt to write a readonly database")
+                original_upsert_asset(path, asset)
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="repair readonly fallback sqlite indexing",
+                user_request=None,
+                constraints=[],
+                commands=[],
+                errors=[],
+                files_changed=[],
+                verification_status="passed",
+                verification_summary="1 passed",
+                result_status="success",
+                result_summary="fallback sqlite indexing works",
+                host=None,
+                session_id=None,
+                trace_id="trace_fallback_sqlite_indexing",
+                no_promote=False,
+                promote_threshold=0.0,
+                knowledge_scope="project",
+                knowledge_kind="pattern",
+            )
+
+            with patch.object(cli_main, "ensure_db", side_effect=fail_on_primary), patch.object(
+                cli_main,
+                "upsert_trace",
+                side_effect=fail_upsert_trace,
+            ), patch.object(
+                cli_main,
+                "upsert_episode",
+                side_effect=fail_upsert_episode,
+            ), patch.object(
+                cli_main,
+                "upsert_candidate",
+                side_effect=fail_upsert_candidate,
+            ), patch.object(
+                cli_main,
+                "upsert_asset",
+                side_effect=fail_upsert_asset,
+            ), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_auto_finish(args)
+
+            self.assertEqual(result, 0)
+            self.assertTrue(fallback_db.exists())
+            self.assertIn("sqlite_warnings", captured)
+            sqlite_warnings = captured["sqlite_warnings"]
+            assert isinstance(sqlite_warnings, list)
+            self.assertTrue(any(item["runtime_state"] == "fallback_active" for item in sqlite_warnings))
+            self.assertTrue(any(item.get("fallback_write_succeeded") for item in sqlite_warnings))
+
+            conn = sqlite3.connect(fallback_db)
+            try:
+                trace_count = conn.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
+                episode_count = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+                candidate_count = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+                asset_count = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(trace_count, 1)
+            self.assertEqual(episode_count, 1)
+            self.assertGreaterEqual(candidate_count, 1)
+            self.assertGreaterEqual(asset_count, 1)
+
     def test_cli_auto_finish_falls_back_when_feedback_asset_write_hits_primary_user_cache_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
             os.environ,
@@ -1365,6 +1479,32 @@ class CliFlowTests(unittest.TestCase):
                         "updated_at": "2026-04-26T00:00:00+00:00",
                     },
                 )
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": "rule_org_convention_dashboard_001",
+                        "workspace": str(workspace),
+                        "asset_type": "rule",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "org_convention",
+                        "title": "org convention dashboard pattern",
+                        "content": "internal components and sibling project demos should be treated as project-local priors.",
+                        "scope": {"level": "workspace", "value": "dashboard-test"},
+                        "source_episode_ids": ["ep_dashboard_002"],
+                        "source_candidate_ids": ["cand_dashboard_002"],
+                        "confidence": 0.88,
+                        "status": "active",
+                        "review_status": "healthy",
+                        "temperature": "warm",
+                        "source_context": {
+                            "kind": "sibling_project",
+                            "ref": "apps/billing-demo",
+                            "matched_signals": ["兄弟项目", "demo"],
+                        },
+                        "created_at": "2026-04-26T00:05:00+00:00",
+                        "updated_at": "2026-04-26T00:05:00+00:00",
+                    },
+                )
                 log_activation(
                     db_path,
                     {
@@ -1439,18 +1579,31 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("Backend Runtime", html)
             self.assertIn("Unproven Validation Queue", html)
             self.assertIn("Local Prior Distribution", html)
+            self.assertIn("Governance focus", html)
+            self.assertIn("Org Conventions", html)
+            self.assertIn("Source", html)
+            self.assertIn("apps/billing-demo", html)
             self.assertIn("Injection Channels", html)
             self.assertIn("Injection Layers", html)
-            self.assertEqual(payload["dashboard"]["cards"]["assets"], 1)
-            self.assertEqual(payload["dashboard"]["cards"]["local_prior_assets"], 1)
-            self.assertEqual(payload["dashboard"]["cards"]["high_priority_prior_assets"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["assets"], 2)
+            self.assertEqual(payload["dashboard"]["cards"]["local_prior_assets"], 2)
+            self.assertEqual(payload["dashboard"]["cards"]["high_priority_prior_assets"], 2)
+            self.assertEqual(payload["dashboard"]["cards"]["governance_focus_assets"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["org_convention_assets"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["emotional_feedback_assets"], 0)
             self.assertEqual(payload["dashboard"]["cards"]["system_prompt_items"], 1)
             self.assertEqual(payload["dashboard"]["cards"]["reference_summary_items"], 1)
             self.assertIn("effectiveness_snapshot", payload["dashboard"])
             self.assertEqual(payload["dashboard"]["unproven_validation_count"], 0)
-            self.assertEqual(dashboard["cards"]["healthy_assets"], 1)
+            self.assertEqual(dashboard["cards"]["healthy_assets"], 2)
             self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["by_kind"]["preference"], 1)
-            self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["high_priority_count"], 1)
+            self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["by_kind"]["org_convention"], 1)
+            self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["high_priority_count"], 2)
+            self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["governance_focus_count"], 1)
+            self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["governance_focus_by_kind"]["org_convention"], 1)
+            org_asset = next(item for item in dashboard["assets"] if item["knowledge_kind"] == "org_convention")
+            self.assertEqual(org_asset["source_context"]["kind"], "sibling_project")
+            self.assertIn("apps/billing-demo", org_asset["source_context_summary"])
             self.assertEqual(dashboard["injection_policy_summary"]["channel_counts"]["system_prompt"], 1)
             self.assertEqual(
                 dashboard["injection_policy_summary"]["layer_counts"]["system_prompt_injection"],
@@ -1464,6 +1617,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(dashboard["retrieval"]["effectiveness"]["selected_from_milvus"], 1)
             self.assertEqual(dashboard["activations"][0]["help_signal"], "supported_strong")
             self.assertEqual(dashboard["unproven_validation_queue"]["asset_count"], 0)
+            self.assertIn("runtime_degradation_summary", dashboard["status"])
 
     def test_dashboard_html_shows_backend_runtime_panel_for_fallback_sqlite(self) -> None:
         payload = {
@@ -1535,6 +1689,18 @@ class CliFlowTests(unittest.TestCase):
                     }
                 },
                 "runtime_warnings": [],
+                "runtime_degradation_summary": {
+                    "warning_count": 2,
+                    "permission_induced_count": 2,
+                    "runtime_failure_count": 0,
+                    "hard_failure_count": 0,
+                    "fallback_write_success_count": 1,
+                    "fallback_sqlite_paths": ["/tmp/expcap-runtime/index.sqlite3"],
+                    "cause_counts": {"permission_or_sandbox": 2},
+                    "state_counts": {"fallback_active": 2},
+                    "has_permission_induced_warning": True,
+                    "has_hard_failure": False,
+                },
             },
         }
 
@@ -1542,6 +1708,8 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("Backend Runtime", html)
         self.assertIn("fallback_sqlite", html)
         self.assertIn("/tmp/expcap-runtime/index.sqlite3", html)
+        self.assertIn("Fallback writes succeeded", html)
+        self.assertIn("Permission-induced", html)
 
     def test_cli_dashboard_falls_back_when_default_json_sidecar_is_unwritable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1906,6 +2074,64 @@ class CliFlowTests(unittest.TestCase):
             sqlite_check = next(item for item in doctor["checks"] if item["name"] == "sqlite_index")
             self.assertIn("fallback SQLite is serving state", sqlite_check["summary"])
 
+    def test_cli_doctor_describes_permission_induced_milvus_probe_degradation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+            local_summary = {
+                "backend": "milvus-lite",
+                "mode": "local",
+                "available": True,
+                "runtime_available": False,
+                "status": "degraded",
+                "degraded_reason": "unix_socket_bind_unavailable",
+                "db_path": str(workspace / "milvus.db"),
+                "runtime_probe": {
+                    "available": False,
+                    "successful_probe_path": None,
+                    "probe_paths": [str(workspace), "/tmp"],
+                    "errors": [{"path": str(workspace), "error": "operation not permitted"}],
+                },
+                "indexed_entities": None,
+            }
+            shared_summary = {
+                "backend": "milvus-lite",
+                "mode": "local",
+                "available": True,
+                "runtime_available": False,
+                "status": "degraded",
+                "degraded_reason": "unix_socket_bind_unavailable",
+                "db_path": "/tmp/shared-milvus.db",
+                "runtime_probe": {
+                    "available": False,
+                    "successful_probe_path": None,
+                    "probe_paths": ["/tmp"],
+                    "errors": [{"path": "/tmp", "error": "operation not permitted"}],
+                },
+                "indexed_entities": None,
+            }
+
+            with patch.object(cli_main, "milvus_backend_summary", side_effect=[local_summary, shared_summary]), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_doctor(args)
+
+            self.assertEqual(result, 0)
+            doctor = captured["doctor"]
+            assert isinstance(doctor, dict)
+            milvus_check = next(item for item in doctor["checks"] if item["name"] == "local_milvus")
+            self.assertIn("permission/sandbox-induced", milvus_check["summary"])
+            self.assertIn("less restricted environment", milvus_check["recommendation"])
+
     def test_dashboard_html_shows_degraded_banner_when_sqlite_unavailable(self) -> None:
         payload = {
             "status": {
@@ -1914,6 +2140,9 @@ class CliFlowTests(unittest.TestCase):
                         "runtime_state": "degraded_primary",
                         "reason": "sqlite_index_unavailable",
                         "error": "readonly sqlite index",
+                        "degradation_cause": "permission_or_sandbox",
+                        "fallback_write_succeeded": True,
+                        "fallback_db_path": "/tmp/expcap-runtime/index.sqlite3",
                     }
                 ]
             }
@@ -1925,6 +2154,30 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("sqlite_index_unavailable", html)
         self.assertIn("readonly sqlite index", html)
         self.assertIn("degraded_primary", html)
+        self.assertIn("permission_or_sandbox", html)
+        self.assertIn("Fallback writes", html)
+
+    def test_build_runtime_degradation_summary_counts_permission_and_fallback_writes(self) -> None:
+        summary = cli_main._build_runtime_degradation_summary(
+            [
+                {
+                    "runtime_state": "fallback_active",
+                    "degradation_cause": "permission_or_sandbox",
+                    "fallback_write_succeeded": True,
+                    "fallback_db_path": "/tmp/fallback-a.sqlite3",
+                },
+                {
+                    "runtime_state": "degraded_primary",
+                    "degradation_cause": "runtime_failure",
+                },
+            ]
+        )
+
+        self.assertEqual(summary["warning_count"], 2)
+        self.assertEqual(summary["permission_induced_count"], 1)
+        self.assertEqual(summary["runtime_failure_count"], 1)
+        self.assertEqual(summary["fallback_write_success_count"], 1)
+        self.assertEqual(summary["fallback_sqlite_paths"], ["/tmp/fallback-a.sqlite3"])
 
     def test_dashboard_html_shows_hard_failure_runtime_warning_summary(self) -> None:
         payload = {
@@ -4060,6 +4313,49 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(items[0]["suggested_action"], "review")
             self.assertTrue(any("高优先级本地先验" in item for item in items[0]["reasons"]))
 
+    def test_cli_review_candidates_exposes_prior_governance_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+            _write_candidate(
+                workspace / ".agent-memory" / "candidates" / "cand_org_metadata_001.json",
+                workspace=workspace,
+                candidate_id="cand_org_metadata_001",
+                status="new",
+                promotion_readiness="unknown",
+                help_signal=None,
+                knowledge_kind="org_convention",
+                source_context={
+                    "kind": "sibling_project",
+                    "ref": "apps/billing-demo",
+                    "matched_signals": ["兄弟项目", "demo"],
+                },
+                content_policy={
+                    "sanitized": True,
+                    "strategy": "summarize_emotional_feedback_as_collaboration_boundary",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "review-candidates",
+                    "--workspace",
+                    str(workspace),
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            item = json.loads(completed.stdout)["review_queue"]["items"][0]
+
+            self.assertEqual(item["candidate_id"], "cand_org_metadata_001")
+            self.assertEqual(item["source_context"]["kind"], "sibling_project")
+            self.assertTrue(item["content_policy"]["sanitized"])
+
     def test_cli_save_prior_creates_active_high_priority_asset(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"
@@ -4113,6 +4409,83 @@ class CliFlowTests(unittest.TestCase):
             )
             status_payload = json.loads(status.stdout)["status"]
             self.assertEqual(status_payload["knowledge_kind_summary"]["assets"]["high_priority_count"], 1)
+
+    def test_cli_save_prior_accepts_org_convention_as_high_priority_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "save-prior",
+                    "--workspace",
+                    str(workspace),
+                    "--knowledge-kind",
+                    "org_convention",
+                    "--title",
+                    "优先学习兄弟项目约定",
+                    "--content",
+                    "公司内部组件、兄弟项目 demo 和约定俗成用法应作为项目级局部先验优先复用。",
+                    "--source-context-kind",
+                    "sibling_project",
+                    "--source-context-ref",
+                    "apps/billing-demo",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            asset_path = Path(payload["asset"]["path"])
+            asset = json.loads(asset_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(asset["knowledge_kind"], "org_convention")
+            self.assertEqual(asset["asset_type"], "rule")
+            self.assertEqual(asset["review_status"], "healthy")
+            self.assertEqual(asset["temperature"], "warm")
+            self.assertEqual(asset["source_context"]["kind"], "sibling_project")
+            self.assertEqual(asset["source_context"]["ref"], "apps/billing-demo")
+            self.assertIn("兄弟项目", asset["source_context"]["matched_signals"])
+
+    def test_cli_save_prior_sanitizes_emotional_feedback_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "save-prior",
+                    "--workspace",
+                    str(workspace),
+                    "--knowledge-kind",
+                    "emotional_feedback",
+                    "--title",
+                    "反复解释触发强负反馈",
+                    "--content",
+                    "用户骂 AI：这个傻逼行为很烦，别再反复解释。",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            asset_path = Path(payload["asset"]["path"])
+            asset = json.loads(asset_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(asset["knowledge_kind"], "emotional_feedback")
+            self.assertIn("用户强烈负面反馈", asset["content"])
+            self.assertIn("[redacted]", asset["content"])
+            self.assertNotIn("傻逼", asset["content"])
+            self.assertTrue(asset["content_policy"]["sanitized"])
+            self.assertTrue(payload["asset"]["content_policy"]["sanitized"])
 
     def test_cli_review_candidates_can_reject_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

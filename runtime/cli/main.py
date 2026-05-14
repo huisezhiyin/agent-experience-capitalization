@@ -41,9 +41,13 @@ from runtime.core.knowledge_kinds import (
     CONSTRAINT,
     DECISION_MEMORY,
     DONT_REPEAT,
+    EMOTIONAL_FEEDBACK,
     HIGH_PRIORITY_PRIOR_KINDS,
+    ORG_CONVENTION,
     PAST_WIN,
     PREFERENCE,
+    infer_org_source_context,
+    sanitize_emotional_feedback_content,
 )
 from runtime.core.project_install import (
     INTEGRATION_MODE_CODEX_HOOKS,
@@ -109,6 +113,37 @@ ALL_CANDIDATE_STATUSES = ("new", "needs_review", "approved", "rejected", "promot
 DEFAULT_REVIEW_QUEUE_STATUSES = ("needs_review", "approved", "new")
 DEFAULT_FEEDBACK_PENDING_HOURS = 24.0
 STALE_FEEDBACK_HELP_SIGNAL = "unclear"
+
+
+def _is_permission_like_error_message(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = str(value).strip().lower()
+    return any(
+        token in normalized
+        for token in (
+            "operation not permitted",
+            "permission denied",
+            "readonly",
+            "read-only",
+            "attempt to write a readonly database",
+            "access is denied",
+            "not writable",
+        )
+    )
+
+
+def _runtime_degradation_cause_from_error(error: BaseException | str | None) -> str:
+    message = str(error or "")
+    return "permission_or_sandbox" if _is_permission_like_error_message(message) else "runtime_failure"
+
+
+def _milvus_runtime_probe_cause(runtime_probe: dict[str, Any] | None) -> str:
+    probe = runtime_probe or {}
+    errors = probe.get("errors") or []
+    if errors and all(_is_permission_like_error_message(item.get("error")) for item in errors):
+        return "permission_or_sandbox"
+    return "runtime_failure"
 
 
 def _feedback_pending_hours() -> float:
@@ -1033,7 +1068,15 @@ def _build_parser() -> argparse.ArgumentParser:
     save_prior.add_argument(
         "--knowledge-kind",
         required=True,
-        choices=[PAST_WIN, PREFERENCE, CONSTRAINT, DECISION_MEMORY, DONT_REPEAT],
+        choices=[
+            PAST_WIN,
+            PREFERENCE,
+            CONSTRAINT,
+            DECISION_MEMORY,
+            DONT_REPEAT,
+            EMOTIONAL_FEEDBACK,
+            ORG_CONVENTION,
+        ],
         help="Local-prior kind to save as an active asset.",
     )
     save_prior.add_argument("--title", help="Optional short title. Defaults to a compact content-derived title.")
@@ -1046,6 +1089,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     save_prior.add_argument("--confidence", type=float, default=0.9, help="Confidence for the explicit prior.")
     save_prior.add_argument("--source-note", help="Optional note explaining why this prior was saved.")
+    save_prior.add_argument(
+        "--source-context-kind",
+        choices=[
+            "sibling_project",
+            "demo",
+            "internal_component",
+            "company_convention",
+            "team_convention",
+            "project_convention",
+            "company_doc",
+            "unspecified",
+        ],
+        help="Optional source context for org_convention priors.",
+    )
+    save_prior.add_argument("--source-context-ref", help="Optional source reference such as a repo, demo, component, or doc.")
 
     status = subparsers.add_parser(
         "status",
@@ -1279,20 +1337,27 @@ def _build_prior_asset(
     scope_value: str,
     confidence: float,
     source_note: str | None,
+    source_context_kind: str | None = None,
+    source_context_ref: str | None = None,
 ) -> dict[str, Any]:
     created_at = now_utc()
     asset_type = _prior_asset_type(knowledge_kind)
-    digest = hashlib.sha1(f"{knowledge_kind}\n{content}".encode("utf-8")).hexdigest()[:10]
-    slug = _doc_asset_slug(title or content)
+    durable_content = (
+        sanitize_emotional_feedback_content(content)
+        if knowledge_kind == EMOTIONAL_FEEDBACK
+        else content
+    )
+    digest = hashlib.sha1(f"{knowledge_kind}\n{durable_content}".encode("utf-8")).hexdigest()[:10]
+    slug = _doc_asset_slug(title or durable_content)
     review_status = "healthy" if knowledge_kind in HIGH_PRIORITY_PRIOR_KINDS else "unproven"
-    return {
+    asset = {
         "asset_id": f"{asset_type}_{knowledge_kind}_{slug}_{digest}",
         "workspace": str(workspace),
         "asset_type": asset_type,
         "knowledge_scope": "project",
         "knowledge_kind": knowledge_kind,
-        "title": title or _compact_text_for_cli(content, limit=72),
-        "content": content,
+        "title": title or _compact_text_for_cli(durable_content, limit=72),
+        "content": durable_content,
         "scope": {"level": scope_level, "value": scope_value},
         "source_episode_ids": [],
         "source_candidate_ids": [],
@@ -1308,6 +1373,18 @@ def _build_prior_asset(
         "created_at": created_at,
         "updated_at": created_at,
     }
+    if knowledge_kind == EMOTIONAL_FEEDBACK:
+        asset["content_policy"] = {
+            "sanitized": True,
+            "strategy": "summarize_emotional_feedback_as_collaboration_boundary",
+        }
+    if knowledge_kind == ORG_CONVENTION:
+        asset["source_context"] = infer_org_source_context(
+            f"{durable_content}\n{source_note or ''}",
+            explicit_kind=source_context_kind,
+            explicit_ref=source_context_ref,
+        )
+    return asset
 
 
 def _compact_text_for_cli(value: str, limit: int = 96) -> str:
@@ -1328,6 +1405,8 @@ def _handle_save_prior(args: argparse.Namespace) -> int:
         scope_value=args.scope_value,
         confidence=args.confidence,
         source_note=args.source_note,
+        source_context_kind=args.source_context_kind,
+        source_context_ref=args.source_context_ref,
     )
     asset_path = memory_root_for_workspace(workspace) / "assets" / f"{asset['asset_type']}s" / f"{asset['asset_id']}.json"
     save_json(asset_path, asset)
@@ -1342,6 +1421,8 @@ def _handle_save_prior(args: argparse.Namespace) -> int:
                 "knowledge_scope": asset["knowledge_scope"],
                 "review_status": asset["review_status"],
                 "temperature": asset["temperature"],
+                "source_context": asset.get("source_context"),
+                "content_policy": asset.get("content_policy"),
             }
         }
     )
@@ -1687,7 +1768,7 @@ def _save_review_json(
 
 
 def _upsert_warning(*, kind: str, path: Path, error: BaseException) -> dict[str, str]:
-    return {
+    warning = {
         "kind": kind,
         "severity": "warn",
         "category": "state_index",
@@ -1697,17 +1778,41 @@ def _upsert_warning(*, kind: str, path: Path, error: BaseException) -> dict[str,
         "fallback": "filesystem_json",
         "error": str(error),
     }
+    warning["degradation_cause"] = _runtime_degradation_cause_from_error(error)
+    return warning
 
 
 def _safe_sqlite_write(
     *,
+    workspace: Path | None,
     db_path: Path,
     kind: str,
     action: Any,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     try:
-        action()
+        action(db_path)
     except (OSError, sqlite3.Error) as error:
+        if workspace is not None and db_path == default_db_path(workspace):
+            fallback_path = fallback_db_path(workspace)
+            if fallback_path != db_path:
+                try:
+                    ensure_db(fallback_path)
+                    action(fallback_path)
+                    warning = _upsert_warning(kind=kind, path=db_path, error=error)
+                    warning["runtime_state"] = "fallback_active"
+                    warning["fallback"] = "fallback_sqlite"
+                    warning["fallback_db_path"] = str(fallback_path)
+                    warning["active_db_path"] = str(fallback_path)
+                    warning["fallback_write_succeeded"] = True
+                    return warning
+                except (OSError, sqlite3.Error) as fallback_error:
+                    warning = _upsert_warning(kind=kind, path=db_path, error=error)
+                    warning["runtime_state"] = "hard_failure"
+                    warning["fallback"] = "filesystem_json"
+                    warning["fallback_db_path"] = str(fallback_path)
+                    warning["fallback_error"] = str(fallback_error)
+                    warning["fallback_degradation_cause"] = _runtime_degradation_cause_from_error(fallback_error)
+                    return warning
         return _upsert_warning(kind=kind, path=db_path, error=error)
     return None
 
@@ -1782,7 +1887,7 @@ def _record_activation_usage_with_fallback(
             return None, db_path
         except (OSError, sqlite3.Error) as error:
             last_error = error
-    return {
+    warning = {
         "kind": "activation_log_unwritable",
         "severity": "error",
         "category": "state_index",
@@ -1790,7 +1895,9 @@ def _record_activation_usage_with_fallback(
         "reason": "sqlite_activation_log_unwritable",
         "db_path": str(fallback_db if fallback_db != primary_db_path else primary_db_path),
         "error": str(last_error or "unknown sqlite write error"),
-    }, None
+    }
+    warning["degradation_cause"] = _runtime_degradation_cause_from_error(last_error)
+    return warning, None
 
 
 def _record_activation_usage(
@@ -1804,7 +1911,7 @@ def _record_activation_usage(
 
 
 def _sqlite_degraded_warning(*, db_path: Path, error: BaseException) -> dict[str, str]:
-    return {
+    warning = {
         "kind": "storage_degraded",
         "severity": "warn",
         "category": "state_index",
@@ -1814,6 +1921,8 @@ def _sqlite_degraded_warning(*, db_path: Path, error: BaseException) -> dict[str
         "fallback": "filesystem_json",
         "error": str(error),
     }
+    warning["degradation_cause"] = _runtime_degradation_cause_from_error(error)
+    return warning
 
 
 def _milvus_probe_warning(*, backend_name: str, backend_summary: dict[str, Any]) -> dict[str, Any] | None:
@@ -1833,6 +1942,7 @@ def _milvus_probe_warning(*, backend_name: str, backend_summary: dict[str, Any])
         "successful_probe_path": runtime_probe.get("successful_probe_path"),
         "probe_paths": runtime_probe.get("probe_paths") or [],
         "errors": errors,
+        "degradation_cause": _milvus_runtime_probe_cause(runtime_probe),
     }
 
 
@@ -1941,6 +2051,7 @@ def _load_status_records(
                     "available": True,
                     "degraded": True,
                     "degraded_reason": warning["reason"],
+                    "degradation_cause": warning.get("degradation_cause"),
                     "fallback": "fallback_sqlite",
                     "source_mode": "fallback_sqlite",
                     "active_db_path": str(fallback_db),
@@ -1964,6 +2075,7 @@ def _load_status_records(
             "available": False,
             "degraded": True,
             "degraded_reason": warning["reason"],
+            "degradation_cause": warning.get("degradation_cause"),
             "fallback": warning["fallback"],
             "source_mode": "filesystem_json",
             "active_db_path": None,
@@ -2094,9 +2206,10 @@ def _apply_activation_feedback(
             updated_at=feedback.get("feedback_at"),
         )
         _safe_sqlite_write(
+            workspace=workspace,
             db_path=asset_db_path,
             kind="asset_effectiveness_unwritten",
-            action=lambda asset_db_path=asset_db_path, asset=asset: upsert_asset(asset_db_path, asset),
+            action=lambda target_db_path, asset=asset: upsert_asset(target_db_path, asset),
         )
         asset_path, asset_save_warning = _save_workspace_json(
             workspace=workspace,
@@ -2120,9 +2233,10 @@ def _handle_auto_start(args: argparse.Namespace) -> int:
     project_activity = load_project_policy(workspace)
     db_path = default_db_path(workspace)
     bootstrap_warning = _safe_sqlite_write(
+        workspace=workspace,
         db_path=db_path,
         kind="sqlite_bootstrap_unwritable",
-        action=lambda: ensure_db(db_path),
+        action=lambda target_db_path: ensure_db(target_db_path),
     )
     feedback_cleanup, feedback_cleanup_warning = _safe_feedback_cleanup(
         workspace=workspace,
@@ -2354,9 +2468,10 @@ def _handle_progressive_recall(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
     _safe_sqlite_write(
+        workspace=workspace,
         db_path=db_path,
         kind="sqlite_bootstrap_unwritable",
-        action=lambda: ensure_db(db_path),
+        action=lambda target_db_path: ensure_db(target_db_path),
     )
     recent_activations = _load_activation_logs_with_fallback(
         workspace=workspace,
@@ -2458,9 +2573,10 @@ def _handle_feedback(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
     _safe_sqlite_write(
+        workspace=workspace,
         db_path=db_path,
         kind="sqlite_bootstrap_unwritable",
-        action=lambda: ensure_db(db_path),
+        action=lambda target_db_path: ensure_db(target_db_path),
     )
     activation = None
     activation_id = args.activation_id
@@ -2546,9 +2662,10 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
     write_warnings: list[dict[str, str]] = []
     vector_warnings: list[dict[str, str]] = []
     bootstrap_warning = _safe_sqlite_write(
+        workspace=workspace,
         db_path=db_path,
         kind="sqlite_bootstrap_unwritable",
-        action=lambda: ensure_db(db_path),
+        action=lambda target_db_path: ensure_db(target_db_path),
     )
     if bootstrap_warning:
         sqlite_warnings.append(bootstrap_warning)
@@ -2591,9 +2708,10 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
     if trace_save_warning:
         write_warnings.append(trace_save_warning)
     trace_upsert_warning = _safe_sqlite_write(
+        workspace=workspace,
         db_path=db_path,
         kind="trace_index_unwritten",
-        action=lambda: upsert_trace(db_path, trace),
+        action=lambda target_db_path, trace=trace: upsert_trace(target_db_path, trace),
     )
     if trace_upsert_warning:
         sqlite_warnings.append(trace_upsert_warning)
@@ -2610,9 +2728,10 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
     if episode_save_warning:
         write_warnings.append(episode_save_warning)
     episode_upsert_warning = _safe_sqlite_write(
+        workspace=workspace,
         db_path=db_path,
         kind="episode_index_unwritten",
-        action=lambda: upsert_episode(db_path, episode),
+        action=lambda target_db_path, episode=episode: upsert_episode(target_db_path, episode),
     )
     if episode_upsert_warning:
         sqlite_warnings.append(episode_upsert_warning)
@@ -2665,9 +2784,10 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
         if candidate_save_warning:
             write_warnings.append(candidate_save_warning)
         candidate_upsert_warning = _safe_sqlite_write(
+            workspace=workspace,
             db_path=db_path,
             kind="candidate_index_unwritten",
-            action=lambda candidate=candidate: upsert_candidate(db_path, candidate),
+            action=lambda target_db_path, candidate=candidate: upsert_candidate(target_db_path, candidate),
         )
         if candidate_upsert_warning:
             sqlite_warnings.append(candidate_upsert_warning)
@@ -2689,9 +2809,10 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             if candidate_promote_save_warning:
                 write_warnings.append(candidate_promote_save_warning)
             candidate_promote_warning = _safe_sqlite_write(
+                workspace=workspace,
                 db_path=db_path,
                 kind="candidate_index_unwritten",
-                action=lambda candidate=candidate: upsert_candidate(db_path, candidate),
+                action=lambda target_db_path, candidate=candidate: upsert_candidate(target_db_path, candidate),
             )
             if candidate_promote_warning:
                 sqlite_warnings.append(candidate_promote_warning)
@@ -2716,16 +2837,18 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
                 write_warnings.append(asset_save_warning)
             asset_db_path = shared_db_path() if args.knowledge_scope == "cross-project" else db_path
             asset_bootstrap_warning = _safe_sqlite_write(
+                workspace=workspace if args.knowledge_scope != "cross-project" else None,
                 db_path=asset_db_path,
                 kind="sqlite_bootstrap_unwritable",
-                action=lambda asset_db_path=asset_db_path: ensure_db(asset_db_path),
+                action=lambda target_db_path: ensure_db(target_db_path),
             )
             if asset_bootstrap_warning:
                 sqlite_warnings.append(asset_bootstrap_warning)
             asset_upsert_warning = _safe_sqlite_write(
+                workspace=workspace if args.knowledge_scope != "cross-project" else None,
                 db_path=asset_db_path,
                 kind="asset_index_unwritten",
-                action=lambda asset_db_path=asset_db_path, asset=asset: upsert_asset(asset_db_path, asset),
+                action=lambda target_db_path, asset=asset: upsert_asset(target_db_path, asset),
             )
             if asset_upsert_warning:
                 sqlite_warnings.append(asset_upsert_warning)
@@ -2757,9 +2880,10 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             if candidate_review_save_warning:
                 write_warnings.append(candidate_review_save_warning)
             candidate_review_warning = _safe_sqlite_write(
+                workspace=workspace,
                 db_path=db_path,
                 kind="candidate_index_unwritten",
-                action=lambda candidate=candidate: upsert_candidate(db_path, candidate),
+                action=lambda target_db_path, candidate=candidate: upsert_candidate(target_db_path, candidate),
             )
             if candidate_review_warning:
                 sqlite_warnings.append(candidate_review_warning)
@@ -3470,6 +3594,10 @@ def _build_status_payload(
             "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
             "temperature": asset.get("temperature", "neutral"),
             "review_status": asset.get("review_status", "unproven"),
+            "source_context": asset.get("source_context"),
+            "source_context_summary": _source_context_summary(asset.get("source_context")),
+            "content_policy": asset.get("content_policy"),
+            "content_policy_summary": _content_policy_summary(asset.get("content_policy")),
             "updated_at": asset.get("updated_at") or asset.get("created_at"),
         }
         for asset in sorted(
@@ -3486,6 +3614,10 @@ def _build_status_payload(
             "status": candidate.get("status"),
             "promotion_readiness": candidate.get("promotion_readiness"),
             "help_signal": candidate.get("promotion_feedback", {}).get("help_signal"),
+            "source_context": candidate.get("source_context"),
+            "source_context_summary": _source_context_summary(candidate.get("source_context")),
+            "content_policy": candidate.get("content_policy"),
+            "content_policy_summary": _content_policy_summary(candidate.get("content_policy")),
             "updated_at": candidate.get("updated_at") or candidate.get("created_at"),
             "created_at": candidate.get("created_at"),
         }
@@ -3580,6 +3712,7 @@ def _build_status_payload(
         "activation_logs": len(activations),
     }
     fallback_runtime_present = fallback_root.exists() and fallback_root != memory_root
+    runtime_degradation_summary = _build_runtime_degradation_summary(runtime_warnings)
     backend_runtime = {
         "memory_root_mode": "fallback_active" if fallback_runtime_present else "primary_only",
         "primary_memory_root": str(memory_root),
@@ -3590,6 +3723,7 @@ def _build_status_payload(
         "fallback_state_index_path": sqlite_backend.get("fallback_db_path", str(fallback_db_path(workspace))),
         "active_state_index_path": sqlite_backend.get("active_db_path"),
         "fallback_state_index_in_use": bool(sqlite_backend.get("fallback_in_use", False)),
+        "runtime_degradation_summary": runtime_degradation_summary,
     }
 
     return {
@@ -3618,6 +3752,7 @@ def _build_status_payload(
             "recent_events": recent_hook_events,
         },
         "backend_runtime": backend_runtime,
+        "runtime_degradation_summary": runtime_degradation_summary,
         "feedback_cleanup": feedback_cleanup
         or {
             "auto_resolved_count": 0,
@@ -3679,6 +3814,56 @@ def _diagnostic_check(name: str, status: str, summary: str, recommendation: str 
     return payload
 
 
+def _runtime_warning_is_permission_induced(warning: dict[str, Any] | None) -> bool:
+    if not warning:
+        return False
+    if warning.get("degradation_cause") == "permission_or_sandbox":
+        return True
+    error = warning.get("error")
+    if isinstance(error, str) and _is_permission_like_error_message(error):
+        return True
+    errors = warning.get("errors") or []
+    return bool(errors) and all(_is_permission_like_error_message(item.get("error")) for item in errors)
+
+
+def _build_runtime_degradation_summary(
+    runtime_warnings: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    warnings = list(runtime_warnings or [])
+    cause_counts: dict[str, int] = {}
+    state_counts: dict[str, int] = {}
+    fallback_write_success_count = 0
+    fallback_sqlite_paths: list[str] = []
+    permission_induced = 0
+    hard_failure = 0
+    for warning in warnings:
+        cause = str(warning.get("degradation_cause") or "unknown")
+        state = str(warning.get("runtime_state") or "unknown")
+        cause_counts[cause] = cause_counts.get(cause, 0) + 1
+        state_counts[state] = state_counts.get(state, 0) + 1
+        if warning.get("fallback_write_succeeded"):
+            fallback_write_success_count += 1
+        fallback_path = warning.get("fallback_db_path")
+        if isinstance(fallback_path, str) and fallback_path and fallback_path not in fallback_sqlite_paths:
+            fallback_sqlite_paths.append(fallback_path)
+        if _runtime_warning_is_permission_induced(warning):
+            permission_induced += 1
+        if state == "hard_failure":
+            hard_failure += 1
+    return {
+        "warning_count": len(warnings),
+        "permission_induced_count": permission_induced,
+        "runtime_failure_count": max(len(warnings) - permission_induced, 0),
+        "hard_failure_count": hard_failure,
+        "fallback_write_success_count": fallback_write_success_count,
+        "fallback_sqlite_paths": fallback_sqlite_paths,
+        "cause_counts": cause_counts,
+        "state_counts": state_counts,
+        "has_permission_induced_warning": permission_induced > 0,
+        "has_hard_failure": hard_failure > 0,
+    }
+
+
 def _build_doctor_payload(
     *,
     workspace: Path,
@@ -3718,37 +3903,45 @@ def _build_doctor_payload(
         "codex": {"files_present": False},
         "claude": {"files_present": False},
     }
+    sqlite_permission_induced = sqlite_backend.get("degradation_cause") == "permission_or_sandbox"
+    sqlite_healthy = sqlite_backend.get("available", sqlite_backend.get("db_exists", False))
+    sqlite_source_mode = sqlite_backend.get("source_mode")
+    if sqlite_healthy and sqlite_source_mode != "fallback_sqlite":
+        sqlite_summary = (
+            f"SQLite index has {sqlite_backend['asset_rows']} assets, "
+            f"{sqlite_backend['candidate_rows']} candidates, and "
+            f"{sqlite_backend['activation_log_rows']} activation logs."
+        )
+        sqlite_recommendation = None
+    elif sqlite_source_mode == "fallback_sqlite":
+        sqlite_summary = (
+            "Primary SQLite is unavailable; fallback SQLite is serving state with "
+            f"{sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, "
+            f"and {sqlite_backend['activation_log_rows']} activation logs."
+        )
+        sqlite_recommendation = (
+            "Primary SQLite looks read-only or sandbox-blocked; fallback SQLite is active, so treat this as an environment constraint first and repair the primary path when possible."
+            if sqlite_permission_induced
+            else "Check primary SQLite permissions/locks; fallback SQLite is active, but primary storage still needs repair."
+        )
+    else:
+        sqlite_summary = (
+            "SQLite index is unavailable; status used filesystem JSON fallback with "
+            f"{sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, "
+            f"and {sqlite_backend['activation_log_rows']} activation views."
+        )
+        sqlite_recommendation = (
+            "SQLite access looks permission- or sandbox-blocked; status fell back to filesystem JSON, so persistence metrics may lag until the runtime gets a writable state index."
+            if sqlite_permission_induced
+            else "Check SQLite permissions/locks; Milvus recall can continue, but state metrics are degraded."
+        )
 
     checks.append(
         _diagnostic_check(
             "sqlite_index",
-            "pass" if sqlite_backend.get("available", sqlite_backend.get("db_exists", False)) else "warn",
-            (
-                f"SQLite index has {sqlite_backend['asset_rows']} assets, "
-                f"{sqlite_backend['candidate_rows']} candidates, and "
-                f"{sqlite_backend['activation_log_rows']} activation logs."
-                if sqlite_backend.get("available", sqlite_backend.get("db_exists", False))
-                and sqlite_backend.get("source_mode") != "fallback_sqlite"
-                else (
-                    "Primary SQLite is unavailable; fallback SQLite is serving state with "
-                    f"{sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, "
-                    f"and {sqlite_backend['activation_log_rows']} activation logs."
-                )
-                if sqlite_backend.get("source_mode") == "fallback_sqlite"
-                else (
-                    "SQLite index is unavailable; status used filesystem JSON fallback with "
-                    f"{sqlite_backend['asset_rows']} assets, {sqlite_backend['candidate_rows']} candidates, "
-                    f"and {sqlite_backend['activation_log_rows']} activation views."
-                )
-            ),
-            None
-            if sqlite_backend.get("available", sqlite_backend.get("db_exists", False))
-            and sqlite_backend.get("source_mode") != "fallback_sqlite"
-            else (
-                "Check primary SQLite permissions/locks; fallback SQLite is active, but primary storage still needs repair."
-                if sqlite_backend.get("source_mode") == "fallback_sqlite"
-                else "Check SQLite permissions/locks; Milvus recall can continue, but state metrics are degraded."
-            ),
+            "pass" if sqlite_healthy else "warn",
+            sqlite_summary,
+            sqlite_recommendation,
         )
     )
     checks.append(
@@ -3831,11 +4024,14 @@ def _build_doctor_payload(
         )
 
     local_milvus = milvus_backend["local"]
+    local_milvus_permission_induced = _milvus_runtime_probe_cause(local_milvus.get("runtime_probe")) == "permission_or_sandbox"
     local_milvus_status = "pass" if local_milvus["status"] == "ready" else "warn"
     milvus_backend_label = "Hosted Milvus" if local_milvus.get("mode") == "remote" else "Local Milvus Lite"
     milvus_recommendation = (
         "Set EXPCAP_RETRIEVAL_INDEX_URI or switch EXPCAP_RETRIEVAL_BACKEND back to milvus-lite."
         if local_milvus.get("degraded_reason") == "missing_retrieval_index_uri"
+        else "Milvus runtime probing looks blocked by sandbox or filesystem permissions; verify in a less restricted environment or provide a writable runtime path before treating this as a real retrieval outage."
+        if local_milvus.get("degraded_reason") == "unix_socket_bind_unavailable" and local_milvus_permission_induced
         else "Lock metadata points to a dead pid; clear the stale lock or run a reset before retrying Milvus."
         if local_lock.get("stale_hint")
         else "If it remains locked, stop the stale process or switch retrieval to a shared/cloud Milvus backend."
@@ -3844,7 +4040,12 @@ def _build_doctor_payload(
         _diagnostic_check(
             "local_milvus",
             local_milvus_status,
-            f"{milvus_backend_label} is {local_milvus['status']} ({local_milvus.get('degraded_reason') or 'no degraded reason'}).",
+            (
+                f"{milvus_backend_label} is {local_milvus['status']} "
+                f"({local_milvus.get('degraded_reason') or 'no degraded reason'}; permission/sandbox-induced runtime probe degradation)."
+                if local_milvus.get("degraded_reason") == "unix_socket_bind_unavailable" and local_milvus_permission_induced
+                else f"{milvus_backend_label} is {local_milvus['status']} ({local_milvus.get('degraded_reason') or 'no degraded reason'})."
+            ),
             None
             if local_milvus_status == "pass"
             else milvus_recommendation,
@@ -3943,6 +4144,29 @@ def _safe_text(value: Any) -> str:
     return html_escape(str(value), quote=True)
 
 
+def _source_context_summary(source_context: Any) -> str:
+    if not isinstance(source_context, dict) or not source_context:
+        return ""
+    kind = source_context.get("kind") or "unspecified"
+    ref = source_context.get("ref")
+    matched = source_context.get("matched_signals") or []
+    parts = [str(kind)]
+    if ref:
+        parts.append(str(ref))
+    if matched:
+        parts.append("signals=" + ",".join(str(item) for item in matched[:3]))
+    return " | ".join(parts)
+
+
+def _content_policy_summary(content_policy: Any) -> str:
+    if not isinstance(content_policy, dict) or not content_policy:
+        return ""
+    strategy = content_policy.get("strategy") or "unspecified"
+    sanitized = content_policy.get("sanitized")
+    suffix = "sanitized" if sanitized else "raw"
+    return f"{strategy} | {suffix}"
+
+
 def _date_bucket(value: Any) -> str | None:
     parsed = _parse_datetime(str(value)) if value else None
     if parsed is None:
@@ -4029,6 +4253,10 @@ def _build_dashboard_payload(
             "temperature": asset.get("temperature", "neutral"),
             "review_status": asset.get("review_status", "unproven"),
             "confidence": asset.get("confidence"),
+            "source_context": asset.get("source_context"),
+            "source_context_summary": _source_context_summary(asset.get("source_context")),
+            "content_policy": asset.get("content_policy"),
+            "content_policy_summary": _content_policy_summary(asset.get("content_policy")),
             "last_used_at": asset.get("last_used_at"),
             "updated_at": asset.get("updated_at") or asset.get("created_at"),
         }
@@ -4042,6 +4270,10 @@ def _build_dashboard_payload(
             "status": candidate.get("status"),
             "promotion_readiness": candidate.get("promotion_readiness"),
             "help_signal": candidate.get("promotion_feedback", {}).get("help_signal"),
+            "source_context": candidate.get("source_context"),
+            "source_context_summary": _source_context_summary(candidate.get("source_context")),
+            "content_policy": candidate.get("content_policy"),
+            "content_policy_summary": _content_policy_summary(candidate.get("content_policy")),
             "updated_at": candidate.get("updated_at") or candidate.get("created_at"),
         }
         for candidate in _dashboard_item_rows(candidates, limit=bounded_limit)
@@ -4144,6 +4376,9 @@ def _build_dashboard_payload(
             "unproven_assets": status_payload["asset_review_backlog"]["unproven_count"],
             "local_prior_assets": status_payload["knowledge_kind_summary"]["assets"]["local_prior_count"],
             "high_priority_prior_assets": status_payload["knowledge_kind_summary"]["assets"]["high_priority_count"],
+            "governance_focus_assets": status_payload["knowledge_kind_summary"]["assets"]["governance_focus_count"],
+            "emotional_feedback_assets": status_payload["knowledge_kind_summary"]["assets"]["by_kind"].get(EMOTIONAL_FEEDBACK, 0),
+            "org_convention_assets": status_payload["knowledge_kind_summary"]["assets"]["by_kind"].get(ORG_CONVENTION, 0),
             "system_prompt_items": status_payload["injection_policy_summary"]["channel_counts"]["system_prompt"],
             "reference_summary_items": status_payload["injection_policy_summary"]["channel_counts"]["reference_summary"],
             "milvus_selected_ratio": status_payload["milvus_retrieval_effectiveness"]["milvus_selected_ratio"],
@@ -4215,7 +4450,9 @@ def _render_count_cards(payload: dict[str, Any]) -> str:
         ("Healthy", cards["healthy_assets"], "assets with positive proof"),
         ("Unproven", cards["unproven_assets"], "assets still needing evidence"),
         ("Local Priors", cards["local_prior_assets"], "assets carrying local behavior/context priors"),
-        ("High Priority Priors", cards["high_priority_prior_assets"], "preference, constraint, and dont_repeat assets"),
+        ("High Priority Priors", cards["high_priority_prior_assets"], "preference, constraint, emotional feedback, org convention, and dont_repeat assets"),
+        ("Emotion Signals", cards.get("emotional_feedback_assets", 0), "user praise/friction distilled into collaboration boundaries"),
+        ("Org Conventions", cards.get("org_convention_assets", 0), "project, team, and company-local ways of working"),
         ("System Prompt", cards["system_prompt_items"], "tiny durable priors routed to system prompt"),
         ("Reference", cards["reference_summary_items"], "codemap/raw evidence routed for LLM re-analysis"),
         ("Milvus Selected", f"{cards['milvus_selected_ratio']:.0%}", "selected assets from semantic retrieval"),
@@ -4250,8 +4487,11 @@ def _render_runtime_warnings(payload: dict[str, Any]) -> str:
     if not warnings:
         return ""
     runtime_states = {str(item.get("runtime_state") or "") for item in warnings}
+    permission_induced = warnings and all(_runtime_warning_is_permission_induced(item) for item in warnings)
     if "hard_failure" in runtime_states:
         summary = "Some runtime writes failed without a usable fallback. Review the warnings below before trusting persistence-related metrics."
+    elif permission_induced:
+        summary = "The current environment is blocking some runtime paths or writes. The session may still continue via fallbacks, but these warnings look permission- or sandbox-induced rather than like a confirmed backend outage."
     elif "fallback_active" in runtime_states:
         summary = "Primary outputs hit write constraints, but fallback runtime storage is active so the session can continue."
     elif "degraded_primary" in runtime_states:
@@ -4261,13 +4501,21 @@ def _render_runtime_warnings(payload: dict[str, Any]) -> str:
     rows = "".join(
         f"<li><strong>{_safe_text(item.get('reason'))}</strong>"
         f" <em>({_safe_text(item.get('runtime_state') or 'unknown')})</em>: "
-        f"{_safe_text(item.get('error') or item.get('status') or 'no details')}</li>"
+        f"{_safe_text(item.get('error') or item.get('status') or 'no details')}"
+        f"{' [' + _safe_text(item.get('degradation_cause')) + ']' if item.get('degradation_cause') else ''}</li>"
         for item in warnings
+    )
+    degradation_summary = _build_runtime_degradation_summary(warnings)
+    summary_lines = (
+        f"<p><strong>Warnings:</strong> {_safe_text(degradation_summary.get('warning_count', 0))} | "
+        f"<strong>Permission-induced:</strong> {_safe_text(degradation_summary.get('permission_induced_count', 0))} | "
+        f"<strong>Fallback writes:</strong> {_safe_text(degradation_summary.get('fallback_write_success_count', 0))}</p>"
     )
     return f"""
     <section class="warning-banner">
       <h2>Degraded Mode</h2>
       <p>{_safe_text(summary)}</p>
+      {summary_lines}
       <ul>{rows}</ul>
     </section>
     """
@@ -4354,6 +4602,7 @@ def _render_backend_runtime_panel(payload: dict[str, Any]) -> str:
     status = payload["status"]
     backend_runtime = status.get("backend_runtime") or {}
     sqlite_backend = (status.get("retrieval_backends") or {}).get("sqlite") or {}
+    degradation_summary = backend_runtime.get("runtime_degradation_summary") or status.get("runtime_degradation_summary") or {}
     primary_root = backend_runtime.get("primary_memory_root")
     fallback_root = backend_runtime.get("fallback_memory_root")
     primary_index = backend_runtime.get("primary_state_index_path")
@@ -4377,6 +4626,10 @@ def _render_backend_runtime_panel(payload: dict[str, Any]) -> str:
       <div class="metric-line"><span>Fallback memory root</span><strong><code>{_safe_text(fallback_root)}</code></strong></div>
       <div class="metric-line"><span>Primary state index</span><strong><code>{_safe_text(primary_index)}</code></strong></div>
       <div class="metric-line"><span>Active state index</span><strong><code>{_safe_text(active_index)}</code></strong></div>
+      <div class="metric-line"><span>Runtime warnings</span><strong>{_safe_text(degradation_summary.get("warning_count", 0))}</strong></div>
+      <div class="metric-line"><span>Permission-induced</span><strong>{_safe_text(degradation_summary.get("permission_induced_count", 0))}</strong></div>
+      <div class="metric-line"><span>Fallback writes succeeded</span><strong>{_safe_text(degradation_summary.get("fallback_write_success_count", 0))}</strong></div>
+      <div class="metric-line"><span>Fallback SQLite paths</span><strong><code>{_safe_text(", ".join(degradation_summary.get("fallback_sqlite_paths", [])) or "none")}</code></strong></div>
     </section>
     """
 
@@ -4399,6 +4652,8 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
             item["temperature"],
             item["review_status"],
             item["confidence"],
+            item.get("source_context_summary"),
+            item.get("content_policy_summary"),
             item["updated_at"],
         ]
         for item in payload["assets"]
@@ -4425,6 +4680,8 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
             item["status"],
             item["promotion_readiness"],
             item["help_signal"],
+            item.get("source_context_summary"),
+            item.get("content_policy_summary"),
             item["updated_at"],
         ]
         for item in payload["candidates"]
@@ -4437,6 +4694,8 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
             item.get("status"),
             item.get("promotion_readiness"),
             item.get("priority_score"),
+            _source_context_summary(item.get("source_context")),
+            _content_policy_summary(item.get("content_policy")),
             item.get("candidate_id"),
         ]
         for item in queue_items
@@ -4457,8 +4716,10 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
             section,
             summary.get("local_prior_count"),
             summary.get("high_priority_count"),
+            summary.get("governance_focus_count", 0),
             summary.get("by_kind"),
             summary.get("high_priority_by_kind"),
+            summary.get("governance_focus_by_kind", {}),
         ]
         for section, summary in [
             ("Assets", kind_summary["assets"]),
@@ -4590,14 +4851,14 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
 
   <section class="panel">
     <h2>Local Prior Distribution</h2>
-    {_render_dashboard_table(["Section", "Local priors", "High priority", "By kind", "High priority by kind"], prior_kind_rows)}
+    {_render_dashboard_table(["Section", "Local priors", "High priority", "Governance focus", "By kind", "High priority by kind", "Governance by kind"], prior_kind_rows)}
   </section>
 
   {_render_injection_policy_panel(payload)}
 
   <section class="panel">
     <h2>Assets</h2>
-    {_render_dashboard_table(["Title", "Kind", "Scope", "Temp", "Review", "Confidence", "Updated"], asset_rows)}
+    {_render_dashboard_table(["Title", "Kind", "Scope", "Temp", "Review", "Confidence", "Source", "Policy", "Updated"], asset_rows)}
   </section>
 
   <section class="panel">
@@ -4607,7 +4868,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
 
   <section class="panel">
     <h2>Candidate Review Queue</h2>
-    {_render_dashboard_table(["Title", "Kind", "Status", "Readiness", "Priority", "Candidate ID"], queue_rows)}
+    {_render_dashboard_table(["Title", "Kind", "Status", "Readiness", "Priority", "Source", "Policy", "Candidate ID"], queue_rows)}
   </section>
 
   <section class="panel">
@@ -4617,7 +4878,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
 
   <section class="panel">
     <h2>Recent Candidates</h2>
-    {_render_dashboard_table(["Title", "Kind", "Status", "Readiness", "Help", "Updated"], candidate_rows)}
+    {_render_dashboard_table(["Title", "Kind", "Status", "Readiness", "Help", "Source", "Policy", "Updated"], candidate_rows)}
   </section>
 
   <details>

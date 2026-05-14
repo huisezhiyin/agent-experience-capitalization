@@ -98,6 +98,8 @@ class EngineTests(unittest.TestCase):
 
         cases = [
             ("dont_repeat", {"lesson": "用户明确说：我不要重复说这个，以后默认由 Codex 代跑命令。"}),
+            ("emotional_feedback", {"lesson": "用户情绪化地骂 AI，说明反复解释和擅自改范围是协作边界。"}),
+            ("org_convention", {"lesson": "公司内部组件和兄弟项目 demo 里的约定俗成用法应作为项目套路复用。"}),
             ("preference", {"lesson": "我喜欢默认使用集中 EXPCAP_HOME 存储。"}),
             ("constraint", {"constraints": ["不能提交 .agent-memory 和本地 SQLite 运行数据"]}),
             ("decision_memory", {"lesson": "这个 hook 设计成触发层是历史原因，当时是为了避免策略泄漏到宿主。"}),
@@ -112,6 +114,70 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(candidate["knowledge_kind"], expected_kind)
                 if expected_kind == "constraint":
                     self.assertEqual(candidate["content"], "不能提交 .agent-memory 和本地 SQLite 运行数据")
+
+    def test_extract_candidates_sanitizes_emotional_feedback_content(self) -> None:
+        episode = {
+            "episode_id": "ep_emotional_boundary_001",
+            "trace_id": "trace_emotional_boundary_001",
+            "goal": "沉淀用户情绪反馈",
+            "constraints": [],
+            "workspace": "/tmp/demo",
+            "files_touched": [],
+            "commands": [],
+            "turning_points": [],
+            "attempted_paths": [],
+            "abandoned_paths": [],
+            "decision_rationale": [],
+            "result": "success",
+            "verification": "passed",
+            "user_feedback": "用户骂 AI：这个傻逼行为很烦，别再反复解释。",
+            "lesson": "用户骂 AI：这个傻逼行为很烦，别再反复解释。",
+            "scope_hint": "general-coding-task",
+            "confidence_hint": 0.8,
+            "created_at": "2026-04-13T00:00:00+00:00",
+        }
+
+        [candidate] = extract_candidates(episode)
+        asset = promote_candidate(candidate)
+
+        self.assertEqual(candidate["knowledge_kind"], "emotional_feedback")
+        self.assertIn("用户强烈负面反馈", candidate["content"])
+        self.assertIn("[redacted]", candidate["content"])
+        self.assertNotIn("傻逼", candidate["content"])
+        self.assertTrue(candidate["content_policy"]["sanitized"])
+        self.assertEqual(asset["content"], candidate["content"])
+        self.assertTrue(asset["content_policy"]["sanitized"])
+
+    def test_extract_candidates_records_org_convention_source_context(self) -> None:
+        episode = {
+            "episode_id": "ep_org_convention_001",
+            "trace_id": "trace_org_convention_001",
+            "goal": "沉淀组织约定",
+            "constraints": [],
+            "workspace": "/tmp/demo",
+            "files_touched": [],
+            "commands": [],
+            "turning_points": [],
+            "attempted_paths": [],
+            "abandoned_paths": [],
+            "decision_rationale": [],
+            "result": "success",
+            "verification": "passed",
+            "user_feedback": "accepted",
+            "lesson": "兄弟项目 demo 使用公司内部组件作为默认表单方案，应复用这个约定俗成用法。",
+            "scope_hint": "general-coding-task",
+            "confidence_hint": 0.8,
+            "created_at": "2026-04-13T00:00:00+00:00",
+        }
+
+        [candidate] = extract_candidates(episode)
+        asset = promote_candidate(candidate)
+
+        self.assertEqual(candidate["knowledge_kind"], "org_convention")
+        self.assertEqual(candidate["source_context"]["kind"], "sibling_project")
+        self.assertIn("兄弟项目", candidate["source_context"]["matched_signals"])
+        self.assertIn("demo", candidate["source_context"]["matched_signals"])
+        self.assertEqual(asset["source_context"], candidate["source_context"])
 
     def test_should_promote_candidate_requires_success_passed_and_threshold(self) -> None:
         candidate = {
@@ -806,6 +872,24 @@ class EngineTests(unittest.TestCase):
                     "scope": {"level": "workspace", "value": "general-coding-task"},
                     "created_at": "2026-04-17T00:01:00+00:00",
                 },
+                {
+                    "candidate_id": "cand_org_convention_001",
+                    "candidate_type": "pattern",
+                    "knowledge_kind": "org_convention",
+                    "title": "org convention item",
+                    "status": "new",
+                    "source_context": {
+                        "kind": "sibling_project",
+                        "ref": "apps/billing-demo",
+                        "matched_signals": ["兄弟项目", "demo"],
+                    },
+                    "confidence_score": 0.7,
+                    "reusability_score": 0.7,
+                    "stability_score": 0.7,
+                    "constraint_value_score": 0.7,
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "created_at": "2026-04-17T00:02:00+00:00",
+                },
             ],
             workspace="/tmp/demo",
         )
@@ -813,9 +897,15 @@ class EngineTests(unittest.TestCase):
         summary = queue["knowledge_kind_summary"]
         self.assertEqual(summary["by_kind"]["preference"], 1)
         self.assertEqual(summary["by_kind"]["pattern"], 1)
-        self.assertEqual(summary["local_prior_count"], 1)
-        self.assertEqual(summary["high_priority_count"], 1)
+        self.assertEqual(summary["by_kind"]["org_convention"], 1)
+        self.assertEqual(summary["local_prior_count"], 2)
+        self.assertEqual(summary["high_priority_count"], 2)
         self.assertEqual(summary["high_priority_by_kind"]["preference"], 1)
+        self.assertEqual(summary["high_priority_by_kind"]["org_convention"], 1)
+        self.assertEqual(summary["governance_focus_count"], 1)
+        self.assertEqual(summary["governance_focus_by_kind"]["org_convention"], 1)
+        org_item = next(item for item in queue["items"] if item["candidate_id"] == "cand_org_convention_001")
+        self.assertEqual(org_item["source_context"]["kind"], "sibling_project")
 
     def test_build_candidate_review_queue_suggests_review_for_high_priority_priors(self) -> None:
         queue = build_candidate_review_queue(
@@ -836,10 +926,10 @@ class EngineTests(unittest.TestCase):
                     "created_at": "2026-04-17T00:01:00+00:00",
                 },
                 {
-                    "candidate_id": "cand_dont_repeat_001",
+                    "candidate_id": "cand_emotional_feedback_001",
                     "candidate_type": "pattern",
-                    "knowledge_kind": "dont_repeat",
-                    "title": "do not repeat item",
+                    "knowledge_kind": "emotional_feedback",
+                    "title": "emotional feedback item",
                     "status": "new",
                     "promotion_readiness": "unknown",
                     "promotion_feedback": {"help_signal": None, "signal_bonus": 0.0},
@@ -854,9 +944,9 @@ class EngineTests(unittest.TestCase):
             workspace="/tmp/demo",
         )
 
-        self.assertEqual(queue["items"][0]["candidate_id"], "cand_dont_repeat_001")
+        self.assertEqual(queue["items"][0]["candidate_id"], "cand_emotional_feedback_001")
         self.assertEqual(queue["items"][0]["suggested_action"], "review")
-        self.assertTrue(any("高优先级本地先验" in item for item in queue["items"][0]["reasons"]))
+        self.assertTrue(any("强情绪协作信号" in item for item in queue["items"][0]["reasons"]))
 
     def test_activate_assets_demotes_broad_scope_low_evidence_matches(self) -> None:
         import json

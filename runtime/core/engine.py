@@ -11,13 +11,19 @@ from runtime.core.knowledge_kinds import (
     CODEMAP,
     CONSTRAINT,
     DONT_REPEAT,
+    EMOTIONAL_FEEDBACK,
+    GOVERNANCE_FOCUS_PRIOR_KINDS,
     HIGH_PRIORITY_PRIOR_KINDS,
     LOCAL_PRIOR_KINDS,
+    ORG_CONVENTION,
     PATTERN,
     PREFERENCE,
     activation_label_for_kind,
+    build_prior_signal_text,
     infer_local_prior_kind,
     ranking_weight_for_kind,
+    infer_org_source_context,
+    sanitize_emotional_feedback_content,
     title_label_for_kind,
 )
 from runtime.storage.fs_store import (
@@ -218,6 +224,8 @@ def _candidate_title(episode: dict[str, Any], candidate_type: str, knowledge_kin
 def _candidate_content(episode: dict[str, Any], knowledge_kind: str, lesson: str) -> str:
     if knowledge_kind == CONSTRAINT and episode.get("constraints"):
         return "；".join(str(item) for item in episode.get("constraints", []) if item)
+    if knowledge_kind == EMOTIONAL_FEEDBACK:
+        return sanitize_emotional_feedback_content(lesson)
     return lesson
 
 
@@ -334,7 +342,13 @@ def build_candidate_review_queue(
     kind_weight = {
         CONSTRAINT: 0.22,
         DONT_REPEAT: 0.22,
+        ORG_CONVENTION: 0.21,
+        EMOTIONAL_FEEDBACK: 0.21,
         PREFERENCE: 0.18,
+    }
+    high_priority_reason = {
+        EMOTIONAL_FEEDBACK: "强情绪协作信号，适合优先提炼成偏好、边界或 dont_repeat 规则",
+        ORG_CONVENTION: "组织或项目局部先验，适合优先审核是否应进入 active prior",
     }
 
     items = []
@@ -367,7 +381,12 @@ def build_candidate_review_queue(
         )
         reasons = []
         if knowledge_kind in HIGH_PRIORITY_PRIOR_KINDS:
-            reasons.append("高优先级本地先验，适合优先审核是否应进入 active prior")
+            reasons.append(
+                high_priority_reason.get(
+                    knowledge_kind,
+                    "高优先级本地先验，适合优先审核是否应进入 active prior",
+                )
+            )
         if candidate.get("status") == "needs_review":
             reasons.append("候选已进入 needs_review，适合优先人工审核")
         if candidate.get("status") == "approved":
@@ -402,6 +421,8 @@ def build_candidate_review_queue(
                 "status": candidate.get("status"),
                 "promotion_readiness": promotion_readiness,
                 "promotion_feedback": promotion_feedback,
+                "source_context": candidate.get("source_context"),
+                "content_policy": candidate.get("content_policy"),
                 "review_score": round(queue_score, 2),
                 "base_score": round(base_score, 2),
                 "scope": candidate.get("scope"),
@@ -441,6 +462,8 @@ def build_knowledge_kind_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
     local_prior_count = 0
     high_priority_count = 0
     high_priority_by_kind: dict[str, int] = {}
+    governance_focus_count = 0
+    governance_focus_by_kind: dict[str, int] = {}
     for item in items:
         kind = str(item.get("knowledge_kind") or item.get("asset_type") or item.get("candidate_type") or "pattern")
         by_kind[kind] = by_kind.get(kind, 0) + 1
@@ -449,11 +472,16 @@ def build_knowledge_kind_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
         if kind in HIGH_PRIORITY_PRIOR_KINDS:
             high_priority_count += 1
             high_priority_by_kind[kind] = high_priority_by_kind.get(kind, 0) + 1
+        if kind in GOVERNANCE_FOCUS_PRIOR_KINDS:
+            governance_focus_count += 1
+            governance_focus_by_kind[kind] = governance_focus_by_kind.get(kind, 0) + 1
     return {
         "by_kind": dict(sorted(by_kind.items())),
         "local_prior_count": local_prior_count,
         "high_priority_count": high_priority_count,
         "high_priority_by_kind": dict(sorted(high_priority_by_kind.items())),
+        "governance_focus_count": governance_focus_count,
+        "governance_focus_by_kind": dict(sorted(governance_focus_by_kind.items())),
     }
 
 
@@ -483,6 +511,13 @@ def extract_candidates(episode: dict[str, Any]) -> list[dict[str, Any]]:
         "status": "new",
         "created_at": _now_utc(),
     }
+    if knowledge_kind == EMOTIONAL_FEEDBACK:
+        candidate["content_policy"] = {
+            "sanitized": True,
+            "strategy": "summarize_emotional_feedback_as_collaboration_boundary",
+        }
+    if knowledge_kind == ORG_CONVENTION:
+        candidate["source_context"] = infer_org_source_context(build_prior_signal_text(episode))
     return [candidate]
 
 
@@ -506,7 +541,7 @@ def promote_candidate(
         + candidate.get("confidence_score", 0)
         + candidate.get("constraint_value_score", 0)
     ) / 4
-    return {
+    asset = {
         "asset_id": asset_id,
         "workspace": candidate.get("workspace"),
         "project_id": project_id,
@@ -557,6 +592,11 @@ def promote_candidate(
         "created_at": _now_utc(),
         "updated_at": _now_utc(),
     }
+    if candidate.get("source_context"):
+        asset["source_context"] = candidate["source_context"]
+    if candidate.get("content_policy"):
+        asset["content_policy"] = candidate["content_policy"]
+    return asset
 
 
 def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -566,7 +606,7 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
     project_id = candidate.get("project_id") or project_identity.get("project_id") or candidate.get("workspace")
     owning_team = candidate.get("owning_team") or project_identity.get("owning_team")
     source_project = candidate.get("source_project") or project_id
-    return {
+    asset = {
         "asset_id": candidate["candidate_id"],
         "workspace": candidate.get("workspace"),
         "project_id": project_id,
@@ -578,6 +618,8 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
         "title": candidate["title"],
         "content": candidate["content"],
         "scope": candidate["scope"],
+        "source_context": candidate.get("source_context"),
+        "content_policy": candidate.get("content_policy"),
         "source_workspace": candidate.get("workspace"),
         "source_episode_ids": candidate.get("source_episode_ids", []),
         "source_candidate_ids": [candidate["candidate_id"]],
@@ -617,6 +659,11 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
         "created_at": candidate.get("created_at"),
         "updated_at": candidate.get("created_at"),
     }
+    if not asset["source_context"]:
+        asset.pop("source_context")
+    if not asset["content_policy"]:
+        asset.pop("content_policy")
+    return asset
 
 
 def _match_score(task: str, scope: dict[str, str], asset: dict[str, Any], workspace: str) -> float:

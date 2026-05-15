@@ -61,6 +61,30 @@ It is designed for:
 - Exposes a backend contract for shared object stores, cloud state indexes, and
   hosted vector search.
 
+## Prompt Layering
+
+`expcap` works best as the dynamic layer beneath project-level prompt files,
+not as a replacement for them.
+
+- [`PROJECT_PROMPT.md`](PROJECT_PROMPT.md): host-neutral stable project rules
+  that should apply every session across hosts.
+- [`AGENTS.md`](AGENTS.md): primary project entrypoint for agent instructions.
+- [`AGENTS.expcap.md`](AGENTS.expcap.md): dynamic `get/save` integration layer
+  installed by `expcap install-project`.
+
+The intended flow is: discover experience in `expcap`, prove it through real
+task activations, then promote the small stable subset into project-level prompt
+files.
+
+Maintenance then stays host-neutral:
+
+- edit stable rules in [`PROJECT_PROMPT.md`](PROJECT_PROMPT.md)
+- use `expcap project-prompt suggest` to find assets worth promoting
+- use `expcap project-prompt apply --sync-after` to write promoted rules into the managed block and refresh host bridge files
+- use `expcap project-prompt archive --sync-after` to retire stale promoted rules with a traceable archive reason and refresh host bridge files
+- use `expcap project-prompt sync` to refresh host bridge files such as
+  `AGENTS.md` and `CLAUDE.md`
+
 ## Install
 
 Use the one-command setup above for Codex. Manual setup:
@@ -187,7 +211,8 @@ scripts/expcap install-project --workspace /path/to/project --integration-mode c
 ```
 
 The installer appends non-destructive instructions and creates
-`AGENTS.expcap.md`. It also ensures `.agent-memory/` is present in
+`AGENTS.expcap.md`. It also ensures `PROJECT_PROMPT.md` exists as the
+host-neutral stable rule source and that `.agent-memory/` is present in
 `.gitignore`. In `codex-hooks` mode it writes `.codex/hooks.json` plus
 `.codex/hooks/expcap_user_prompt_submit.sh` and `.codex/hooks/expcap_stop.sh`.
 These wrappers route Codex `UserPromptSubmit` / `Stop` events to

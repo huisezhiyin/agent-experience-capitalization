@@ -24,18 +24,23 @@ class InstallProjectTests(unittest.TestCase):
 
             agents_text = agents_path.read_text(encoding="utf-8")
             sidecar_text = (workspace / "AGENTS.expcap.md").read_text(encoding="utf-8")
+            project_prompt_text = (workspace / "PROJECT_PROMPT.md").read_text(encoding="utf-8")
             policy_text = json.loads((workspace / ".expcap-project.json").read_text(encoding="utf-8"))
             gitignore_text = (workspace / ".gitignore").read_text(encoding="utf-8")
 
             self.assertIn("原有规则。", agents_text)
             self.assertIn("<!-- EXPCAP START -->", agents_text)
             self.assertIn("AGENTS.expcap.md", agents_text)
+            self.assertIn("PROJECT_PROMPT.md", agents_text)
             self.assertIn("只要这个项目里真的开了新 chat，默认仍然会执行 `auto-start`", sidecar_text)
+            self.assertIn("宿主中立的项目级 prompt 真源", project_prompt_text)
             self.assertIn("默认先做 get", sidecar_text)
             self.assertEqual(policy_text["project_status"], "active")
             self.assertEqual(result["project_status"], "active")
             self.assertEqual(result["integration_mode"], INTEGRATION_MODE_DOCS_ONLY)
             self.assertIn(".agent-memory/", gitignore_text)
+            self.assertEqual(result["created_project_prompt"], True)
+            self.assertEqual(result["updated_project_prompt"], True)
             self.assertEqual(result["created_agents"], False)
             self.assertEqual(result["updated_agents"], True)
             self.assertEqual(result["created_gitignore"], True)
@@ -103,6 +108,7 @@ class InstallProjectTests(unittest.TestCase):
             self.assertIn("原有 Claude 规则。", claude_text)
             self.assertIn("<!-- EXPCAP START -->", claude_text)
             self.assertIn("AGENTS.expcap.md", claude_text)
+            self.assertIn("PROJECT_PROMPT.md", claude_text)
             self.assertEqual(result["integration_mode"], INTEGRATION_MODE_CLAUDE_HOOKS)
             self.assertEqual(result["created_claude"], False)
             self.assertEqual(result["updated_claude"], True)
@@ -254,6 +260,19 @@ class InstallProjectTests(unittest.TestCase):
             self.assertEqual(policy_text["project_status"], "inactive")
             self.assertIn("当前项目状态：`inactive`", sidecar_text)
             self.assertIn("不用于阻断新 chat 激活", sidecar_text)
+
+    def test_install_project_preserves_existing_project_prompt_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "repo"
+            workspace.mkdir(parents=True, exist_ok=True)
+            project_prompt_path = workspace / "PROJECT_PROMPT.md"
+            project_prompt_path.write_text("# PROJECT_PROMPT.md\n\n团队自己维护的稳定规则。\n", encoding="utf-8")
+
+            result = install_project_agents(workspace)
+
+            self.assertIn("团队自己维护的稳定规则。", project_prompt_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["created_project_prompt"], False)
+            self.assertEqual(result["updated_project_prompt"], False)
 
 
 if __name__ == "__main__":

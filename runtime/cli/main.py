@@ -33,8 +33,11 @@ from runtime.core.injection_policy import (
     INJECTION_CHANNELS,
     INJECTION_LAYERS,
     SYSTEM_PROMPT_INJECTION,
+    SYSTEM_PROMPT,
     TASK_START_RUNTIME_INJECTION,
+    injection_channel_for_asset,
 )
+from runtime.core.project_install import EXPCAP_SIDECAR, PROJECT_PROMPT_SOURCE
 from runtime.core.knowledge_kinds import (
     CANONICAL_KNOWLEDGE_KINDS,
     CODEMAP,
@@ -113,6 +116,10 @@ ALL_CANDIDATE_STATUSES = ("new", "needs_review", "approved", "rejected", "promot
 DEFAULT_REVIEW_QUEUE_STATUSES = ("needs_review", "approved", "new")
 DEFAULT_FEEDBACK_PENDING_HOURS = 24.0
 STALE_FEEDBACK_HELP_SIGNAL = "unclear"
+PROJECT_PROMPT_MANAGED_START = "<!-- EXPCAP PROJECT PROMOTED START -->"
+PROJECT_PROMPT_MANAGED_END = "<!-- EXPCAP PROJECT PROMOTED END -->"
+PROJECT_PROMPT_ARCHIVE_START = "<!-- EXPCAP PROJECT ARCHIVED START -->"
+PROJECT_PROMPT_ARCHIVE_END = "<!-- EXPCAP PROJECT ARCHIVED END -->"
 
 
 def _is_permission_like_error_message(value: str | None) -> bool:
@@ -318,6 +325,257 @@ def _validation_age_bucket(timestamp: str | None) -> str:
     if age_days <= 30.0:
         return "8_30d"
     return "31d_plus"
+
+
+def _load_asset_for_workspace(
+    *,
+    workspace: Path,
+    db_path: Path,
+    asset_id: str,
+    knowledge_scope: str = "project",
+) -> dict[str, Any] | None:
+    asset_db_path = shared_db_path() if knowledge_scope == "cross-project" else db_path
+    try:
+        asset = get_asset(asset_db_path, asset_id=asset_id)
+    except (OSError, sqlite3.Error):
+        asset = None
+    if asset:
+        return asset
+    for memory_root in memory_roots_for_workspace(workspace):
+        for asset_path in (memory_root / "assets").rglob(f"{asset_id}.json"):
+            return load_json(asset_path)
+    if knowledge_scope == "cross-project":
+        shared_path = default_shared_asset_path({"asset_type": "pattern", "asset_id": asset_id})
+        if shared_path.exists():
+            return load_json(shared_path)
+    return None
+
+
+def _proof_query_for_asset(asset: dict[str, Any]) -> str:
+    title = re.sub(r"\s+", " ", str(asset.get("title") or "")).strip()
+    content = re.sub(r"\s+", " ", str(asset.get("content") or "")).strip()
+    if content:
+        first_clause = re.split(r"[。！？.!?]", content, maxsplit=1)[0].strip()
+        if first_clause:
+            content = first_clause
+    segments = [segment for segment in (title, content) if segment]
+    if not segments:
+        segments = [str(asset.get("asset_id") or "")]
+    return " ".join(segments)[:240].strip()
+
+
+def _target_asset_rank(selected_assets: list[dict[str, Any]], target_asset_id: str) -> int | None:
+    for index, item in enumerate(selected_assets, start=1):
+        if str(item.get("asset_id") or "") == target_asset_id:
+            return index
+    return None
+
+
+def _project_prompt_paths(workspace: Path) -> dict[str, Path]:
+    return {
+        "project_prompt": workspace / PROJECT_PROMPT_SOURCE,
+        "agents": workspace / "AGENTS.md",
+        "claude": workspace / "CLAUDE.md",
+        "expcap": workspace / EXPCAP_SIDECAR,
+    }
+
+
+def _extract_project_prompt_entries(
+    text: str,
+    *,
+    start_marker: str = PROJECT_PROMPT_MANAGED_START,
+    end_marker: str = PROJECT_PROMPT_MANAGED_END,
+) -> list[dict[str, str]]:
+    if start_marker not in text or end_marker not in text:
+        return []
+    start = text.index(start_marker) + len(start_marker)
+    end = text.index(end_marker)
+    block = text[start:end]
+    entries: list[dict[str, str]] = []
+    sections = re.split(r"(?=^### `)", block, flags=re.M)
+    for section in sections:
+        candidate = section.strip()
+        if not candidate.startswith("### `"):
+            continue
+        lines = candidate.splitlines()
+        if len(lines) < 4:
+            continue
+        asset_match = re.match(r"### `(?P<asset_id>[^`]+)`$", lines[0].strip())
+        title_match = re.match(r"- Title: (?P<title>.+)$", lines[1].strip())
+        kind_match = re.match(r"- Kind: `(?P<knowledge_kind>[^`]+)`$", lines[2].strip())
+        source_match = re.match(r"- Source: `(?P<source>[^`]+)`$", lines[3].strip())
+        if not (asset_match and title_match and kind_match and source_match):
+            continue
+        metadata: dict[str, str] = {
+            "asset_id": asset_match.group("asset_id").strip(),
+            "title": title_match.group("title").strip(),
+            "knowledge_kind": kind_match.group("knowledge_kind").strip(),
+            "source": source_match.group("source").strip(),
+        }
+        content_start = 4
+        while content_start < len(lines):
+            line = lines[content_start].strip()
+            if line.startswith("- ") and ": " in line:
+                key, value = line[2:].split(": ", 1)
+                metadata[key.strip().lower().replace(" ", "_")] = value.strip().strip("`")
+                content_start += 1
+                continue
+            break
+        metadata["content"] = "\n".join(lines[content_start:]).strip()
+        entries.append(metadata)
+    return entries
+
+
+def _render_project_prompt_entries(
+    entries: list[dict[str, str]],
+    *,
+    heading: str = "## Promoted Stable Rules",
+    intro: str = "下列规则来自已被证明稳定有效的 expcap 资产；这里是项目级 prompt 真源中的受管区块。",
+    start_marker: str = PROJECT_PROMPT_MANAGED_START,
+    end_marker: str = PROJECT_PROMPT_MANAGED_END,
+) -> str:
+    lines = [
+        start_marker,
+        heading,
+        "",
+        intro,
+        "",
+    ]
+    for entry in entries:
+        lines.extend(
+            [
+                f"### `{entry['asset_id']}`",
+                f"- Title: {entry['title']}",
+                f"- Kind: `{entry['knowledge_kind']}`",
+                f"- Source: `{entry['source']}`",
+            ]
+        )
+        extra_keys = [
+            key
+            for key in entry
+            if key not in {"asset_id", "title", "knowledge_kind", "source", "content"}
+        ]
+        for key in sorted(extra_keys):
+            label = key.replace("_", " ").title()
+            lines.append(f"- {label}: `{str(entry[key]).strip()}`")
+        lines.extend(
+            [
+                "",
+                str(entry["content"]).strip(),
+                "",
+            ]
+        )
+    lines.append(end_marker)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _upsert_project_prompt_entries(path: Path, new_entries: list[dict[str, str]]) -> tuple[list[dict[str, str]], bool]:
+    original = path.read_text(encoding="utf-8") if path.exists() else f"# {PROJECT_PROMPT_SOURCE}\n\n"
+    existing_entries = _extract_project_prompt_entries(original)
+    merged: dict[str, dict[str, str]] = {entry["asset_id"]: entry for entry in existing_entries}
+    for entry in new_entries:
+        merged[entry["asset_id"]] = entry
+    rendered_block = _render_project_prompt_entries(list(merged.values()))
+    if PROJECT_PROMPT_MANAGED_START in original and PROJECT_PROMPT_MANAGED_END in original:
+        start = original.index(PROJECT_PROMPT_MANAGED_START)
+        end = original.index(PROJECT_PROMPT_MANAGED_END) + len(PROJECT_PROMPT_MANAGED_END)
+        suffix = original[end:].lstrip("\n")
+        new_content = original[:start].rstrip() + "\n\n" + rendered_block + suffix
+    else:
+        prefix = original.rstrip()
+        new_content = (prefix + "\n\n" if prefix else "") + rendered_block
+    updated = new_content != original
+    if updated:
+        path.write_text(new_content, encoding="utf-8")
+    return list(merged.values()), updated
+
+
+def _upsert_project_prompt_archive_entries(path: Path, new_entries: list[dict[str, str]]) -> tuple[list[dict[str, str]], bool]:
+    original = path.read_text(encoding="utf-8") if path.exists() else f"# {PROJECT_PROMPT_SOURCE}\n\n"
+    existing_entries = _extract_project_prompt_entries(
+        original,
+        start_marker=PROJECT_PROMPT_ARCHIVE_START,
+        end_marker=PROJECT_PROMPT_ARCHIVE_END,
+    )
+    merged: dict[str, dict[str, str]] = {entry["asset_id"]: entry for entry in existing_entries}
+    for entry in new_entries:
+        merged[entry["asset_id"]] = entry
+    rendered_block = _render_project_prompt_entries(
+        list(merged.values()),
+        heading="## Archived Stable Rules",
+        intro="下列规则曾被晋升到项目级 prompt，但已退出当前受管生效区；保留这里用于追溯归档原因。",
+        start_marker=PROJECT_PROMPT_ARCHIVE_START,
+        end_marker=PROJECT_PROMPT_ARCHIVE_END,
+    )
+    if PROJECT_PROMPT_ARCHIVE_START in original and PROJECT_PROMPT_ARCHIVE_END in original:
+        start = original.index(PROJECT_PROMPT_ARCHIVE_START)
+        end = original.index(PROJECT_PROMPT_ARCHIVE_END) + len(PROJECT_PROMPT_ARCHIVE_END)
+        suffix = original[end:].lstrip("\n")
+        new_content = original[:start].rstrip() + "\n\n" + rendered_block + suffix
+    else:
+        prefix = original.rstrip()
+        new_content = (prefix + "\n\n" if prefix else "") + rendered_block
+    updated = new_content != original
+    if updated:
+        path.write_text(new_content, encoding="utf-8")
+    return list(merged.values()), updated
+
+
+def _remove_project_prompt_entries(path: Path, asset_ids: list[str]) -> tuple[list[dict[str, str]], list[dict[str, str]], bool]:
+    original = path.read_text(encoding="utf-8") if path.exists() else f"# {PROJECT_PROMPT_SOURCE}\n\n"
+    existing_entries = _extract_project_prompt_entries(original)
+    removal_set = {asset_id for asset_id in asset_ids if asset_id}
+    removed_entries = [entry for entry in existing_entries if entry["asset_id"] in removal_set]
+    remaining_entries = [entry for entry in existing_entries if entry["asset_id"] not in removal_set]
+    rendered_block = _render_project_prompt_entries(remaining_entries)
+    if PROJECT_PROMPT_MANAGED_START in original and PROJECT_PROMPT_MANAGED_END in original:
+        start = original.index(PROJECT_PROMPT_MANAGED_START)
+        end = original.index(PROJECT_PROMPT_MANAGED_END) + len(PROJECT_PROMPT_MANAGED_END)
+        suffix = original[end:].lstrip("\n")
+        new_content = original[:start].rstrip() + "\n\n" + rendered_block + suffix
+    else:
+        new_content = original
+    updated = new_content != original
+    if updated:
+        path.write_text(new_content, encoding="utf-8")
+    return remaining_entries, removed_entries, updated
+
+
+def _project_prompt_suggestion_candidates(*, workspace: Path, limit: int) -> list[dict[str, Any]]:
+    db_path = default_db_path(workspace)
+    assets, _, _, _, _ = _load_status_records(workspace=workspace, db_path=db_path)
+    project_prompt_path = _project_prompt_paths(workspace)["project_prompt"]
+    existing_entries = _extract_project_prompt_entries(project_prompt_path.read_text(encoding="utf-8")) if project_prompt_path.exists() else []
+    existing_ids = {entry["asset_id"] for entry in existing_entries}
+    candidates: list[dict[str, Any]] = []
+    for asset in assets:
+        if asset.get("status", "active") != "active":
+            continue
+        if asset.get("knowledge_scope", "project") != "project":
+            continue
+        if str(asset.get("review_status") or "unproven") not in {"healthy", "watch"}:
+            continue
+        if injection_channel_for_asset(asset) != SYSTEM_PROMPT:
+            continue
+        asset_id = str(asset.get("asset_id") or "")
+        if not asset_id or asset_id in existing_ids:
+            continue
+        candidates.append(
+            {
+                "asset_id": asset_id,
+                "title": str(asset.get("title") or asset_id),
+                "knowledge_kind": str(asset.get("knowledge_kind", asset.get("asset_type", "pattern")) or "pattern"),
+                "content": str(asset.get("content") or "").strip(),
+                "review_status": str(asset.get("review_status") or "unproven"),
+                "temperature": str(asset.get("temperature") or "neutral"),
+                "confidence": float(asset.get("confidence", 0.0) or 0.0),
+                "reason": "Stable small prompt-worthy asset not yet promoted into PROJECT_PROMPT.md.",
+            }
+        )
+    candidates.sort(
+        key=lambda item: (-item["confidence"], item["knowledge_kind"], item["asset_id"])
+    )
+    return candidates[:limit]
 
 
 def _build_unproven_validation_queue(
@@ -1086,6 +1344,87 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     validation_plan.add_argument("--output", help="Optional output path for the validation plan JSON.")
 
+    prove_next = subparsers.add_parser(
+        "prove-next",
+        help="Auto-run proof attempts for top unproven assets and only auto-feedback exact target hits.",
+    )
+    prove_next.add_argument("--workspace", required=True, help="Workspace path for the proof run.")
+    prove_next.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        help="How many top unproven assets to process. Defaults to 3.",
+    )
+    prove_next.add_argument(
+        "--help-signal",
+        choices=["supported_strong", "supported_weak", "unclear"],
+        default="supported_strong",
+        help="Feedback signal written only when the target asset is selected. Defaults to supported_strong.",
+    )
+    prove_next.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build activation attempts without writing automatic feedback.",
+    )
+    prove_next.add_argument("--output", help="Optional output path for the prove-next JSON report.")
+
+    project_prompt = subparsers.add_parser(
+        "project-prompt",
+        help="Manage the project-level stable prompt source and its expcap-backed promotion flow.",
+    )
+    project_prompt_subparsers = project_prompt.add_subparsers(dest="project_prompt_command", required=True)
+
+    project_prompt_status = project_prompt_subparsers.add_parser(
+        "status",
+        help="Inspect the current project prompt source and bridge files.",
+    )
+    project_prompt_status.add_argument("--workspace", required=True, help="Workspace path to inspect.")
+    project_prompt_status.add_argument("--output", help="Optional output path for the project prompt status JSON.")
+
+    project_prompt_suggest = project_prompt_subparsers.add_parser(
+        "suggest",
+        help="Suggest stable expcap assets that are ready to be promoted into PROJECT_PROMPT.md.",
+    )
+    project_prompt_suggest.add_argument("--workspace", required=True, help="Workspace path to inspect.")
+    project_prompt_suggest.add_argument("--limit", type=int, default=5, help="How many suggestions to return. Defaults to 5.")
+    project_prompt_suggest.add_argument("--output", help="Optional output path for the project prompt suggestion JSON.")
+
+    project_prompt_apply = project_prompt_subparsers.add_parser(
+        "apply",
+        help="Apply selected stable assets into the managed section of PROJECT_PROMPT.md.",
+    )
+    project_prompt_apply.add_argument("--workspace", required=True, help="Workspace path to update.")
+    project_prompt_apply.add_argument("--asset-id", action="append", required=True, dest="asset_ids", help="Asset id to promote into PROJECT_PROMPT.md. May be passed multiple times.")
+    project_prompt_apply.add_argument("--sync-after", action="store_true", help="Run project-prompt sync automatically after a successful content update.")
+    project_prompt_apply.add_argument("--output", help="Optional output path for the project prompt apply JSON.")
+
+    project_prompt_archive = project_prompt_subparsers.add_parser(
+        "archive",
+        help="Archive active promoted rules out of the managed PROJECT_PROMPT.md block while keeping a traceable archive record.",
+    )
+    project_prompt_archive.add_argument("--workspace", required=True, help="Workspace path to update.")
+    project_prompt_archive.add_argument("--asset-id", action="append", required=True, dest="asset_ids", help="Asset id to archive from PROJECT_PROMPT.md. May be passed multiple times.")
+    project_prompt_archive.add_argument("--reason", required=True, help="Short reason for archiving the selected rule(s).")
+    project_prompt_archive.add_argument("--sync-after", action="store_true", help="Run project-prompt sync automatically after a successful content update.")
+    project_prompt_archive.add_argument("--output", help="Optional output path for the project prompt archive JSON.")
+
+    project_prompt_sync = project_prompt_subparsers.add_parser(
+        "sync",
+        help="Sync PROJECT_PROMPT.md bridge files for the current or requested host integration mode.",
+    )
+    project_prompt_sync.add_argument("--workspace", required=True, help="Workspace path to sync.")
+    project_prompt_sync.add_argument(
+        "--integration-mode",
+        choices=SUPPORTED_INTEGRATION_MODES,
+        help="Optional host integration mode override. Defaults to the current project policy mode.",
+    )
+    project_prompt_sync.add_argument(
+        "--project-status",
+        choices=["active", "inactive"],
+        help="Optional project status override. Defaults to the current project policy status.",
+    )
+    project_prompt_sync.add_argument("--output", help="Optional output path for the project prompt sync JSON.")
+
     save_prior = subparsers.add_parser(
         "save-prior",
         help="Save an explicit active local prior such as a preference, constraint, or dont_repeat instruction.",
@@ -1791,6 +2130,84 @@ def _save_review_json(
             fallback_path=fallback_path,
             error=error,
         )
+
+
+def _probe_parent_dir_writable(path: Path) -> tuple[bool, str | None, str]:
+    probe_dir = path
+    while not probe_dir.exists() and probe_dir != probe_dir.parent:
+        probe_dir = probe_dir.parent
+    if probe_dir.exists() and not probe_dir.is_dir():
+        probe_dir = probe_dir.parent
+    try:
+        fd, probe_path = tempfile.mkstemp(prefix=".expcap-write-probe-", dir=str(probe_dir))
+        os.close(fd)
+        Path(probe_path).unlink(missing_ok=True)
+        return True, None, str(probe_dir)
+    except OSError as error:
+        return False, str(error), str(probe_dir)
+
+
+def _probe_state_index_writable(path: Path) -> tuple[bool, str | None, str]:
+    if path.exists():
+        try:
+            with path.open("r+b"):
+                pass
+            return True, None, str(path)
+        except OSError as error:
+            return False, str(error), str(path)
+    return _probe_parent_dir_writable(path.parent)
+
+
+def _build_primary_write_health(workspace: Path) -> dict[str, Any]:
+    memory_root = memory_root_for_workspace(workspace)
+    targets = [
+        ("views", memory_root / "views", _probe_parent_dir_writable),
+        ("reviews", memory_root / "reviews", _probe_parent_dir_writable),
+        ("traces", memory_root / "traces" / "bundles", _probe_parent_dir_writable),
+        ("episodes", memory_root / "episodes", _probe_parent_dir_writable),
+        ("assets", memory_root / "assets", _probe_parent_dir_writable),
+        ("candidates", memory_root / "candidates", _probe_parent_dir_writable),
+        ("state_index", default_db_path(workspace), _probe_state_index_writable),
+    ]
+    checked_targets: list[dict[str, Any]] = []
+    failed_targets: list[dict[str, str]] = []
+    for name, target_path, probe in targets:
+        writable, error, probe_path = probe(target_path)
+        checked_targets.append(
+            {
+                "target": name,
+                "path": str(target_path),
+                "probe_path": probe_path,
+                "writable": writable,
+                "error": error,
+            }
+        )
+        if not writable:
+            failed_targets.append(
+                {
+                    "target": name,
+                    "path": str(target_path),
+                    "probe_path": probe_path,
+                    "error": str(error or "unknown error"),
+                }
+            )
+    permission_induced = bool(failed_targets) and all(
+        _is_permission_like_error_message(item.get("error")) for item in failed_targets
+    )
+    if not failed_targets:
+        status = "primary_writable"
+    elif len(failed_targets) == len(checked_targets):
+        status = "fallback_only"
+    else:
+        status = "partial_primary_write"
+    return {
+        "status": status,
+        "all_writable": not failed_targets,
+        "failed_target_count": len(failed_targets),
+        "permission_induced": permission_induced,
+        "checked_targets": checked_targets,
+        "failed_targets": failed_targets,
+    }
 
 
 def _upsert_warning(*, kind: str, path: Path, error: BaseException) -> dict[str, str]:
@@ -3543,6 +3960,502 @@ def _handle_validation_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_prove_next(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    bounded_limit = max(int(args.limit or 3), 1)
+    status_payload = _build_status_payload(
+        workspace=workspace,
+        limit=bounded_limit,
+        deep_retrieval_check=False,
+    )
+    queue = status_payload["unproven_validation_queue"]
+    top_items = queue.get("top_items", [])[:bounded_limit]
+    result_items: list[dict[str, Any]] = []
+
+    for index, item in enumerate(top_items, start=1):
+        asset_id = str(item.get("asset_id") or "")
+        knowledge_scope = str(item.get("knowledge_scope") or "project")
+        asset = _load_asset_for_workspace(
+            workspace=workspace,
+            db_path=db_path,
+            asset_id=asset_id,
+            knowledge_scope=knowledge_scope,
+        )
+        if not asset:
+            result_items.append(
+                {
+                    "rank": index,
+                    "asset_id": asset_id,
+                    "status": "asset_missing",
+                    "query_text": None,
+                    "target_asset_hit": False,
+                    "target_asset_rank": None,
+                    "help_signal_written": None,
+                }
+            )
+            continue
+
+        query_text = _proof_query_for_asset(asset)
+        assets_dir, candidates_dir = _activation_source_dirs(workspace)
+        view = activate_assets(
+            task=query_text,
+            workspace=workspace,
+            constraints=[],
+            assets_dir=assets_dir,
+            candidates_dir=candidates_dir,
+            db_path=db_path,
+        )
+        output_path, activation_save_warning = _save_activation_view(
+            workspace=workspace,
+            view=view,
+            requested_output=None,
+        )
+        injection_artifacts, injection_artifact_warning = _safe_materialize_injection_artifacts(
+            workspace=workspace,
+            view=view,
+        )
+        if injection_artifacts:
+            view["injection_artifacts"] = injection_artifacts
+        save_json(output_path, view)
+        activation_log_warning = _record_activation_usage(workspace=workspace, db_path=db_path, view=view)
+
+        selected_assets = list(view.get("selected_assets", []))
+        target_rank = _target_asset_rank(selected_assets, asset_id)
+        target_hit = target_rank is not None
+        feedback_result = None
+        feedback_warnings: list[dict[str, str]] = []
+        if target_hit and not args.dry_run:
+            feedback_result, feedback_warnings = _apply_activation_feedback(
+                workspace=workspace,
+                db_path=db_path,
+                activation_id=str(view["activation_id"]),
+                feedback={
+                    "help_signal": args.help_signal,
+                    "feedback_at": now_utc(),
+                    "feedback_summary": (
+                        f"prove-next auto validated target asset {asset_id} via exact target hit in selected_assets."
+                    ),
+                    "task_query": query_text,
+                },
+            )
+
+        result_items.append(
+            {
+                "rank": index,
+                "asset_id": asset_id,
+                "title": asset.get("title"),
+                "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
+                "query_text": query_text,
+                "activation_id": view.get("activation_id"),
+                "selected_asset_ids": [
+                    selected.get("asset_id")
+                    for selected in selected_assets
+                    if isinstance(selected, dict) and selected.get("asset_id")
+                ],
+                "target_asset_hit": target_hit,
+                "target_asset_rank": target_rank,
+                "help_signal_written": feedback_result.get("help_signal") if feedback_result else None,
+                "status": "proved" if feedback_result else "hit_without_feedback" if target_hit else "missed",
+                "activation_save_warning": activation_save_warning,
+                "activation_log_warning": activation_log_warning,
+                "injection_artifact_warning": injection_artifact_warning,
+                "feedback_warnings": feedback_warnings,
+            }
+        )
+
+    payload = {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "requested_limit": bounded_limit,
+        "processed_count": len(result_items),
+        "target_hit_count": sum(1 for item in result_items if item.get("target_asset_hit")),
+        "proved_count": sum(1 for item in result_items if item.get("help_signal_written")),
+        "dry_run": bool(args.dry_run),
+        "items": result_items,
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "prove_next.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_prove_next_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "prove_next": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
+def _handle_project_prompt_status(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    paths = _project_prompt_paths(workspace)
+    project_prompt_path = paths["project_prompt"]
+    project_prompt_text = project_prompt_path.read_text(encoding="utf-8") if project_prompt_path.exists() else ""
+    entries = _extract_project_prompt_entries(project_prompt_text)
+    archived_entries = _extract_project_prompt_entries(
+        project_prompt_text,
+        start_marker=PROJECT_PROMPT_ARCHIVE_START,
+        end_marker=PROJECT_PROMPT_ARCHIVE_END,
+    )
+    payload = {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "prompt_source": {
+            "path": str(project_prompt_path),
+            "exists": project_prompt_path.exists(),
+            "managed_entry_count": len(entries),
+            "managed_asset_ids": [entry["asset_id"] for entry in entries],
+            "archived_entry_count": len(archived_entries),
+            "archived_asset_ids": [entry["asset_id"] for entry in archived_entries],
+        },
+        "bridge_files": {
+            "agents_md": {
+                "path": str(paths["agents"]),
+                "exists": paths["agents"].exists(),
+                "references_prompt_source": paths["agents"].exists()
+                and PROJECT_PROMPT_SOURCE in paths["agents"].read_text(encoding="utf-8"),
+                "references_expcap": paths["agents"].exists()
+                and EXPCAP_SIDECAR in paths["agents"].read_text(encoding="utf-8"),
+            },
+            "claude_md": {
+                "path": str(paths["claude"]),
+                "exists": paths["claude"].exists(),
+                "references_prompt_source": paths["claude"].exists()
+                and PROJECT_PROMPT_SOURCE in paths["claude"].read_text(encoding="utf-8"),
+                "references_expcap": paths["claude"].exists()
+                and EXPCAP_SIDECAR in paths["claude"].read_text(encoding="utf-8"),
+            },
+            "expcap_sidecar": {
+                "path": str(paths["expcap"]),
+                "exists": paths["expcap"].exists(),
+            },
+        },
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "project_prompt_status.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_project_prompt_status_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "project_prompt_status": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
+def _project_prompt_sync_payload(
+    *,
+    workspace: Path,
+    integration_mode: str | None,
+    project_status: str | None,
+) -> tuple[dict[str, Any], str]:
+    project_activity = load_project_policy(workspace)
+    resolved_integration_mode = str(integration_mode or project_activity.get("integration_mode") or DEFAULT_INTEGRATION_MODE)
+    resolved_project_status = str(project_status or project_activity.get("project_status") or DEFAULT_PROJECT_STATUS)
+    sync_result = install_project_agents(
+        workspace,
+        integration_mode=resolved_integration_mode,
+        project_status=resolved_project_status,
+    )
+    payload = {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "integration_mode": resolved_integration_mode,
+        "project_status": resolved_project_status,
+        "mode_source": "override" if integration_mode else str(project_activity.get("policy_source") or "default"),
+        "status_source": "override" if project_status else str(project_activity.get("policy_source") or "default"),
+        "project_prompt_path": str(sync_result.get("project_prompt_path") or ""),
+        "bridge_files": {
+            "agents_md": {
+                "path": str(sync_result.get("agents_path") or ""),
+                "created": bool(sync_result.get("created_agents")),
+                "updated": bool(sync_result.get("updated_agents")),
+            },
+            "claude_md": {
+                "path": str(sync_result.get("claude_path") or ""),
+                "created": bool(sync_result.get("created_claude")),
+                "updated": bool(sync_result.get("updated_claude")),
+                "configured": resolved_integration_mode == INTEGRATION_MODE_CLAUDE_HOOKS,
+            },
+            "expcap_sidecar": {
+                "path": str(sync_result.get("sidecar_path") or ""),
+                "exists": Path(str(sync_result.get("sidecar_path") or "")).exists() if sync_result.get("sidecar_path") else False,
+            },
+        },
+        "hook_artifacts": {
+            "codex": {
+                "configured": resolved_integration_mode == INTEGRATION_MODE_CODEX_HOOKS,
+                "hooks_path": str(sync_result.get("codex_hooks_path") or ""),
+                "hooks_dir": str(sync_result.get("codex_hooks_dir") or ""),
+                "updated": any(
+                    bool(sync_result.get(key))
+                    for key in (
+                        "created_codex_hooks",
+                        "updated_codex_hooks",
+                        "created_codex_prompt_hook",
+                        "updated_codex_prompt_hook",
+                        "created_codex_stop_hook",
+                        "updated_codex_stop_hook",
+                        "created_codex_session_start_hook",
+                        "updated_codex_session_start_hook",
+                        "created_codex_pre_tool_use_hook",
+                        "updated_codex_pre_tool_use_hook",
+                        "created_codex_permission_request_hook",
+                        "updated_codex_permission_request_hook",
+                        "created_codex_post_tool_use_hook",
+                        "updated_codex_post_tool_use_hook",
+                    )
+                ),
+            },
+            "claude": {
+                "configured": resolved_integration_mode == INTEGRATION_MODE_CLAUDE_HOOKS,
+                "settings_path": str(sync_result.get("claude_settings_path") or ""),
+                "hooks_dir": str(sync_result.get("claude_hooks_dir") or ""),
+                "updated": any(
+                    bool(sync_result.get(key))
+                    for key in (
+                        "created_claude_settings",
+                        "updated_claude_settings",
+                        "created_claude_prompt_hook",
+                        "updated_claude_prompt_hook",
+                        "created_claude_stop_hook",
+                        "updated_claude_stop_hook",
+                    )
+                ),
+            },
+        },
+    }
+    output_path = (
+        memory_root_for_workspace(workspace) / "reviews" / "project_prompt_sync.json"
+    )
+    return payload, str(output_path)
+
+
+def _handle_project_prompt_suggest(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    bounded_limit = max(int(args.limit or 5), 1)
+    suggestions = _project_prompt_suggestion_candidates(workspace=workspace, limit=bounded_limit)
+    payload = {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "limit": bounded_limit,
+        "suggestion_count": len(suggestions),
+        "suggestions": suggestions,
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "project_prompt_suggestions.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_project_prompt_suggestions_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "project_prompt_suggestions": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
+def _handle_project_prompt_apply(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    project_prompt_path = _project_prompt_paths(workspace)["project_prompt"]
+    if not project_prompt_path.exists():
+        project_prompt_path.write_text(f"# {PROJECT_PROMPT_SOURCE}\n\n", encoding="utf-8")
+    asset_ids = [str(asset_id) for asset_id in args.asset_ids if str(asset_id).strip()]
+    entries: list[dict[str, str]] = []
+    missing_asset_ids: list[str] = []
+    for asset_id in asset_ids:
+        asset = _load_asset_for_workspace(
+            workspace=workspace,
+            db_path=db_path,
+            asset_id=asset_id,
+            knowledge_scope="project",
+        )
+        if not asset:
+            missing_asset_ids.append(asset_id)
+            continue
+        entries.append(
+            {
+                "asset_id": asset_id,
+                "title": str(asset.get("title") or asset_id),
+                "knowledge_kind": str(asset.get("knowledge_kind", asset.get("asset_type", "pattern")) or "pattern"),
+                "source": "expcap_asset",
+                "content": str(asset.get("content") or "").strip(),
+            }
+        )
+    merged_entries, updated = _upsert_project_prompt_entries(project_prompt_path, entries)
+    payload = {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "project_prompt_path": str(project_prompt_path),
+        "requested_asset_ids": asset_ids,
+        "applied_asset_ids": [entry["asset_id"] for entry in entries],
+        "missing_asset_ids": missing_asset_ids,
+        "updated": updated,
+        "managed_entry_count": len(merged_entries),
+    }
+    if updated and bool(getattr(args, "sync_after", False)):
+        sync_payload, sync_default_output = _project_prompt_sync_payload(
+            workspace=workspace,
+            integration_mode=None,
+            project_status=None,
+        )
+        payload["sync_after"] = {
+            "requested": True,
+            "triggered": True,
+            "review_output_path": sync_default_output,
+            "sync": sync_payload,
+        }
+    else:
+        payload["sync_after"] = {
+            "requested": bool(getattr(args, "sync_after", False)),
+            "triggered": False,
+        }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "project_prompt_apply.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_project_prompt_apply_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "project_prompt_apply": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
+def _handle_project_prompt_archive(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    project_prompt_path = _project_prompt_paths(workspace)["project_prompt"]
+    if not project_prompt_path.exists():
+        project_prompt_path.write_text(f"# {PROJECT_PROMPT_SOURCE}\n\n", encoding="utf-8")
+    asset_ids = [str(asset_id).strip() for asset_id in args.asset_ids if str(asset_id).strip()]
+    remaining_entries, removed_entries, managed_updated = _remove_project_prompt_entries(project_prompt_path, asset_ids)
+    removed_by_id = {entry["asset_id"]: entry for entry in removed_entries}
+    archive_entries = []
+    missing_asset_ids = []
+    archived_at = now_utc()
+    for asset_id in asset_ids:
+        entry = removed_by_id.get(asset_id)
+        if not entry:
+            missing_asset_ids.append(asset_id)
+            continue
+        archive_entries.append(
+            {
+                **entry,
+                "archived_at": archived_at,
+                "archive_reason": str(args.reason).strip(),
+            }
+        )
+    if archive_entries:
+        archived_entries, archive_updated = _upsert_project_prompt_archive_entries(project_prompt_path, archive_entries)
+    else:
+        archived_entries = _extract_project_prompt_entries(
+            project_prompt_path.read_text(encoding="utf-8"),
+            start_marker=PROJECT_PROMPT_ARCHIVE_START,
+            end_marker=PROJECT_PROMPT_ARCHIVE_END,
+        )
+        archive_updated = False
+    payload = {
+        "workspace": str(workspace),
+        "generated_at": archived_at,
+        "project_prompt_path": str(project_prompt_path),
+        "requested_asset_ids": asset_ids,
+        "archived_asset_ids": [entry["asset_id"] for entry in archive_entries],
+        "missing_asset_ids": missing_asset_ids,
+        "updated": bool(managed_updated or archive_updated),
+        "archive_reason": str(args.reason).strip(),
+        "managed_entry_count": len(remaining_entries),
+        "archived_entry_count": len(archived_entries),
+    }
+    if payload["updated"] and bool(getattr(args, "sync_after", False)):
+        sync_payload, sync_default_output = _project_prompt_sync_payload(
+            workspace=workspace,
+            integration_mode=None,
+            project_status=None,
+        )
+        payload["sync_after"] = {
+            "requested": True,
+            "triggered": True,
+            "review_output_path": sync_default_output,
+            "sync": sync_payload,
+        }
+    else:
+        payload["sync_after"] = {
+            "requested": bool(getattr(args, "sync_after", False)),
+            "triggered": False,
+        }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "project_prompt_archive.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_project_prompt_archive_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "project_prompt_archive": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
+def _handle_project_prompt_sync(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    payload, _ = _project_prompt_sync_payload(
+        workspace=workspace,
+        integration_mode=args.integration_mode,
+        project_status=args.project_status,
+    )
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "project_prompt_sync.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_project_prompt_sync_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "project_prompt_sync": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
 def _build_status_payload(
     *,
     workspace: Path,
@@ -3747,6 +4660,7 @@ def _build_status_payload(
     }
     fallback_runtime_present = fallback_root.exists() and fallback_root != memory_root
     runtime_degradation_summary = _build_runtime_degradation_summary(runtime_warnings)
+    primary_write_health = _build_primary_write_health(workspace)
     backend_runtime = {
         "memory_root_mode": "fallback_active" if fallback_runtime_present else "primary_only",
         "primary_memory_root": str(memory_root),
@@ -3757,6 +4671,7 @@ def _build_status_payload(
         "fallback_state_index_path": sqlite_backend.get("fallback_db_path", str(fallback_db_path(workspace))),
         "active_state_index_path": sqlite_backend.get("active_db_path"),
         "fallback_state_index_in_use": bool(sqlite_backend.get("fallback_in_use", False)),
+        "primary_write_health": primary_write_health,
         "runtime_degradation_summary": runtime_degradation_summary,
     }
 
@@ -3787,6 +4702,7 @@ def _build_status_payload(
         },
         "backend_runtime": backend_runtime,
         "runtime_degradation_summary": runtime_degradation_summary,
+        "primary_write_health": primary_write_health,
         "feedback_cleanup": feedback_cleanup
         or {
             "auto_resolved_count": 0,
@@ -3930,6 +4846,7 @@ def _build_doctor_payload(
     asset_health = status_payload["asset_effectiveness_summary"]["review_status"]
     asset_backlog = status_payload["asset_review_backlog"]
     unproven_validation_queue = status_payload["unproven_validation_queue"]
+    primary_write_health = status_payload.get("primary_write_health") or {}
     hook_integration = status_payload.get("hook_integration") or {
         "integration_mode": DEFAULT_INTEGRATION_MODE,
         "recent_events": [],
@@ -3976,6 +4893,39 @@ def _build_doctor_payload(
             "pass" if sqlite_healthy else "warn",
             sqlite_summary,
             sqlite_recommendation,
+        )
+    )
+    primary_write_status = str(primary_write_health.get("status") or "unknown")
+    failed_targets = primary_write_health.get("failed_targets") or []
+    failed_target_names = ", ".join(str(item.get("target")) for item in failed_targets) or "none"
+    if primary_write_status == "primary_writable":
+        primary_write_summary = (
+            "Primary write path is healthy across views, reviews, traces, episodes, assets, candidates, and state index."
+        )
+        primary_write_recommendation = None
+    elif primary_write_status == "fallback_only":
+        primary_write_summary = (
+            "Primary write path is unavailable; runtime can only persist through fallback paths for "
+            f"{failed_target_names}."
+        )
+        primary_write_recommendation = (
+            "Primary write probes look permission- or sandbox-blocked; treat fallback persistence as degraded success and restore writable access to ~/.expcap before trusting save/log closure."
+            if primary_write_health.get("permission_induced")
+            else "Primary write probes failed across the storage tree; inspect path ownership, directory creation, and SQLite file permissions before relying on save/log closure."
+        )
+    else:
+        primary_write_summary = f"Primary write path is partially degraded; failed targets: {failed_target_names}."
+        primary_write_recommendation = (
+            "Some primary write targets look permission- or sandbox-blocked; verify per-target path permissions before relying on partial save/log closure."
+            if primary_write_health.get("permission_induced")
+            else "Inspect the failed targets and their parent directories; partial primary write degradation can hide behind otherwise healthy read-side metrics."
+        )
+    checks.append(
+        _diagnostic_check(
+            "primary_write_path",
+            "pass" if primary_write_status == "primary_writable" else "warn",
+            primary_write_summary,
+            primary_write_recommendation,
         )
     )
     checks.append(
@@ -4637,6 +5587,7 @@ def _render_backend_runtime_panel(payload: dict[str, Any]) -> str:
     backend_runtime = status.get("backend_runtime") or {}
     sqlite_backend = (status.get("retrieval_backends") or {}).get("sqlite") or {}
     degradation_summary = backend_runtime.get("runtime_degradation_summary") or status.get("runtime_degradation_summary") or {}
+    primary_write_health = backend_runtime.get("primary_write_health") or status.get("primary_write_health") or {}
     primary_root = backend_runtime.get("primary_memory_root")
     fallback_root = backend_runtime.get("fallback_memory_root")
     primary_index = backend_runtime.get("primary_state_index_path")
@@ -4655,6 +5606,8 @@ def _render_backend_runtime_panel(payload: dict[str, Any]) -> str:
       <div class="metric-line"><span>State index mode</span><strong>{_safe_text(state_index_mode)}</strong></div>
       <div class="metric-line"><span>Fallback state index in use</span><strong>{fallback_in_use}</strong></div>
       <div class="metric-line"><span>SQLite available</span><strong>{_safe_text(sqlite_backend.get("available"))}</strong></div>
+      <div class="metric-line"><span>Primary write health</span><strong>{_safe_text(primary_write_health.get("status") or "unknown")}</strong></div>
+      <div class="metric-line"><span>Primary write probe failures</span><strong>{_safe_text(primary_write_health.get("failed_target_count", 0))}</strong></div>
       <div class="metric-line"><span>Primary memory root</span><strong><code>{_safe_text(primary_root)}</code></strong></div>
       <div class="metric-line"><span>Fallback memory root present</span><strong>{fallback_root_present}</strong></div>
       <div class="metric-line"><span>Fallback memory root</span><strong><code>{_safe_text(fallback_root)}</code></strong></div>
@@ -5090,6 +6043,19 @@ def main() -> int:
         return _handle_review_candidates(args)
     if args.command == "validation-plan":
         return _handle_validation_plan(args)
+    if args.command == "prove-next":
+        return _handle_prove_next(args)
+    if args.command == "project-prompt":
+        if args.project_prompt_command == "status":
+            return _handle_project_prompt_status(args)
+        if args.project_prompt_command == "suggest":
+            return _handle_project_prompt_suggest(args)
+        if args.project_prompt_command == "apply":
+            return _handle_project_prompt_apply(args)
+        if args.project_prompt_command == "archive":
+            return _handle_project_prompt_archive(args)
+        if args.project_prompt_command == "sync":
+            return _handle_project_prompt_sync(args)
     if args.command == "status":
         return _handle_status(args)
     if args.command == "doctor":

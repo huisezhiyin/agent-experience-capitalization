@@ -10,6 +10,12 @@
 
 `expcap` 不和 Codex / Claude Code 的个人记忆竞争。它专注于项目级、团队级、公司级的工程经验资产：可共享、可审阅、可交割，不绑定某一个人的模型账号。
 
+## 双层结构
+
+- 项目级稳定规则真源见 `PROJECT_PROMPT.md`
+- 动态经验 `get/save` 集成见 `AGENTS.expcap.md`
+- `AGENTS.md` 负责主入口，不让稳定规则和动态经验治理混在一起
+
 ## 默认规则
 
 默认使用集中数据中心，而不是把运行数据写入项目目录：
@@ -98,14 +104,16 @@ EXPCAP_STORAGE_PROFILE=user-cache EXPCAP_HOME="$HOME/.expcap" expcap <subcommand
 - 这是一个边用边改的原型项目
 - 允许半自动，不要求一开始就完美全自动
 - 但默认行为必须向“自动 get / 自动 save”方向靠拢
+- 项目级稳定规则应尽量落到宿主无关的 `PROJECT_PROMPT.md`，而不是绑定某个 agent 的专有文件名
 
 <!-- EXPCAP START -->
 ## Expcap Integration
 
-- 本项目额外启用经验资本化工作流，详细规则见 `AGENTS.expcap.md`
+- 本项目采用双层 agent 规则结构：稳定项目规则见 `PROJECT_PROMPT.md`，动态经验集成见 `AGENTS.expcap.md`
 - 不替换本项目原有 agent 约束，只补充经验 `get/save` 行为
 - 只要进入新 chat，就优先执行集中存储模式的 `expcap auto-start`
 - 任务收敛后优先执行集中存储模式的 `expcap auto-finish`
 - 高置信经验再继续 `promote`
+- 被反复证明有效的稳定经验，应优先人工收敛到 `PROJECT_PROMPT.md`
 
 <!-- EXPCAP END -->

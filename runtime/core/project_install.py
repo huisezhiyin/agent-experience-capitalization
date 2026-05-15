@@ -19,16 +19,61 @@ SUPPORTED_INTEGRATION_MODES = (
     INTEGRATION_MODE_CLAUDE_HOOKS,
 )
 
+PROJECT_PROMPT_SOURCE = "PROJECT_PROMPT.md"
+LEGACY_PROJECT_AGENT_SIDECAR = "AGENTS.project.md"
+EXPCAP_SIDECAR = "AGENTS.expcap.md"
+
+
+def _project_prompt_source_content() -> str:
+    return f"""# {PROJECT_PROMPT_SOURCE}
+
+本文件是宿主中立的项目级 prompt 真源，用来承接已经被反复验证、希望每次新会话都默认生效的规则。
+
+## 作用定位
+
+- 这里放稳定、长期、希望默认注入的项目规则
+- 不放还在试验中的临时经验
+- `expcap` 负责发现、验证、证明经验；稳定后再考虑晋升到本文件
+
+## 宿主兼容策略
+
+- 本文件是宿主中立的规则真源
+- `AGENTS.md` / `CLAUDE.md` / 其他 agent 宿主文件应只做入口和桥接，不应各自维护一套分叉规则
+- 对不原生读取 `AGENTS.md` 的宿主，也应优先复用本文件内容，而不是重新发明另一套项目规则文档
+
+## 建议放入的内容
+
+- 项目目标与边界
+- 目录结构与模块约定
+- 禁止事项与高风险操作边界
+- 默认验证路径
+- 已验证稳定的协作规则 / 组织约定 / dont_repeat 事项
+
+## 建议不要放入的内容
+
+- 一次性排障过程
+- 还没有 proof 的 pattern
+- 容易快速过期的环境状态
+- 长篇背景材料或原始文档摘录
+
+## Maintainer Notes
+
+- 优先保持短、硬、稳定
+- 当 `expcap` 中某条经验被多次证明有效，再考虑手工收敛到这里
+- 若某条规则已经失效，优先直接修改这里，而不是继续依赖历史资产纠偏
+"""
+
 
 def _sidecar_content(workspace: Path, *, project_status: str) -> str:
     workspace_path = str(workspace.resolve())
-    return f"""# AGENTS.expcap.md
+    return f"""# {EXPCAP_SIDECAR}
 
 本文件由 `expcap install-project` 生成，用于把经验资本化工作流非破坏式接入当前项目。
 
 ## 目标
 
 - 不替换原有 `AGENTS.md`
+- 不替换项目级稳定规则层 `{PROJECT_PROMPT_SOURCE}`
 - 只为当前项目补充经验 `get/save` 规则
 - 让 Codex 在这个项目中默认通过 `expcap` skill 执行经验 `get/save`
 - 默认把运行数据写入 `EXPCAP_HOME` 集中数据中心，而不是项目目录
@@ -36,6 +81,12 @@ def _sidecar_content(workspace: Path, *, project_status: str) -> str:
 ## 核心定位
 
 `expcap` 不和 Codex / Claude Code 的个人记忆竞争。它专注于项目级、团队级、公司级的工程经验资产：可共享、可审阅、可交割，不绑定某一个人的模型账号。
+
+## 与项目级提示词的关系
+
+- `{PROJECT_PROMPT_SOURCE}` 是稳定项目规则层
+- `{EXPCAP_SIDECAR}` 是动态经验集成层
+- 先让 `expcap` 发现和验证经验，再把反复证明有效的规则晋升到 `{PROJECT_PROMPT_SOURCE}`
 
 ## 默认行为
 
@@ -105,13 +156,26 @@ def _managed_block(sidecar_name: str = "AGENTS.expcap.md") -> str:
     return f"""{EXPCAP_BLOCK_START}
 ## Expcap Integration
 
-- 本项目额外启用经验资本化工作流，详细规则见 `{sidecar_name}`
+- 本项目采用双层 agent 规则结构：稳定项目规则见 `{PROJECT_PROMPT_SOURCE}`，动态经验集成见 `{sidecar_name}`
 - 不替换本项目原有 agent 约束，只补充经验 `get/save` 行为
 - 只要进入新 chat，就优先执行集中存储模式的 `expcap auto-start`
 - 任务收敛后优先执行集中存储模式的 `expcap auto-finish`
 - 高置信经验再继续 `promote`
+- 被反复证明有效的稳定经验，应优先人工收敛到 `{PROJECT_PROMPT_SOURCE}`
 
 {EXPCAP_BLOCK_END}"""
+
+
+def _ensure_project_prompt_source(workspace: Path) -> tuple[Path, bool, bool]:
+    source_path = workspace / PROJECT_PROMPT_SOURCE
+    legacy_path = workspace / LEGACY_PROJECT_AGENT_SIDECAR
+    if source_path.exists():
+        return source_path, False, False
+    if legacy_path.exists():
+        source_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
+        return source_path, True, True
+    source_path.write_text(_project_prompt_source_content(), encoding="utf-8")
+    return source_path, True, True
 
 
 def normalize_integration_mode(
@@ -536,7 +600,8 @@ def install_project_agents(
         integration_mode=integration_mode,
         include_claude=include_claude,
     )
-    sidecar_path = workspace / "AGENTS.expcap.md"
+    project_prompt_path, created_project_prompt, updated_project_prompt = _ensure_project_prompt_source(workspace)
+    sidecar_path = workspace / EXPCAP_SIDECAR
     policy_path = write_project_policy(
         workspace,
         project_status=project_status,
@@ -549,8 +614,8 @@ def install_project_agents(
     created_agents, updated_agents = _upsert_managed_block(
         agents_path,
         title="AGENTS.md",
-        intro="本项目启用了 `expcap` 经验资本化工作流，详细规则见 `AGENTS.expcap.md`。",
-        sidecar_name="AGENTS.expcap.md",
+        intro=f"本项目采用项目级 agent 双层结构：稳定规则见 `{PROJECT_PROMPT_SOURCE}`，动态经验工作流见 `{EXPCAP_SIDECAR}`。",
+        sidecar_name=EXPCAP_SIDECAR,
     )
 
     claude_path = workspace / "CLAUDE.md"
@@ -590,8 +655,8 @@ def install_project_agents(
         created_claude, updated_claude = _upsert_managed_block(
             claude_path,
             title="CLAUDE.md",
-            intro="本项目启用了 `expcap` 经验资本化工作流，详细规则见 `AGENTS.expcap.md`。",
-            sidecar_name="AGENTS.expcap.md",
+            intro=f"本项目采用项目级 agent 双层结构：稳定规则见 `{PROJECT_PROMPT_SOURCE}`，动态经验工作流见 `{EXPCAP_SIDECAR}`。",
+            sidecar_name=EXPCAP_SIDECAR,
         )
         claude_hook_result = _ensure_claude_hook_files(workspace)
 
@@ -599,11 +664,17 @@ def install_project_agents(
         "workspace": str(workspace),
         "integration_mode": normalized_mode,
         "agents_path": str(agents_path),
+        "project_prompt_path": str(project_prompt_path),
+        "project_agent_path": str(project_prompt_path),
         "sidecar_path": str(sidecar_path),
         "policy_path": str(policy_path),
         "project_status": project_status,
         "gitignore_path": str(gitignore_path),
         "claude_path": str(claude_path) if normalized_mode == INTEGRATION_MODE_CLAUDE_HOOKS else "",
+        "created_project_prompt": created_project_prompt,
+        "updated_project_prompt": updated_project_prompt,
+        "created_project_agent": created_project_prompt,
+        "updated_project_agent": updated_project_prompt,
         "created_agents": created_agents,
         "updated_agents": updated_agents,
         "created_gitignore": created_gitignore,

@@ -5,6 +5,7 @@
 ## 目标
 
 - 不替换原有 `AGENTS.md`
+- 不替换项目级稳定规则层 `PROJECT_PROMPT.md`
 - 只为当前项目补充经验 `get/save` 规则
 - 让 Codex 在这个项目中默认通过 `expcap` skill 执行经验 `get/save`
 - 默认把运行数据写入 `EXPCAP_HOME` 集中数据中心，而不是项目目录
@@ -12,6 +13,12 @@
 ## 核心定位
 
 `expcap` 不和 Codex / Claude Code 的个人记忆竞争。它专注于项目级、团队级、公司级的工程经验资产：可共享、可审阅、可交割，不绑定某一个人的模型账号。
+
+## 与项目级提示词的关系
+
+- `PROJECT_PROMPT.md` 是稳定项目规则层
+- `AGENTS.expcap.md` 是动态经验集成层
+- 先让 `expcap` 发现和验证经验，再把反复证明有效的规则晋升到 `PROJECT_PROMPT.md`
 
 ## 默认行为
 

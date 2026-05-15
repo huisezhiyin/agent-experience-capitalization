@@ -71,6 +71,615 @@ def _write_candidate(
 
 
 class CliFlowTests(unittest.TestCase):
+    def test_cli_project_prompt_status_reports_source_and_bridge_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "PROJECT_PROMPT.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_PROMPT.md",
+                        "",
+                        "<!-- EXPCAP PROJECT PROMOTED START -->",
+                        "## Promoted Stable Rules",
+                        "",
+                        "下列规则来自已被证明稳定有效的 expcap 资产；这里是项目级 prompt 真源中的受管区块。",
+                        "",
+                        "### `constraint_001`",
+                        "- Title: 保持公共 API 稳定",
+                        "- Kind: `constraint`",
+                        "- Source: `expcap_asset`",
+                        "",
+                        "不要在当前阶段改 public API。",
+                        "",
+                        "<!-- EXPCAP PROJECT PROMOTED END -->",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (workspace / "AGENTS.md").write_text(
+                "# AGENTS.md\n\nSee PROJECT_PROMPT.md and AGENTS.expcap.md.\n",
+                encoding="utf-8",
+            )
+            (workspace / "CLAUDE.md").write_text(
+                "# CLAUDE.md\n\nBridge to PROJECT_PROMPT.md and AGENTS.expcap.md.\n",
+                encoding="utf-8",
+            )
+            (workspace / "AGENTS.expcap.md").write_text("# AGENTS.expcap.md\n", encoding="utf-8")
+
+            args = argparse.Namespace(workspace=str(workspace), output=None)
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_project_prompt_status(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["project_prompt_status"]
+            assert isinstance(payload, dict)
+            self.assertEqual(payload["prompt_source"]["managed_entry_count"], 1)
+            self.assertEqual(payload["prompt_source"]["managed_asset_ids"], ["constraint_001"])
+            self.assertEqual(payload["prompt_source"]["archived_entry_count"], 0)
+            self.assertTrue(payload["bridge_files"]["agents_md"]["references_prompt_source"])
+            self.assertTrue(payload["bridge_files"]["claude_md"]["references_prompt_source"])
+            self.assertTrue(payload["bridge_files"]["expcap_sidecar"]["exists"])
+
+    def test_cli_project_prompt_suggest_returns_only_unapplied_prompt_worthy_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "PROJECT_PROMPT.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_PROMPT.md",
+                        "",
+                        "<!-- EXPCAP PROJECT PROMOTED START -->",
+                        "## Promoted Stable Rules",
+                        "",
+                        "下列规则来自已被证明稳定有效的 expcap 资产；这里是项目级 prompt 真源中的受管区块。",
+                        "",
+                        "### `constraint_existing`",
+                        "- Title: 已经晋升过的规则",
+                        "- Kind: `constraint`",
+                        "- Source: `expcap_asset`",
+                        "",
+                        "已存在于项目级 prompt 中。",
+                        "",
+                        "<!-- EXPCAP PROJECT PROMOTED END -->",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "constraint_existing",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "constraint",
+                    "title": "已经晋升过的规则",
+                    "content": "已存在于项目级 prompt 中。",
+                    "confidence": 0.92,
+                    "status": "active",
+                    "review_status": "healthy",
+                    "temperature": "warm",
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                    "updated_at": "2026-05-14T00:00:00+00:00",
+                },
+            )
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "constraint_candidate",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "constraint",
+                    "title": "保持公共 API 稳定",
+                    "content": "不要在当前阶段改 public API。",
+                    "confidence": 0.95,
+                    "status": "active",
+                    "review_status": "healthy",
+                    "temperature": "warm",
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                    "updated_at": "2026-05-14T00:00:00+00:00",
+                },
+            )
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_runtime_only",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "运行时经验，不该进项目级 prompt",
+                    "content": "这条经验更适合作为运行时召回，而不是稳定项目提示词。",
+                    "confidence": 0.98,
+                    "status": "active",
+                    "review_status": "healthy",
+                    "temperature": "warm",
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                    "updated_at": "2026-05-14T00:00:00+00:00",
+                },
+            )
+
+            args = argparse.Namespace(workspace=str(workspace), limit=5, output=None)
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_project_prompt_suggest(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["project_prompt_suggestions"]
+            assert isinstance(payload, dict)
+            self.assertEqual(payload["suggestion_count"], 1)
+            self.assertEqual(payload["suggestions"][0]["asset_id"], "constraint_candidate")
+
+    def test_cli_project_prompt_apply_writes_managed_entries_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "constraint_apply_001",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "constraint",
+                    "title": "保持公共 API 稳定",
+                    "content": "不要在当前阶段改 public API。",
+                    "confidence": 0.95,
+                    "status": "active",
+                    "review_status": "healthy",
+                    "temperature": "warm",
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                    "updated_at": "2026-05-14T00:00:00+00:00",
+                },
+            )
+
+            first_args = argparse.Namespace(workspace=str(workspace), asset_ids=["constraint_apply_001"], output=None)
+            first_captured: dict[str, object] = {}
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: first_captured.update(payload)):
+                first_result = cli_main._handle_project_prompt_apply(first_args)
+
+            self.assertEqual(first_result, 0)
+            first_payload = first_captured["project_prompt_apply"]
+            assert isinstance(first_payload, dict)
+            self.assertTrue(first_payload["updated"])
+            self.assertEqual(first_payload["applied_asset_ids"], ["constraint_apply_001"])
+
+            project_prompt_text = (workspace / "PROJECT_PROMPT.md").read_text(encoding="utf-8")
+            self.assertIn("constraint_apply_001", project_prompt_text)
+            self.assertIn("不要在当前阶段改 public API。", project_prompt_text)
+
+            second_args = argparse.Namespace(workspace=str(workspace), asset_ids=["constraint_apply_001"], output=None)
+            second_captured: dict[str, object] = {}
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: second_captured.update(payload)):
+                second_result = cli_main._handle_project_prompt_apply(second_args)
+
+            self.assertEqual(second_result, 0)
+            second_payload = second_captured["project_prompt_apply"]
+            assert isinstance(second_payload, dict)
+            self.assertFalse(second_payload["updated"])
+            self.assertEqual(second_payload["managed_entry_count"], 1)
+            self.assertFalse(second_payload["sync_after"]["triggered"])
+
+    def test_cli_project_prompt_apply_can_sync_after_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "constraint_apply_sync_001",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "constraint",
+                    "title": "保持公共 API 稳定",
+                    "content": "不要在当前阶段改 public API。",
+                    "confidence": 0.95,
+                    "status": "active",
+                    "review_status": "healthy",
+                    "temperature": "warm",
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                    "updated_at": "2026-05-14T00:00:00+00:00",
+                },
+            )
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                asset_ids=["constraint_apply_sync_001"],
+                sync_after=True,
+                output=None,
+            )
+            captured: dict[str, object] = {}
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_project_prompt_apply(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["project_prompt_apply"]
+            assert isinstance(payload, dict)
+            self.assertTrue(payload["updated"])
+            self.assertTrue(payload["sync_after"]["requested"])
+            self.assertTrue(payload["sync_after"]["triggered"])
+            sync_payload = payload["sync_after"]["sync"]
+            assert isinstance(sync_payload, dict)
+            self.assertEqual(sync_payload["integration_mode"], "docs-only")
+            self.assertTrue((workspace / "AGENTS.md").exists())
+
+    def test_cli_project_prompt_archive_moves_entries_into_archive_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "PROJECT_PROMPT.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_PROMPT.md",
+                        "",
+                        "<!-- EXPCAP PROJECT PROMOTED START -->",
+                        "## Promoted Stable Rules",
+                        "",
+                        "下列规则来自已被证明稳定有效的 expcap 资产；这里是项目级 prompt 真源中的受管区块。",
+                        "",
+                        "### `constraint_keep`",
+                        "- Title: 保持 API 稳定",
+                        "- Kind: `constraint`",
+                        "- Source: `expcap_asset`",
+                        "",
+                        "不要改 public API。",
+                        "",
+                        "### `dont_repeat_archive`",
+                        "- Title: 不要重复解释定位",
+                        "- Kind: `dont_repeat`",
+                        "- Source: `expcap_asset`",
+                        "",
+                        "不要重复解释 expcap 的定位。",
+                        "",
+                        "<!-- EXPCAP PROJECT PROMOTED END -->",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                asset_ids=["dont_repeat_archive"],
+                reason="rule_no_longer_needs_session_level_enforcement",
+                output=None,
+            )
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_project_prompt_archive(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["project_prompt_archive"]
+            assert isinstance(payload, dict)
+            self.assertTrue(payload["updated"])
+            self.assertEqual(payload["archived_asset_ids"], ["dont_repeat_archive"])
+            self.assertEqual(payload["managed_entry_count"], 1)
+            self.assertEqual(payload["archived_entry_count"], 1)
+            self.assertFalse(payload["sync_after"]["triggered"])
+
+            prompt_text = (workspace / "PROJECT_PROMPT.md").read_text(encoding="utf-8")
+            self.assertIn("constraint_keep", prompt_text)
+            self.assertIn("Archived Stable Rules", prompt_text)
+            self.assertIn("dont_repeat_archive", prompt_text)
+            self.assertIn("Archive Reason: `rule_no_longer_needs_session_level_enforcement`", prompt_text)
+
+            status_args = argparse.Namespace(workspace=str(workspace), output=None)
+            status_captured: dict[str, object] = {}
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: status_captured.update(payload)):
+                status_result = cli_main._handle_project_prompt_status(status_args)
+
+            self.assertEqual(status_result, 0)
+            status_payload = status_captured["project_prompt_status"]
+            assert isinstance(status_payload, dict)
+            self.assertEqual(status_payload["prompt_source"]["managed_entry_count"], 1)
+            self.assertEqual(status_payload["prompt_source"]["archived_entry_count"], 1)
+
+    def test_cli_project_prompt_archive_missing_asset_keeps_file_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            project_prompt_path = workspace / "PROJECT_PROMPT.md"
+            project_prompt_path.write_text(
+                "# PROJECT_PROMPT.md\n\n只包含静态项目规则。\n",
+                encoding="utf-8",
+            )
+            before = project_prompt_path.read_text(encoding="utf-8")
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                asset_ids=["missing_rule_001"],
+                reason="rule_not_present",
+                output=None,
+            )
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_project_prompt_archive(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["project_prompt_archive"]
+            assert isinstance(payload, dict)
+            self.assertFalse(payload["updated"])
+            self.assertEqual(payload["archived_asset_ids"], [])
+            self.assertEqual(payload["missing_asset_ids"], ["missing_rule_001"])
+            self.assertEqual(project_prompt_path.read_text(encoding="utf-8"), before)
+            self.assertFalse(payload["sync_after"]["triggered"])
+
+    def test_cli_project_prompt_archive_can_sync_after_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "PROJECT_PROMPT.md").write_text(
+                "\n".join(
+                    [
+                        "# PROJECT_PROMPT.md",
+                        "",
+                        "<!-- EXPCAP PROJECT PROMOTED START -->",
+                        "## Promoted Stable Rules",
+                        "",
+                        "下列规则来自已被证明稳定有效的 expcap 资产；这里是项目级 prompt 真源中的受管区块。",
+                        "",
+                        "### `dont_repeat_archive_sync`",
+                        "- Title: 不要重复解释定位",
+                        "- Kind: `dont_repeat`",
+                        "- Source: `expcap_asset`",
+                        "",
+                        "不要重复解释 expcap 的定位。",
+                        "",
+                        "<!-- EXPCAP PROJECT PROMOTED END -->",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                asset_ids=["dont_repeat_archive_sync"],
+                reason="promoted_rule_retired",
+                sync_after=True,
+                output=None,
+            )
+            captured: dict[str, object] = {}
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_project_prompt_archive(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["project_prompt_archive"]
+            assert isinstance(payload, dict)
+            self.assertTrue(payload["updated"])
+            self.assertTrue(payload["sync_after"]["requested"])
+            self.assertTrue(payload["sync_after"]["triggered"])
+            sync_payload = payload["sync_after"]["sync"]
+            assert isinstance(sync_payload, dict)
+            self.assertEqual(sync_payload["integration_mode"], "docs-only")
+            self.assertTrue((workspace / "AGENTS.md").exists())
+
+    def test_cli_project_prompt_sync_uses_policy_mode_and_refreshes_bridge_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "PROJECT_PROMPT.md").write_text(
+                "# PROJECT_PROMPT.md\n\n稳定规则真源。\n",
+                encoding="utf-8",
+            )
+            (workspace / ".expcap-project.json").write_text(
+                json.dumps(
+                    {
+                        "project_status": "active",
+                        "integration_mode": "claude-hooks",
+                        "auto_start_mode": "always_on_new_chat",
+                        "updated_at": "2026-05-14T00:00:00+00:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (workspace / "AGENTS.md").write_text("# AGENTS.md\n\n原有说明。\n", encoding="utf-8")
+            (workspace / "CLAUDE.md").write_text("# CLAUDE.md\n\n原有 Claude 说明。\n", encoding="utf-8")
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                integration_mode=None,
+                project_status=None,
+                output=None,
+            )
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_project_prompt_sync(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["project_prompt_sync"]
+            assert isinstance(payload, dict)
+            self.assertEqual(payload["integration_mode"], "claude-hooks")
+            self.assertEqual(payload["mode_source"], "file")
+            self.assertTrue(payload["bridge_files"]["agents_md"]["updated"])
+            self.assertTrue(payload["bridge_files"]["claude_md"]["configured"])
+            self.assertTrue(Path(payload["hook_artifacts"]["claude"]["settings_path"]).exists())
+
+            agents_text = (workspace / "AGENTS.md").read_text(encoding="utf-8")
+            claude_text = (workspace / "CLAUDE.md").read_text(encoding="utf-8")
+            self.assertIn("PROJECT_PROMPT.md", agents_text)
+            self.assertIn("AGENTS.expcap.md", agents_text)
+            self.assertIn("PROJECT_PROMPT.md", claude_text)
+            self.assertIn("AGENTS.expcap.md", claude_text)
+
+    def test_cli_prove_next_writes_feedback_only_on_exact_target_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / "pattern_target_001.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_target_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "修复 auto-finish 在 user-cache 不可写时的 asset feedback",
+                        "content": "修复 auto-finish 在 user-cache 不可写时的 asset feedback fallback，并重新验证 save get log 闭环。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.88,
+                        "status": "active",
+                        "created_at": "2026-05-12T02:11:26+00:00",
+                        "updated_at": "2026-05-12T02:11:26+00:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(db_path, json.loads(asset_path.read_text(encoding="utf-8")))
+
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs):
+                return {
+                    "activation_id": "act_prove_next_hit",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [
+                        {
+                            "asset_id": "pattern_target_001",
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                        }
+                    ],
+                    "selected_asset_ids": ["pattern_target_001"],
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=1,
+                help_signal="supported_strong",
+                dry_run=False,
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_prove_next(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["prove_next"]
+            assert isinstance(payload, dict)
+            self.assertEqual(payload["processed_count"], 1)
+            self.assertEqual(payload["target_hit_count"], 1)
+            self.assertEqual(payload["proved_count"], 1)
+            self.assertEqual(payload["items"][0]["status"], "proved")
+            self.assertEqual(payload["items"][0]["help_signal_written"], "supported_strong")
+
+            updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_asset["review_status"], "healthy")
+            self.assertEqual(updated_asset["temperature"], "warm")
+            self.assertEqual(updated_asset["historical_help"]["supported_strong_count"], 1)
+
+    def test_cli_prove_next_skips_feedback_when_target_asset_is_not_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / "pattern_target_002.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            original_asset = {
+                "asset_id": "pattern_target_002",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "回顾 expcap 核心目标完成度",
+                "content": "回顾 expcap 当前 save get activate feedback review prove 闭环的完成度。",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.86,
+                "status": "active",
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            asset_path.write_text(json.dumps(original_asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(db_path, original_asset)
+
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs):
+                return {
+                    "activation_id": "act_prove_next_miss",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [
+                        {
+                            "asset_id": "pattern_other_999",
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                        }
+                    ],
+                    "selected_asset_ids": ["pattern_other_999"],
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=1,
+                help_signal="supported_strong",
+                dry_run=False,
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_prove_next(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["prove_next"]
+            assert isinstance(payload, dict)
+            self.assertEqual(payload["target_hit_count"], 0)
+            self.assertEqual(payload["proved_count"], 0)
+            self.assertEqual(payload["items"][0]["status"], "missed")
+            self.assertIsNone(payload["items"][0]["help_signal_written"])
+
+            updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_asset, original_asset)
+
     def test_filesystem_status_records_merge_primary_and_fallback_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
             os.environ,
@@ -1682,6 +2291,10 @@ class CliFlowTests(unittest.TestCase):
                     "primary_state_index_path": "/readonly/root/index.sqlite3",
                     "active_state_index_path": "/tmp/expcap-runtime/index.sqlite3",
                     "fallback_state_index_in_use": True,
+                    "primary_write_health": {
+                        "status": "fallback_only",
+                        "failed_target_count": 7,
+                    },
                 },
                 "retrieval_backends": {
                     "sqlite": {
@@ -1710,6 +2323,37 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("/tmp/expcap-runtime/index.sqlite3", html)
         self.assertIn("Fallback writes succeeded", html)
         self.assertIn("Permission-induced", html)
+        self.assertIn("Primary write health", html)
+        self.assertIn("fallback_only", html)
+
+    def test_build_primary_write_health_reports_primary_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            health = cli_main._build_primary_write_health(workspace)
+            self.assertEqual(health["status"], "primary_writable")
+            self.assertTrue(health["all_writable"])
+            self.assertEqual(health["failed_target_count"], 0)
+
+    def test_build_primary_write_health_reports_fallback_only_when_all_probes_fail(self) -> None:
+        workspace = Path("/tmp/demo-workspace")
+        with patch.object(
+            cli_main,
+            "_probe_parent_dir_writable",
+            return_value=(False, "operation not permitted", "/tmp"),
+        ), patch.object(
+            cli_main,
+            "_probe_state_index_writable",
+            return_value=(False, "attempt to write a readonly database", "/tmp/index.sqlite3"),
+        ):
+            health = cli_main._build_primary_write_health(workspace)
+
+        self.assertEqual(health["status"], "fallback_only")
+        self.assertTrue(health["permission_induced"])
+        self.assertEqual(health["failed_target_count"], 7)
 
     def test_cli_dashboard_falls_back_when_default_json_sidecar_is_unwritable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1972,6 +2616,7 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(status["retrieval_backends"]["sqlite"]["source_mode"], "fallback_sqlite")
             self.assertTrue(status["backend_runtime"]["fallback_state_index_in_use"])
             self.assertEqual(status["backend_runtime"]["state_index_mode"], "fallback_sqlite")
+            self.assertEqual(status["primary_write_health"]["status"], "primary_writable")
             self.assertEqual(status["counts"]["activation_logs"], 1)
 
     def test_cli_status_surfaces_milvus_probe_fallback_warning(self) -> None:
@@ -2073,6 +2718,43 @@ class CliFlowTests(unittest.TestCase):
             assert isinstance(doctor, dict)
             sqlite_check = next(item for item in doctor["checks"] if item["name"] == "sqlite_index")
             self.assertIn("fallback SQLite is serving state", sqlite_check["summary"])
+
+    def test_cli_doctor_warns_when_primary_write_path_is_fallback_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.object(
+                cli_main,
+                "_build_primary_write_health",
+                return_value={
+                    "status": "fallback_only",
+                    "all_writable": False,
+                    "failed_target_count": 7,
+                    "permission_induced": True,
+                    "checked_targets": [],
+                    "failed_targets": [
+                        {"target": "views", "error": "operation not permitted"},
+                        {"target": "reviews", "error": "operation not permitted"},
+                    ],
+                },
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_doctor(args)
+
+            self.assertEqual(result, 0)
+            doctor = captured["doctor"]
+            assert isinstance(doctor, dict)
+            write_check = next(item for item in doctor["checks"] if item["name"] == "primary_write_path")
+            self.assertEqual(write_check["status"], "warn")
+            self.assertIn("fallback paths", write_check["summary"])
+            self.assertIn("restore writable access", write_check["recommendation"])
 
     def test_cli_doctor_describes_permission_induced_milvus_probe_degradation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

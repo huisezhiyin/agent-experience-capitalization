@@ -2210,6 +2210,43 @@ def _build_primary_write_health(workspace: Path) -> dict[str, Any]:
     }
 
 
+def _build_persistence_summary(
+    *,
+    primary_write_health: dict[str, Any],
+    sqlite_backend: dict[str, Any],
+) -> dict[str, Any]:
+    primary_status = str(primary_write_health.get("status") or "unknown")
+    sqlite_source_mode = str(sqlite_backend.get("source_mode") or "unknown")
+    sqlite_available = bool(sqlite_backend.get("available"))
+    if primary_status == "primary_writable":
+        closure_status = "closed_loop"
+        ratio = 1.0
+        summary = "Read/write paths are healthy; save/get/log is closed-loop on the primary path."
+    elif primary_status == "fallback_only":
+        closure_status = "degraded_success"
+        ratio = 0.68
+        summary = (
+            "Read-side remains available, but the primary write path is blocked; fallback persistence is active, so this is degraded-success rather than a primary closed-loop run."
+        )
+    elif primary_status == "partial_primary_write":
+        closure_status = "partial_closure"
+        ratio = 0.5
+        summary = "Some primary write targets are blocked; save/get/log is only partially closed on the primary path."
+    else:
+        closure_status = "unknown"
+        ratio = 0.3
+        summary = "Persistence health could not be determined from the current runtime signals."
+    return {
+        "closure_status": closure_status,
+        "primary_write_status": primary_status,
+        "sqlite_source_mode": sqlite_source_mode,
+        "sqlite_available": sqlite_available,
+        "permission_induced": bool(primary_write_health.get("permission_induced")),
+        "summary": summary,
+        "ratio": ratio,
+    }
+
+
 def _upsert_warning(*, kind: str, path: Path, error: BaseException) -> dict[str, str]:
     warning = {
         "kind": kind,
@@ -4661,6 +4698,10 @@ def _build_status_payload(
     fallback_runtime_present = fallback_root.exists() and fallback_root != memory_root
     runtime_degradation_summary = _build_runtime_degradation_summary(runtime_warnings)
     primary_write_health = _build_primary_write_health(workspace)
+    persistence_summary = _build_persistence_summary(
+        primary_write_health=primary_write_health,
+        sqlite_backend=sqlite_backend,
+    )
     backend_runtime = {
         "memory_root_mode": "fallback_active" if fallback_runtime_present else "primary_only",
         "primary_memory_root": str(memory_root),
@@ -4703,6 +4744,7 @@ def _build_status_payload(
         "backend_runtime": backend_runtime,
         "runtime_degradation_summary": runtime_degradation_summary,
         "primary_write_health": primary_write_health,
+        "persistence_summary": persistence_summary,
         "feedback_cleanup": feedback_cleanup
         or {
             "auto_resolved_count": 0,
@@ -5330,6 +5372,7 @@ def _build_dashboard_payload(
         float(status_payload["milvus_retrieval_effectiveness"]["activation_selected_ratio"] or 0.0)
     )
     write_activity_ratio = _clamp_ratio(recent_writes / max(bounded_days, 1) / 5.0)
+    persistence_summary = status_payload.get("persistence_summary") or {}
     overall_score = round(
         (
             asset_quality_ratio * 0.30
@@ -5376,6 +5419,7 @@ def _build_dashboard_payload(
             "help_rate": round(help_rate, 4),
             "milvus_contribution_ratio": round(milvus_contribution_ratio, 4),
             "write_activity_ratio": round(write_activity_ratio, 4),
+            "persistence_summary": persistence_summary,
             "recent_writes": recent_writes,
             "days": bounded_days,
             "signals": [
@@ -5398,6 +5442,11 @@ def _build_dashboard_payload(
                     "label": "Write activity",
                     "ratio": round(write_activity_ratio, 4),
                     "value": f"{recent_writes} writes / {bounded_days}d",
+                },
+                {
+                    "label": "Persistence",
+                    "ratio": round(float(persistence_summary.get("ratio", 0.0) or 0.0), 4),
+                    "value": str(persistence_summary.get("closure_status") or "unknown"),
                 },
             ],
         },
@@ -5508,6 +5557,7 @@ def _render_runtime_warnings(payload: dict[str, Any]) -> str:
 def _render_effectiveness_snapshot(payload: dict[str, Any]) -> str:
     snapshot = payload["effectiveness_snapshot"]
     signals = snapshot["signals"]
+    persistence_summary = snapshot.get("persistence_summary") or {}
     score = int(snapshot["overall_score"])
     gauge_width = max(0, min(score, 100)) * 3.6
     signal_rows = []
@@ -5544,6 +5594,8 @@ def _render_effectiveness_snapshot(payload: dict[str, Any]) -> str:
         <text x="32" y="204" class="snapshot-note">One-glance read: quality, actual help, Milvus contribution, and write activity.</text>
         {''.join(signal_rows)}
       </svg>
+      <div class="metric-line"><span>Persistence</span><strong>{_safe_text(persistence_summary.get("closure_status") or "unknown")}</strong></div>
+      <div class="metric-line"><span>Persistence Summary</span><strong>{_safe_text(persistence_summary.get("summary") or "n/a")}</strong></div>
     </section>
     """
 

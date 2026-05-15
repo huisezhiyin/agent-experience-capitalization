@@ -2249,11 +2249,16 @@ class CliFlowTests(unittest.TestCase):
             "effectiveness_snapshot": {
                 "overall_score": 50,
                 "verdict": "watch",
+                "persistence_summary": {
+                    "closure_status": "degraded_success",
+                    "summary": "Read-side remains available, but the primary write path is blocked; fallback persistence is active, so this is degraded-success rather than a primary closed-loop run.",
+                },
                 "signals": [
                     {"label": "Asset quality", "ratio": 0.0, "value": "0/0 healthy"},
                     {"label": "Activation help", "ratio": 0.0, "value": "0/1 helpful"},
                     {"label": "Milvus contribution", "ratio": 0.0, "value": "0% activations"},
                     {"label": "Write activity", "ratio": 0.0, "value": "0 writes / 14d"},
+                    {"label": "Persistence", "ratio": 0.68, "value": "degraded_success"},
                 ],
             },
             "write_frequency": [],
@@ -2325,6 +2330,23 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("Permission-induced", html)
         self.assertIn("Primary write health", html)
         self.assertIn("fallback_only", html)
+        self.assertIn("degraded_success", html)
+
+    def test_build_persistence_summary_reports_degraded_success_for_fallback_only(self) -> None:
+        summary = cli_main._build_persistence_summary(
+            primary_write_health={
+                "status": "fallback_only",
+                "permission_induced": True,
+            },
+            sqlite_backend={
+                "source_mode": "primary_sqlite",
+                "available": True,
+            },
+        )
+
+        self.assertEqual(summary["closure_status"], "degraded_success")
+        self.assertEqual(summary["primary_write_status"], "fallback_only")
+        self.assertIn("degraded-success", summary["summary"])
 
     def test_build_primary_write_health_reports_primary_writable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(

@@ -63,6 +63,86 @@ def _infer_scope(task_text: str) -> dict[str, str]:
     return {"level": "workspace", "value": "general-coding-task"}
 
 
+def _infer_task_type(task_text: str) -> str:
+    lower = task_text.lower()
+    if any(token in lower for token in ("readme", "docs", "document", "文档")):
+        return "docs"
+    if any(token in lower for token in ("review", "审阅", "复盘")):
+        return "review"
+    if any(token in lower for token in ("refactor", "重构")):
+        return "refactor"
+    if any(token in lower for token in ("fix", "bug", "error", "修复", "报错")):
+        return "bugfix"
+    if any(token in lower for token in ("test", "pytest", "测试")):
+        return "test"
+    return "implementation"
+
+
+def _infer_language(task_text: str, files_touched: list[str], commands: list[str]) -> str | None:
+    joined = " ".join([task_text, *files_touched, *commands]).lower()
+    if ".py" in joined or "pytest" in joined or "python" in joined:
+        return "python"
+    if any(token in joined for token in (".ts", ".tsx", ".js", ".jsx", "node", "npm", "pnpm")):
+        return "javascript"
+    if ".java" in joined or "mvn" in joined or "gradle" in joined:
+        return "java"
+    return None
+
+
+def _infer_framework(task_text: str, commands: list[str]) -> str | None:
+    joined = " ".join([task_text, *commands]).lower()
+    if "pytest" in joined:
+        return "pytest"
+    if any(token in joined for token in ("react", "next.js", "nextjs", "tsx")):
+        return "react"
+    if "django" in joined:
+        return "django"
+    if "flask" in joined:
+        return "flask"
+    return None
+
+
+def _infer_module(files_touched: list[str], task_text: str) -> str | None:
+    if files_touched:
+        first = str(files_touched[0]).strip().lstrip("./")
+        if "/" in first:
+            parts = [part for part in first.split("/") if part]
+            if len(parts) >= 2:
+                return "/".join(parts[:2])
+        return first or None
+    lower = task_text.lower()
+    if "runtime/" in lower:
+        return "runtime"
+    if "docs/" in lower or "readme" in lower or "文档" in lower:
+        return "docs"
+    if "tests/" in lower or "pytest" in lower:
+        return "tests"
+    return None
+
+
+def _infer_scope_profile(
+    *,
+    task_text: str,
+    files_touched: list[str] | None = None,
+    commands: list[str] | None = None,
+) -> dict[str, Any]:
+    files = files_touched or []
+    command_list = commands or []
+    module = _infer_module(files, task_text)
+    language = _infer_language(task_text, files, command_list)
+    framework = _infer_framework(task_text, command_list)
+    return {
+        "task_type": _infer_task_type(task_text),
+        "module": module,
+        "language": language,
+        "framework": framework,
+        "applicable_conditions": _unique_preserve_order(
+            [item for item in [language, framework, module] if item]
+        ),
+        "known_counterexamples": [],
+    }
+
+
 def _compact_text(value: str, limit: int = 96) -> str:
     cleaned = " ".join(value.split())
     return cleaned if len(cleaned) <= limit else cleaned[: limit - 1].rstrip() + "…"
@@ -168,8 +248,14 @@ def review_trace_bundle(trace: dict[str, Any]) -> dict[str, Any]:
     verification = trace.get("verification", {})
     trace_id = trace.get("trace_id", f"trace-{_slugify(goal)}")
     episode_id = trace_id.replace("trace_", "ep_") if trace_id.startswith("trace_") else f"ep_{_slugify(goal)}"
+    files_touched = trace.get("files_changed", [])
 
     scope = _infer_scope(goal)
+    scope_profile = _infer_scope_profile(
+        task_text=goal,
+        files_touched=files_touched,
+        commands=commands,
+    )
     turning_points = _build_turning_points(
         errors=errors,
         commands=commands,
@@ -183,7 +269,7 @@ def review_trace_bundle(trace: dict[str, Any]) -> dict[str, Any]:
         "goal": goal,
         "constraints": trace.get("constraints", []),
         "workspace": trace.get("workspace"),
-        "files_touched": trace.get("files_changed", []),
+        "files_touched": files_touched,
         "commands": commands,
         "turning_points": turning_points,
         "attempted_paths": _build_attempted_paths(commands, errors),
@@ -198,6 +284,7 @@ def review_trace_bundle(trace: dict[str, Any]) -> dict[str, Any]:
         "user_feedback": "accepted" if result.get("status") == "success" else "unknown",
         "lesson": lesson,
         "scope_hint": scope["value"],
+        "scope_profile": scope_profile,
         "confidence_hint": 0.8 if verification.get("status") == "passed" else 0.55,
         "created_at": _now_utc(),
     }
@@ -227,6 +314,30 @@ def _candidate_content(episode: dict[str, Any], knowledge_kind: str, lesson: str
     if knowledge_kind == EMOTIONAL_FEEDBACK:
         return sanitize_emotional_feedback_content(lesson)
     return lesson
+
+
+def _default_governance_metadata(
+    *,
+    knowledge_scope: str,
+    owner: str,
+    created_at: str,
+    review_status: str = "unproven",
+    temperature: str = "neutral",
+    quarantine_status: str = "active",
+    version: str = "1",
+) -> dict[str, Any]:
+    return {
+        "knowledge_scope": knowledge_scope,
+        "owner": owner,
+        "review_status": review_status,
+        "temperature": temperature,
+        "quarantine_status": quarantine_status,
+        "version": version,
+        "validity_window": {
+            "starts_at": created_at,
+            "ends_at": None,
+        },
+    }
 
 
 def build_asset_effectiveness_summary(historical_help: dict[str, Any]) -> dict[str, Any]:
@@ -284,6 +395,23 @@ def apply_asset_effectiveness(
     updated["effectiveness_summary"] = summary
     updated["temperature"] = summary["temperature"]
     updated["review_status"] = summary["review_status"]
+    governance = dict(updated.get("governance", {}))
+    governance["temperature"] = summary["temperature"]
+    governance["review_status"] = summary["review_status"]
+    governance.setdefault("quarantine_status", updated.get("quarantine_status", "active"))
+    governance.setdefault("owner", updated.get("owner") or updated.get("delivery", {}).get("owner") or "project")
+    governance.setdefault("knowledge_scope", updated.get("knowledge_scope", "project"))
+    governance.setdefault("version", str(updated.get("version") or "1"))
+    validity_window = governance.get("validity_window")
+    if not isinstance(validity_window, dict):
+        validity_window = {}
+    validity_window.setdefault("starts_at", updated.get("created_at"))
+    validity_window.setdefault("ends_at", None)
+    governance["validity_window"] = validity_window
+    updated["governance"] = governance
+    updated["quarantine_status"] = governance["quarantine_status"]
+    updated["owner"] = governance["owner"]
+    updated["version"] = governance["version"]
     if updated_at:
         updated["updated_at"] = updated_at
     return updated
@@ -493,12 +621,24 @@ def extract_candidates(episode: dict[str, Any]) -> list[dict[str, Any]]:
     knowledge_kind = knowledge_kind or (PATTERN if success else ANTI_PATTERN)
     confidence = float(episode.get("confidence_hint", 0.6))
     scope = {"level": "task-family", "value": episode.get("scope_hint", "general-coding-task")}
+    scope_profile = episode.get("scope_profile") or _infer_scope_profile(
+        task_text=str(episode.get("goal") or ""),
+        files_touched=list(episode.get("files_touched", [])),
+        commands=list(episode.get("commands", [])),
+    )
     candidate_id = episode["episode_id"].replace("ep_", "cand_", 1)
+    created_at = _now_utc()
+    governance = _default_governance_metadata(
+        knowledge_scope="project",
+        owner="project",
+        created_at=created_at,
+    )
     candidate = {
         "candidate_id": candidate_id,
         "source_episode_ids": [episode["episode_id"]],
         "workspace": episode.get("workspace"),
         "candidate_type": candidate_type,
+        "knowledge_scope": governance["knowledge_scope"],
         "knowledge_kind": knowledge_kind,
         "title": _candidate_title(episode, candidate_type, knowledge_kind),
         "content": _candidate_content(episode, knowledge_kind, lesson),
@@ -507,9 +647,16 @@ def extract_candidates(episode: dict[str, Any]) -> list[dict[str, Any]]:
         "confidence_score": round(confidence, 2),
         "constraint_value_score": round(0.78 if episode.get("constraints") else 0.66, 2),
         "scope": scope,
+        "scope_profile": scope_profile,
         "conflicts_with": [],
         "status": "new",
-        "created_at": _now_utc(),
+        "review_status": governance["review_status"],
+        "temperature": governance["temperature"],
+        "quarantine_status": governance["quarantine_status"],
+        "owner": governance["owner"],
+        "version": governance["version"],
+        "governance": governance,
+        "created_at": created_at,
     }
     if knowledge_kind == EMOTIONAL_FEEDBACK:
         candidate["content_policy"] = {
@@ -541,6 +688,17 @@ def promote_candidate(
         + candidate.get("confidence_score", 0)
         + candidate.get("constraint_value_score", 0)
     ) / 4
+    created_at = _now_utc()
+    owner = "project" if knowledge_scope == "project" else "team"
+    governance = _default_governance_metadata(
+        knowledge_scope=knowledge_scope,
+        owner=owner,
+        created_at=created_at,
+        review_status=str(candidate.get("review_status") or "unproven"),
+        temperature=str(candidate.get("temperature") or "neutral"),
+        quarantine_status=str(candidate.get("quarantine_status") or "active"),
+        version=str(candidate.get("version") or "1"),
+    )
     asset = {
         "asset_id": asset_id,
         "workspace": candidate.get("workspace"),
@@ -553,6 +711,7 @@ def promote_candidate(
         "title": candidate["title"],
         "content": candidate["content"],
         "scope": candidate["scope"],
+        "scope_profile": candidate.get("scope_profile"),
         "source_workspace": candidate.get("workspace"),
         "source_episode_ids": candidate["source_episode_ids"],
         "source_candidate_ids": [candidate["candidate_id"]],
@@ -583,14 +742,20 @@ def promote_candidate(
         "delivery": {
             "portable": True,
             "shareable": bool(backend_config["shareable_enabled"]) or knowledge_scope in {"project", "cross-project"},
-            "owner": "project" if knowledge_scope == "project" else "team",
+            "owner": owner,
             "mode": backend_config["profile"],
         },
         "confidence": round(score, 2),
         "status": "active",
+        "review_status": governance["review_status"],
+        "temperature": governance["temperature"],
+        "quarantine_status": governance["quarantine_status"],
+        "owner": governance["owner"],
+        "version": governance["version"],
+        "governance": governance,
         "last_used_at": None,
-        "created_at": _now_utc(),
-        "updated_at": _now_utc(),
+        "created_at": created_at,
+        "updated_at": created_at,
     }
     if candidate.get("source_context"):
         asset["source_context"] = candidate["source_context"]
@@ -606,6 +771,17 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
     project_id = candidate.get("project_id") or project_identity.get("project_id") or candidate.get("workspace")
     owning_team = candidate.get("owning_team") or project_identity.get("owning_team")
     source_project = candidate.get("source_project") or project_id
+    created_at = candidate.get("created_at") or _now_utc()
+    owner = str(candidate.get("owner") or "project")
+    governance = _default_governance_metadata(
+        knowledge_scope=str(candidate.get("knowledge_scope", "project")),
+        owner=owner,
+        created_at=created_at,
+        review_status=str(candidate.get("review_status") or "unproven"),
+        temperature=str(candidate.get("temperature") or "neutral"),
+        quarantine_status=str(candidate.get("quarantine_status") or "active"),
+        version=str(candidate.get("version") or "1"),
+    )
     asset = {
         "asset_id": candidate["candidate_id"],
         "workspace": candidate.get("workspace"),
@@ -618,6 +794,7 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
         "title": candidate["title"],
         "content": candidate["content"],
         "scope": candidate["scope"],
+        "scope_profile": candidate.get("scope_profile"),
         "source_context": candidate.get("source_context"),
         "content_policy": candidate.get("content_policy"),
         "source_workspace": candidate.get("workspace"),
@@ -650,14 +827,20 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
         "delivery": {
             "portable": True,
             "shareable": True,
-            "owner": "project",
+            "owner": owner,
             "mode": backend_config["profile"],
         },
         "confidence": candidate.get("confidence_score", 0.6),
         "status": candidate.get("status", "candidate"),
+        "review_status": governance["review_status"],
+        "temperature": governance["temperature"],
+        "quarantine_status": governance["quarantine_status"],
+        "owner": governance["owner"],
+        "version": governance["version"],
+        "governance": governance,
         "last_used_at": None,
-        "created_at": candidate.get("created_at"),
-        "updated_at": candidate.get("created_at"),
+        "created_at": created_at,
+        "updated_at": created_at,
     }
     if not asset["source_context"]:
         asset.pop("source_context")
@@ -668,6 +851,16 @@ def _candidate_as_asset(candidate: dict[str, Any]) -> dict[str, Any]:
 
 def _match_score(task: str, scope: dict[str, str], asset: dict[str, Any], workspace: str) -> float:
     return _match_details(task, scope, asset, workspace)["score"]
+
+
+def _profile_value_matches(current: str | None, asset_value: str | None) -> bool:
+    if not current or not asset_value:
+        return False
+    return current == asset_value
+
+
+def _asset_is_quarantined(asset: dict[str, Any]) -> bool:
+    return str(asset.get("quarantine_status") or "active").lower() in {"quarantined", "deprecated", "blocked"}
 
 
 def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], workspace: str) -> dict[str, Any]:
@@ -688,6 +881,8 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
     risk_flags: list[str] = []
     evidence_bonus = 0.0
     penalty_score = 0.0
+    task_profile = _infer_scope_profile(task_text=task)
+    asset_profile = asset.get("scope_profile", {}) if isinstance(asset.get("scope_profile"), dict) else {}
     historical_help = asset.get("historical_help", {})
     effectiveness_summary = asset.get("effectiveness_summary") or build_asset_effectiveness_summary(historical_help)
     temperature = effectiveness_summary.get("temperature", "neutral")
@@ -757,6 +952,32 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
     elif review_status == "watch":
         penalty_score += 0.04
         risk_flags.append("资产处于 watch 状态，仍需继续观察实际帮助效果。")
+    if _asset_is_quarantined(asset):
+        penalty_score += 0.35
+        risk_flags.append("资产已被 quarantine/deprecated，默认不应继续注入。")
+    profile_bonus_rules = {
+        "task_type": 0.12,
+        "module": 0.18,
+        "language": 0.08,
+        "framework": 0.08,
+    }
+    profile_labels = {
+        "task_type": "任务类型",
+        "module": "模块",
+        "language": "语言",
+        "framework": "框架",
+    }
+    for key, bonus in profile_bonus_rules.items():
+        current_value = task_profile.get(key)
+        asset_value = asset_profile.get(key)
+        if _profile_value_matches(str(current_value) if current_value else None, str(asset_value) if asset_value else None):
+            score += bonus
+            evidence_bonus += bonus
+            evidence.append(f"{profile_labels[key]}命中 {asset_value}")
+        elif current_value and asset_value:
+            penalty = 0.06 if key == "module" else 0.03
+            penalty_score += penalty
+            risk_flags.append(f"{profile_labels[key]}不一致：当前为 {current_value}，资产为 {asset_value}。")
     if title_hits:
         score += 0.12
         evidence_bonus += 0.12
@@ -839,6 +1060,8 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
         "content_hits": content_hits,
         "distinctive_hits": distinctive_hits,
         "effectiveness_summary": effectiveness_summary,
+        "task_profile": task_profile,
+        "scope_profile": asset_profile,
         "evidence": _unique_preserve_order(evidence),
         "risk_flags": _unique_preserve_order(risk_flags),
     }
@@ -1203,6 +1426,17 @@ def _rerank_activation_assets(
     return scored_assets
 
 
+def _conflicts_with_selected(asset: dict[str, Any], selected: list[dict[str, Any]]) -> str | None:
+    current_conflicts = {str(item) for item in asset.get("conflicts_with", []) if item}
+    if not current_conflicts:
+        return None
+    selected_ids = {str(item.get("asset_id")) for item in selected if item.get("asset_id")}
+    for conflict_id in current_conflicts:
+        if conflict_id in selected_ids:
+            return conflict_id
+    return None
+
+
 def _select_activation_assets(
     scored_assets: list[tuple[float, dict[str, Any], dict[str, Any]]],
     *,
@@ -1219,7 +1453,22 @@ def _select_activation_assets(
     )
     selection_adjustments: list[str] = []
 
-    for score, asset, details in scored_assets[:5]:
+    for score, asset, details in scored_assets:
+        if len(selected) >= 5:
+            break
+        if _asset_is_quarantined(asset):
+            selection_adjustments.append(f"跳过已隔离资产 {asset['asset_id']}。")
+            selection_risks = _unique_preserve_order(
+                [*selection_risks, "被 quarantine 的资产默认不应进入注入候选。"]
+            )
+            continue
+        conflict_id = _conflicts_with_selected(asset, selected)
+        if conflict_id:
+            selection_adjustments.append(f"跳过冲突资产 {asset['asset_id']}，因其与 {conflict_id} 冲突。")
+            selection_risks = _unique_preserve_order(
+                [*selection_risks, "同一批注入中已排除显式冲突资产，避免互相矛盾的经验同时进入上下文。"]
+            )
+            continue
         provenance = _source_provenance(asset, workspace_str)
         selected.append(
             _selected_activation_item(
@@ -1235,6 +1484,10 @@ def _select_activation_assets(
     milvus_first_candidates: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
     for score, asset, details in scored_assets:
         if asset.get("asset_id") in selected_ids:
+            continue
+        if _asset_is_quarantined(asset):
+            continue
+        if _conflicts_with_selected(asset, selected):
             continue
         if "milvus" not in asset.get("retrieval_sources", []):
             continue
@@ -1275,6 +1528,10 @@ def _select_activation_assets(
     strongest_milvus_probe: tuple[float, dict[str, Any], dict[str, Any]] | None = None
     for score, asset, details in scored_assets:
         if asset.get("asset_id") in selected_ids:
+            continue
+        if _asset_is_quarantined(asset):
+            continue
+        if _conflicts_with_selected(asset, selected):
             continue
         if "milvus" not in asset.get("retrieval_sources", []):
             continue
@@ -1322,6 +1579,10 @@ def _select_activation_assets(
         for score, asset, details in scored_assets:
             if asset.get("asset_id") in selected_ids:
                 continue
+            if _asset_is_quarantined(asset):
+                continue
+            if _conflicts_with_selected(asset, selected):
+                continue
             if not _is_explicit_high_priority_prior(asset):
                 continue
             explicit_prior_probe = (score, asset, details)
@@ -1352,6 +1613,10 @@ def _select_activation_assets(
         codemap_probe: tuple[float, dict[str, Any], dict[str, Any]] | None = None
         for score, asset, details in scored_assets:
             if asset.get("asset_id") in selected_ids:
+                continue
+            if _asset_is_quarantined(asset):
+                continue
+            if _conflicts_with_selected(asset, selected):
                 continue
             if asset.get("knowledge_kind") != CODEMAP:
                 continue
@@ -1631,6 +1896,51 @@ def explain_object(payload: dict[str, Any]) -> dict[str, Any]:
             "id": payload["activation_id"],
             "explanation": explanation,
             "source_refs": payload.get("fallback_episode_refs", []),
+        }
+    if "items" in payload and "pending_validation_count" in payload and "total_assets" in payload:
+        items = payload.get("items", [])
+        explanation = [
+            "validation queue 是治理账本给出的 replay/复核优先级列表，用来决定哪些资产应先证明、复查或隔离。"
+        ]
+        if items:
+            top_item = items[0]
+            explanation.append(
+                f"当前队首是 {top_item.get('asset_id')}，建议动作是 {top_item.get('suggested_action')}。"
+            )
+            reasons = top_item.get("reasons", [])
+            if reasons:
+                explanation.append(f"优先原因：{'；'.join(reasons[:2])}。")
+        explanation.append(
+            f"当前共覆盖 {payload.get('total_assets', 0)} 条资产，其中待验证 {payload.get('pending_validation_count', 0)} 条。"
+        )
+        return {
+            "kind": "validation_queue",
+            "id": None,
+            "explanation": explanation,
+            "source_refs": [item.get("asset_id") for item in items[:5] if item.get("asset_id")],
+        }
+    if "asset_count" in payload and "review_status_counts" in payload and "top_validation_items" in payload:
+        explanation = [
+            "governance summary 是面向 status/dashboard 的治理快照，概括资产健康分布、隔离状态和 replay 压力。"
+        ]
+        review_counts = payload.get("review_status_counts", {})
+        if review_counts:
+            explanation.append(
+                "当前 review_status 分布："
+                + "，".join(f"{key}={value}" for key, value in sorted(review_counts.items()))
+                + "。"
+            )
+        explanation.append(
+            f"总资产 {payload.get('asset_count', 0)} 条，冲突资产 {payload.get('conflict_asset_count', 0)} 条，待验证 {payload.get('pending_validation_count', 0)} 条。"
+        )
+        top_items = payload.get("top_validation_items", [])
+        if top_items:
+            explanation.append(f"当前 validation 队首是 {top_items[0].get('asset_id')}。")
+        return {
+            "kind": "governance_summary",
+            "id": None,
+            "explanation": explanation,
+            "source_refs": [item.get("asset_id") for item in top_items[:5] if item.get("asset_id")],
         }
     return {
         "kind": "unknown",

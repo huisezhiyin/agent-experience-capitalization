@@ -18,6 +18,9 @@
 
 - `AGENTS.md` 负责项目主入口和规则总览
 - `AGENTS.expcap.md` 只负责动态经验 `get/save` 集成，不替代项目静态规则
+- `expcap` 的默认定位是 experience governance / asset governance，不是不断自动压缩历史的长期记忆池
+- 原始 trace 是一等证据；总结先生成 candidate，不直接当成真理
+- 召回结果是带 provenance 和 risk 的候选，不直接支配执行
 - 稳定、短小、反复证明有效的规则，优先收敛到这里
 - 仍在试验、需要 feedback/proof 的内容，继续留在 `expcap` 资产层
 

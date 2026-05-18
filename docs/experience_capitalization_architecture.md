@@ -4,7 +4,7 @@
 
 本文档不是最终实现 spec，而是一份偏技术架构设计的研究草案。
 
-目标不是复刻 Hermes Agent 全部工程能力，而是抽取其中最有价值的经验治理理念，设计一层可挂载在 `Codex` 与 `Claude Code` 之上的项目经验资产层，用于实现更稳健的“自学习 / 自强化”闭环。
+目标不是复刻 Hermes Agent 全部工程能力，而是抽取其中最有价值的经验治理理念，设计一层可挂载在 `Codex` 与 `Claude Code` 之上的项目经验资产层，用于实现更稳健的经验治理闭环，而不是幼稚的 memory consolidation pile。
 
 新的核心定位是：经验资产属于项目或团队，而不是属于某一个人的模型账号。本地模式服务单人团队和离线开发；云端共享模式服务团队协作、资产交割和跨机器复用。
 
@@ -32,7 +32,7 @@
 
 因此，本项目研究对象不是泛泛的“自学习 agent”，而是：
 
-> 一个面向 coding agent 的经验资本化增强层。
+> 一个面向 coding agent 的、project-owned / team-shareable / evidence-backed experience governance layer。
 
 它不替代宿主 agent，而是增强宿主 agent 的长期经验治理能力。
 
@@ -80,6 +80,18 @@
 ### 4.5 核心通用，适配器局部化
 
 经验资本化内核尽量通用，但宿主接入、日志解析、激活方式等宿主相关部分必须允许局部化实现。
+
+### 4.6 容错优先于压缩
+
+系统不应默认认为“持续总结”就会带来更好的长期记忆。持续 consolidation 很容易引入信息丢失、错误泛化、边界抹平和错误累积。
+
+因此默认原则应是：
+
+- raw trace 不被抽象层替代
+- consolidation 只生成 candidate，不生成真理
+- promote 必须有证据、审核和作用域
+- retrieval 返回带 provenance 的候选，而不是命令
+- activation 后必须进入 feedback / decay / quarantine 治理
 
 
 ## 5. 总体架构
@@ -546,7 +558,7 @@ skill 不负责保存复杂状态，而是负责：
 
 ## 10. 存储层设计
 
-存储层应区分“产品语义”和“部署形态”：
+存储层应区分“产品语义”和“部署形态”，更要区分不同存储职责：
 
 - 产品语义：资产是 project-owned / team-shareable / deliverable。
 - 团队模式：对象存储或 Git 仓库存资产正文，Cloud SQL/Postgres 存状态索引，云端 Milvus/Zilliz/Qdrant 存语义索引。
@@ -554,14 +566,25 @@ skill 不负责保存复杂状态，而是负责：
 
 MVP 可以继续采用“文件 + SQLite”双存储策略，但它应被视为 local-mode backend，而不是最终产品边界。
 
-### 10.1 文件存储
+一句话边界：
+
+- Milvus 负责“找得到”，不负责“信得过”。
+- SQLite / Postgres 负责治理，不负责语义理解。
+- Markdown 负责人类可读与审查，不负责大规模召回。
+- JSON / logs / object storage 负责原始真源，不应被 LLM 总结替代。
+
+### 10.1 Evidence Store：原始证据真源
 
 适合存放：
 
-- 可读性强的 markdown 资产
-- skill 文件
-- episode 文档
-- 人工审核记录
+- raw trace
+- task input
+- tool calls
+- diff
+- test result
+- error log
+- activation view
+- user feedback
 
 建议目录示例：
 
@@ -587,7 +610,33 @@ MVP 可以继续采用“文件 + SQLite”双存储策略，但它应被视为 
 - `assets/` 保存晋升后的长期资产
 - `views/` 保存激活阶段生成的临时结果
 
-### 10.2 SQLite 存储
+关键约束：
+
+- 原始 trace 不会因为后续抽象资产出现而被覆盖
+- Milvus 只能索引这些证据，不能替代这些证据
+
+### 10.2 Curated Markdown Memory：稳定可读知识层
+
+适合存放：
+
+- `PROJECT_PROMPT.md`
+- `AGENTS.md`
+- `AGENTS.expcap.md`
+- `memory/*.md`
+- `docs/*.md`
+- 稳定 checklist
+- decision memory
+- dont_repeat
+
+关键要求：
+
+- 人类可读
+- 可 review / 可 PR
+- 少量、高置信、稳定
+- 不承担大规模原始 trace 保存
+- 不承担大规模语义召回
+
+### 10.3 Governance DB：资产治理状态层
 
 适合存放：
 
@@ -616,14 +665,50 @@ MVP 可以继续采用“文件 + SQLite”双存储策略，但它应被视为 
 - `task_boundaries`
 - `runtime_events`
 
-### 10.3 文件与数据库的关系
+建议进一步纳入的治理字段：
 
-- 文件负责可读、可编辑、可审查
-- SQLite 负责检索、关联、评分、调度
+- `owner`
+- `version`
+- `validity_window`
+- `promotion_history`
+- `deprecation_history`
+- `quarantine_status`
 
-这样既保留了本地透明性，又避免所有查询都依赖 markdown 扫描。
+### 10.4 Semantic Retrieval Layer：语义召回层
 
-### 10.4 存储一致性建议
+推荐使用 Milvus / Milvus Lite。
+
+存储内容：
+
+- chunk embedding
+- asset embedding
+- episode embedding
+- codemap embedding
+- trace summary embedding
+- metadata filters
+- source pointer
+
+每个语义 item 至少应带：
+
+- `source_type`
+- `source_id`
+- `source_path` / `object_uri`
+- `asset_id` / `episode_id` / `trace_id`
+- `knowledge_kind`
+- `knowledge_scope`
+- `created_at`
+- `embedding_profile`
+
+### 10.5 文件、数据库与索引的关系
+
+- Evidence Store 负责 recoverable source of truth
+- Curated Markdown 负责可读、可编辑、可审查
+- Governance DB 负责关系、状态、评分、调度
+- Semantic Retrieval Layer 负责相似召回与 metadata filter
+
+这样既保留了本地透明性，又避免所有查询都依赖 markdown 扫描，同时防止单一介质承担不该承担的职责。
+
+### 10.6 存储一致性建议
 
 建议采用“数据库为索引真源、文件为内容真源”的弱双写模型：
 
@@ -632,7 +717,7 @@ MVP 可以继续采用“文件 + SQLite”双存储策略，但它应被视为 
 
 这样更适合 local-mode 场景，也更利于和 agent 直接协作。团队模式下，这组文件可以成为本地 cache 或可导入/导出的资产包，最终真源应迁移到共享后端。
 
-### 10.5 资产交割字段
+### 10.7 资产交割字段
 
 长期资产应逐步具备以下元数据：
 
@@ -953,6 +1038,47 @@ plugin 不只是采集器，还应是编排器。
 - `team` 承载多个项目验证后的团队级经验
 - `project` 承载仓库局部经验，是默认主形态
 - `task-family` 承载某类问题域的专项经验
+
+进一步建议补充：
+
+- `personal / local prior`
+- `module`
+- `language`
+- `framework`
+- `task type`
+- `applicable conditions`
+- `known counterexamples`
+
+### 16.4 Fault-Tolerant Memory Governance
+
+建议把以下原则视为长期设计真源：
+
+1. Raw trace is never replaced by abstraction.
+2. Consolidation creates candidates, not truth.
+3. Promotion requires evidence, review, and scope.
+4. Retrieval returns sourced candidates, not commands.
+5. Activated assets must receive feedback, decay, or quarantine.
+6. Cross-task contamination must be prevented by default.
+7. Abstraction must remain grounded in recoverable evidence.
+
+### 16.5 当前实现能力审计
+
+当前已经支持或基本支持：
+
+- Raw trace retention：trace / episode / activation view / feedback 都保留为持久对象。
+- Candidate quarantine：任务后总结先进入 candidate 层，再 promote。
+- Activation provenance：selected assets 已带 `source_provenance`、`match_evidence`、`risk_flags`、`llm_use_guidance`。
+- Feedback-driven health：asset 有 `temperature`、`review_status`、activation feedback 回写。
+- Progressive recall gate：仅在新错误、新文件、新阶段、topic drift 时触发增量召回。
+- 跨项目风险提示：`cross-project` 资产已显式附带 provenance 与 risk flags。
+
+当前容易扩展但尚未完整落地：
+
+- Heterogeneous task isolation：不同任务类型默认隔离的 schema / policy 还不够完整。
+- Replay / validation：重要资产的历史任务回放验证尚未成为标准能力。
+- Conflict detection：架构文档已有 `asset_conflicts` 方向，但运行时还没有完整冲突抑制。
+- Quarantine / deprecate / validity window：已有生命周期信号，但缺少更显式的治理字段。
+- Team / organization promotion rails：当前实现主要还是 `project` / `cross-project`，更高层级不应由单次任务自动晋升。
 
 
 ## 17. 可观测性设计

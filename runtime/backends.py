@@ -140,11 +140,16 @@ def resolve_backend_config(env: Mapping[str, str] | None = None) -> dict[str, ob
         "retrieval": retrieval,
         "sharing": sharing,
         "state_index_role": "lightweight-state-index" if state_index == "sqlite" else "shared-state-index",
+        "state_index_governance_role": (
+            "local-governance-ledger" if state_index == "sqlite" else "shared-governance-ledger"
+        ),
+        "state_index_truth_boundary": "lifecycle-and-relationships-not-content-truth",
         "retrieval_role": (
             "core-semantic-retrieval"
             if retrieval in {"milvus-lite", "milvus"}
             else "lightweight-metadata-retrieval"
         ),
+        "retrieval_truth_boundary": "findability-not-trust-or-content-truth",
         "cloud_enabled": cloud_enabled,
         "local_mode": local_mode,
         "shareable_enabled": shareable_enabled,

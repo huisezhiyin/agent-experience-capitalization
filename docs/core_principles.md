@@ -6,9 +6,11 @@
 personal memory systems.
 
 Its core purpose is to turn coding-agent work into project-owned, team-shareable,
-deliverable engineering experience assets.
+deliverable engineering experience assets with evidence, scope, lifecycle, and
+feedback governance.
 
 Short name: **TEAM memory** — **Transferable Engineering Asset Memory**.
+Preferred product framing: **fault-tolerant experience governance layer**.
 
 ## What This Means
 
@@ -21,6 +23,9 @@ Short name: **TEAM memory** — **Transferable Engineering Asset Memory**.
   engineering memory.
 - The product boundary is experience governance: evidence, extraction,
   candidate review, promotion, retrieval, activation, feedback, and decay.
+- Raw evidence stays first-class even after abstractions are produced.
+- Retrieval should return sourced candidates, not commands.
+- LLM consolidation should create candidates, not truth.
 
 ## What This Is Not
 
@@ -28,9 +33,22 @@ Short name: **TEAM memory** — **Transferable Engineering Asset Memory**.
 - Not a generic chat memory store.
 - Not a private preference profile bound to one user.
 - Not just a vector database wrapper.
+- Not an auto-compressing memory-consolidation pile.
+
+## Fault-Tolerant Governance Rules
+
+- Raw trace is never replaced by abstraction.
+- Consolidation creates candidates, not truth.
+- Promotion requires evidence, review, and scope.
+- Retrieval returns sourced candidates, not commands.
+- Activated assets must receive feedback, decay, quarantine, or deprecation.
+- Cross-task contamination should be prevented by default.
+- Abstract assets must remain grounded in recoverable evidence.
 
 ## Asset Levels
 
+- `personal / local prior`: Local preferences, collaboration boundaries, and
+  dont-repeat context that should not silently pollute shared memory.
 - `project`: Default asset level. Captures decisions, patterns, rules, and
   lessons that belong to one repository or product.
 - `team`: Shared asset level. Captures experience validated across multiple
@@ -38,12 +56,25 @@ Short name: **TEAM memory** — **Transferable Engineering Asset Memory**.
 - `organization`: Future asset level. Captures stable engineering knowledge
   that a company wants to preserve and transfer across teams.
 
+## Promotion Ladder
+
+- `trace -> episode -> candidate -> project asset -> team asset -> organization asset`
+
+Each step upward should require stronger evidence, clearer scope, and stricter
+review. Team- or organization-level assets should never be auto-promoted from a
+single task without additional governance.
+
 ## Storage Philosophy
 
 The storage backend is replaceable, but the asset contract is not.
 
-- Milvus is the core semantic retrieval capability. SQLite is a lightweight
-  state index, review log, activation log, and fallback layer.
+- Evidence files / logs are the recoverable source of truth for raw traces,
+  task input, tool calls, diffs, tests, errors, activation views, and feedback.
+- Curated Markdown memory is the human-readable and reviewable layer for stable
+  rules, prompts, docs, and curated memory notes.
+- Milvus is the core semantic retrieval capability, not the source of truth.
+- SQLite is a lightweight governance DB: state index, review log, activation
+  log, relationship store, and fallback metadata layer.
 - Solo/local mode can use `.agent-memory/`, SQLite, and Milvus Lite, but
   Milvus Lite should still be treated as the primary retrieval path.
 - Project ownership does not require project-directory storage. A project can
@@ -56,3 +87,6 @@ The storage backend is replaceable, but the asset contract is not.
   development impossible.
 - Local and cloud modes should share the same asset contract. Cloud adoption
   should be a backend configuration change, not a product rewrite.
+- Markdown should not be overloaded as the large-scale retrieval substrate.
+- SQLite should not be overloaded as the semantic understanding layer.
+- LLM summaries should never be allowed to erase the underlying evidence.

@@ -25,6 +25,11 @@ from runtime.core.engine import (
     review_trace_bundle,
     should_promote_candidate,
 )
+from runtime.core.governance_views import (
+    build_governance_dashboard_view,
+    build_governance_status_view,
+    build_validation_queue_view,
+)
 from runtime.core.hook_activity import load_recent_hook_events
 from runtime.core.injection_materializer import materialize_injection_artifacts
 from runtime.core.injection_policy import (
@@ -95,6 +100,9 @@ from runtime.storage.milvus_store import (
     upsert_asset_vector,
 )
 from runtime.storage.sqlite_store import (
+    build_asset_validation_queue,
+    build_governance_summary,
+    deprecate_asset,
     ensure_db,
     find_latest_activation,
     get_asset,
@@ -103,7 +111,11 @@ from runtime.storage.sqlite_store import (
     list_assets,
     list_candidates,
     log_activation,
+    mark_asset_conflict,
     record_activation_feedback,
+    reactivate_asset,
+    resolve_asset_conflict,
+    set_asset_quarantine_status,
     summarize_asset_feedback,
     touch_assets_last_used,
     upsert_asset,
@@ -325,6 +337,106 @@ def _validation_age_bucket(timestamp: str | None) -> str:
     if age_days <= 30.0:
         return "8_30d"
     return "31d_plus"
+
+
+def _add_scope_filter_arguments(parser: argparse.ArgumentParser) -> None:
+    existing = {
+        option
+        for action in parser._actions  # type: ignore[attr-defined]
+        for option in getattr(action, "option_strings", [])
+    }
+    if "--knowledge-scope" not in existing:
+        parser.add_argument(
+            "--knowledge-scope",
+            choices=["project", "cross-project"],
+            help="Optional knowledge scope filter.",
+        )
+    if "--task-type" not in existing:
+        parser.add_argument("--task-type", help="Optional task_type scope filter.")
+    if "--module" not in existing:
+        parser.add_argument("--module", dest="scope_module", help="Optional module scope filter.")
+    if "--language" not in existing:
+        parser.add_argument("--language", help="Optional language scope filter.")
+    if "--framework" not in existing:
+        parser.add_argument("--framework", help="Optional framework scope filter.")
+    if "--review-status" not in existing:
+        parser.add_argument(
+            "--review-status",
+            choices=["healthy", "watch", "needs_review", "unproven"],
+            help="Optional governance review_status filter.",
+        )
+    if "--quarantine-status" not in existing:
+        parser.add_argument(
+            "--quarantine-status",
+            choices=["active", "quarantined", "deprecated"],
+            help="Optional governance quarantine_status filter.",
+        )
+    if "--asset-status" not in existing:
+        parser.add_argument(
+            "--asset-status",
+            choices=["active", "deprecated"],
+            help="Optional asset lifecycle status filter.",
+        )
+    if "--only-deprecated" not in existing:
+        parser.add_argument(
+            "--only-deprecated",
+            action="store_true",
+            help="Shortcut for governance views focused on deprecated assets.",
+        )
+    if "--only-quarantined" not in existing:
+        parser.add_argument(
+            "--only-quarantined",
+            action="store_true",
+            help="Shortcut for governance views focused on quarantined assets.",
+        )
+    if "--only-needs-review" not in existing:
+        parser.add_argument(
+            "--only-needs-review",
+            action="store_true",
+            help="Shortcut for governance views focused on needs_review assets.",
+        )
+
+
+def _is_fresh_self_referential_validation_asset(asset: dict[str, Any]) -> bool:
+    """Skip freshly-generated meta assets that only describe the proof workflow itself.
+
+    These assets are useful as historical trace output, but if they immediately top the
+    unproven queue they create a low-value feedback loop where automation keeps proving
+    the latest backlog-digestion summary instead of the next substantive project pattern.
+    """
+
+    updated_at = _parse_datetime(asset.get("updated_at") or asset.get("created_at"))
+    if not updated_at:
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    age_hours = max((datetime.now(timezone.utc) - updated_at).total_seconds() / 3600.0, 0.0)
+    if age_hours > 24.0:
+        return False
+
+    title = str(asset.get("title") or "").lower()
+    content = str(asset.get("content") or "").lower()
+    text = f"{title}\n{content}"
+
+    workflow_signals = [
+        "unproven backlog",
+        "prove-next",
+        "validation queue",
+        "validation plan",
+        "回写帮助反馈",
+        "优先验证",
+        "help feedback",
+        "real-task validation",
+        "真实任务",
+        "显式验证",
+    ]
+    meta_signals = [
+        "继续消化",
+        "继续推进",
+        "should be captured as reusable experience",
+        "后应沉淀成可复用经验",
+    ]
+    return any(signal in text for signal in workflow_signals) and any(signal in text for signal in meta_signals)
 
 
 def _load_asset_for_workspace(
@@ -591,6 +703,8 @@ def _build_unproven_validation_queue(
     for asset in assets:
         if asset.get("review_status", "unproven") != "unproven":
             continue
+        if _is_fresh_self_referential_validation_asset(asset):
+            continue
         title = str(asset.get("title") or "")
         content = str(asset.get("content") or "")
         knowledge_kind = asset.get("knowledge_kind", asset.get("asset_type", "pattern"))
@@ -607,6 +721,7 @@ def _build_unproven_validation_queue(
                 "title": asset.get("title"),
                 "knowledge_kind": knowledge_kind,
                 "knowledge_scope": asset.get("knowledge_scope", "project"),
+                "scope_profile": asset.get("scope_profile"),
                 "confidence": asset.get("confidence"),
                 "updated_at": updated_at,
                 "priority_score": priority_score,
@@ -1236,6 +1351,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open retrieval backends for deeper health checks. Defaults to lightweight checks only.",
     )
+    _add_scope_filter_arguments(dashboard)
     dashboard.add_argument("--output", help="Optional output HTML path.")
 
     review = subparsers.add_parser("review", help="Generate an episode from a trace bundle.")
@@ -1329,6 +1445,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=list(CANONICAL_KNOWLEDGE_KINDS),
         help="Filter queue by kind; also used as an override when --action promote is selected.",
     )
+    _add_scope_filter_arguments(review_candidates)
     review_candidates.add_argument("--output", help="Optional output path for the review queue JSON.")
 
     validation_plan = subparsers.add_parser(
@@ -1342,7 +1459,91 @@ def _build_parser() -> argparse.ArgumentParser:
         default=5,
         help="How many top unproven assets to include. Defaults to 5.",
     )
+    _add_scope_filter_arguments(validation_plan)
     validation_plan.add_argument("--output", help="Optional output path for the validation plan JSON.")
+
+    validation_queue = subparsers.add_parser(
+        "validation-queue",
+        help="Build the governance-backed validation queue for replay, review, and quarantine follow-up.",
+    )
+    validation_queue.add_argument("--workspace", required=True, help="Workspace path for the validation queue.")
+    validation_queue.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="How many validation items to include. Defaults to 10.",
+    )
+    _add_scope_filter_arguments(validation_queue)
+    validation_queue.add_argument("--output", help="Optional output path for the validation queue JSON.")
+
+    quarantine_asset = subparsers.add_parser(
+        "quarantine-asset",
+        help="Mark one asset as quarantined or restore it to active governance state.",
+    )
+    quarantine_asset.add_argument("--workspace", required=True, help="Workspace path that owns the asset.")
+    quarantine_asset.add_argument("--asset-id", required=True, help="Asset id to update.")
+    quarantine_asset.add_argument(
+        "--status",
+        choices=["active", "quarantined"],
+        default="quarantined",
+        help="Target quarantine status. Defaults to quarantined.",
+    )
+    quarantine_asset.add_argument("--reason", help="Optional human-readable reason for the governance change.")
+    quarantine_asset.add_argument("--output", help="Optional output path for the governance action JSON.")
+
+    unquarantine_asset = subparsers.add_parser(
+        "unquarantine-asset",
+        help="Restore one asset from quarantined state back to active governance state.",
+    )
+    unquarantine_asset.add_argument("--workspace", required=True, help="Workspace path that owns the asset.")
+    unquarantine_asset.add_argument("--asset-id", required=True, help="Asset id to restore.")
+    unquarantine_asset.add_argument("--reason", help="Optional human-readable reason for restoring the asset.")
+    unquarantine_asset.add_argument("--output", help="Optional output path for the governance action JSON.")
+
+    deprecate_asset_parser = subparsers.add_parser(
+        "deprecate-asset",
+        help="Retire one asset from active retrieval while preserving evidence and governance history.",
+    )
+    deprecate_asset_parser.add_argument("--workspace", required=True, help="Workspace path that owns the asset.")
+    deprecate_asset_parser.add_argument("--asset-id", required=True, help="Asset id to retire.")
+    deprecate_asset_parser.add_argument("--reason", help="Optional human-readable reason for deprecating the asset.")
+    deprecate_asset_parser.add_argument("--output", help="Optional output path for the governance action JSON.")
+
+    reactivate_asset_parser = subparsers.add_parser(
+        "reactivate-asset",
+        help="Restore a deprecated or quarantined asset back into the active governance pool.",
+    )
+    reactivate_asset_parser.add_argument("--workspace", required=True, help="Workspace path that owns the asset.")
+    reactivate_asset_parser.add_argument("--asset-id", required=True, help="Asset id to reactivate.")
+    reactivate_asset_parser.add_argument("--reason", help="Optional human-readable reason for reactivating the asset.")
+    reactivate_asset_parser.add_argument("--output", help="Optional output path for the governance action JSON.")
+
+    mark_conflict = subparsers.add_parser(
+        "mark-conflict",
+        help="Mark two assets as conflicting so retrieval stops co-injecting them.",
+    )
+    mark_conflict.add_argument("--workspace", required=True, help="Workspace path that owns the assets.")
+    mark_conflict.add_argument("--asset-id", required=True, help="Primary asset id.")
+    mark_conflict.add_argument(
+        "--conflicting-asset-id",
+        required=True,
+        help="Asset id that conflicts with --asset-id.",
+    )
+    mark_conflict.add_argument("--output", help="Optional output path for the governance action JSON.")
+
+    resolve_conflict = subparsers.add_parser(
+        "resolve-conflict",
+        help="Remove an explicit conflict relation after review or replay confirms compatibility.",
+    )
+    resolve_conflict.add_argument("--workspace", required=True, help="Workspace path that owns the assets.")
+    resolve_conflict.add_argument("--asset-id", required=True, help="Primary asset id.")
+    resolve_conflict.add_argument(
+        "--conflicting-asset-id",
+        required=True,
+        help="Asset id that should no longer conflict with --asset-id.",
+    )
+    resolve_conflict.add_argument("--reason", help="Optional human-readable reason for resolving the conflict.")
+    resolve_conflict.add_argument("--output", help="Optional output path for the governance action JSON.")
 
     prove_next = subparsers.add_parser(
         "prove-next",
@@ -1361,6 +1562,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="supported_strong",
         help="Feedback signal written only when the target asset is selected. Defaults to supported_strong.",
     )
+    _add_scope_filter_arguments(prove_next)
     prove_next.add_argument(
         "--dry-run",
         action="store_true",
@@ -1487,6 +1689,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open retrieval backends for deeper health checks. Defaults to lightweight checks only.",
     )
+    _add_scope_filter_arguments(status)
 
     doctor = subparsers.add_parser(
         "doctor",
@@ -1505,6 +1708,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Open retrieval backends for deeper health checks. Defaults to lightweight checks only.",
     )
+    _add_scope_filter_arguments(doctor)
 
     return parser
 
@@ -3910,6 +4114,7 @@ def _handle_review_candidates(args: argparse.Namespace) -> int:
             for candidate in candidates
             if candidate.get("knowledge_kind", candidate.get("candidate_type", "pattern")) == args.knowledge_kind
         ]
+    candidates = [candidate for candidate in candidates if _scope_filter_match(candidate, args)]
     queue = build_candidate_review_queue(candidates, workspace=str(workspace))
     output_path = (
         Path(args.output)
@@ -3930,13 +4135,31 @@ def _handle_review_candidates(args: argparse.Namespace) -> int:
 
 def _handle_validation_plan(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    bounded_limit = max(int(args.limit or 5), 1)
     status_payload = _build_status_payload(
         workspace=workspace,
-        limit=max(int(args.limit or 5), 1),
+        limit=bounded_limit,
         deep_retrieval_check=False,
     )
-    queue = status_payload["unproven_validation_queue"]
-    top_items = queue.get("top_items", [])[: max(int(args.limit or 5), 1)]
+    queue = _filter_unproven_validation_queue(status_payload["unproven_validation_queue"], args)
+    top_items = queue.get("top_items", [])[:bounded_limit]
+    governance_summary = status_payload.get("governance_summary") or build_governance_summary(
+        db_path,
+        workspace=str(workspace),
+        validation_limit=bounded_limit,
+    )
+    governance_queue = build_asset_validation_queue(
+        db_path,
+        workspace=str(workspace),
+        limit=bounded_limit,
+    )
+    governance_queue = _filter_governance_queue(governance_queue, args)
+    governance_summary = _filtered_governance_summary(governance_queue)
+    governance_views = {
+        "status": build_governance_status_view(governance_summary),
+        "validation_queue": build_validation_queue_view(governance_queue),
+    }
     plan_items = [
         {
             "rank": index,
@@ -3965,6 +4188,7 @@ def _handle_validation_plan(args: argparse.Namespace) -> int:
         "kind": "unproven_validation_plan",
         "workspace": str(workspace),
         "generated_at": now_utc(),
+        "scope_filters": _active_scope_filters(args),
         "asset_count": queue.get("asset_count", 0),
         "recent_topics": queue.get("recent_topics", []),
         "plan_count": len(plan_items),
@@ -3976,6 +4200,11 @@ def _handle_validation_plan(args: argparse.Namespace) -> int:
             "top_kind": queue.get("top_kind"),
             "kind_summary": queue.get("kind_summary", {}),
             "age_summary": queue.get("age_summary", {}),
+        },
+        "governance": {
+            "summary": governance_summary,
+            "queue": governance_queue,
+            "views": governance_views,
         },
     }
     output_path = (
@@ -3997,6 +4226,664 @@ def _handle_validation_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_governance_snapshot(*, workspace: Path, db_path: Path, limit: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    bounded_limit = max(int(limit or 1), 1)
+    governance_summary = build_governance_summary(
+        db_path,
+        workspace=str(workspace),
+        validation_limit=bounded_limit,
+    )
+    governance_queue = build_asset_validation_queue(
+        db_path,
+        workspace=str(workspace),
+        limit=bounded_limit,
+    )
+    governance_views = {
+        "status": build_governance_status_view(governance_summary),
+        "validation_queue": build_validation_queue_view(governance_queue),
+    }
+    return governance_summary, governance_queue, governance_views
+
+
+def _scope_filter_match(item: dict[str, Any], args: argparse.Namespace) -> bool:
+    requested_scope = getattr(args, "knowledge_scope", None)
+    if requested_scope and str(item.get("knowledge_scope") or "project") != requested_scope:
+        return False
+    requested_review_status = getattr(args, "review_status", None)
+    if requested_review_status and str(item.get("review_status") or "unproven") != requested_review_status:
+        return False
+    requested_quarantine_status = getattr(args, "quarantine_status", None)
+    if requested_quarantine_status and str(item.get("quarantine_status") or "active") != requested_quarantine_status:
+        return False
+    requested_asset_status = getattr(args, "asset_status", None)
+    if requested_asset_status and str(item.get("status") or "active") != requested_asset_status:
+        return False
+    profile = item.get("scope_profile", {}) if isinstance(item.get("scope_profile"), dict) else {}
+
+    requested_task_type = getattr(args, "task_type", None)
+    if requested_task_type and str(profile.get("task_type") or "").lower() != str(requested_task_type).lower():
+        return False
+
+    requested_module = getattr(args, "scope_module", None)
+    if requested_module:
+        item_module = str(profile.get("module") or "").lower()
+        expected_module = str(requested_module).lower()
+        if not item_module or (expected_module not in item_module and item_module not in expected_module):
+            return False
+
+    requested_language = getattr(args, "language", None)
+    if requested_language and str(profile.get("language") or "").lower() != str(requested_language).lower():
+        return False
+
+    requested_framework = getattr(args, "framework", None)
+    if requested_framework and str(profile.get("framework") or "").lower() != str(requested_framework).lower():
+        return False
+    return True
+
+
+def _active_scope_filters(args: argparse.Namespace) -> dict[str, Any]:
+    filters = {
+        "knowledge_scope": getattr(args, "knowledge_scope", None),
+        "review_status": getattr(args, "review_status", None),
+        "quarantine_status": getattr(args, "quarantine_status", None),
+        "asset_status": getattr(args, "asset_status", None),
+        "task_type": getattr(args, "task_type", None),
+        "module": getattr(args, "scope_module", None),
+        "language": getattr(args, "language", None),
+        "framework": getattr(args, "framework", None),
+    }
+    return {key: value for key, value in filters.items() if value not in {None, ""}}
+
+
+def _apply_governance_filter_presets(args: argparse.Namespace) -> None:
+    preset_flags = {
+        "only_deprecated": bool(getattr(args, "only_deprecated", False)),
+        "only_quarantined": bool(getattr(args, "only_quarantined", False)),
+        "only_needs_review": bool(getattr(args, "only_needs_review", False)),
+    }
+    active_presets = [name for name, enabled in preset_flags.items() if enabled]
+    if len(active_presets) > 1:
+        raise SystemExit(
+            "governance filter presets are mutually exclusive: "
+            + ", ".join(flag.replace("_", "-") for flag in active_presets)
+        )
+    if not active_presets:
+        return
+    preset = active_presets[0]
+    if preset == "only_deprecated":
+        if getattr(args, "quarantine_status", None) not in {None, "deprecated"}:
+            raise SystemExit("--only-deprecated conflicts with --quarantine-status")
+        if getattr(args, "asset_status", None) not in {None, "deprecated"}:
+            raise SystemExit("--only-deprecated conflicts with --asset-status")
+        args.quarantine_status = "deprecated"
+        args.asset_status = "deprecated"
+    elif preset == "only_quarantined":
+        if getattr(args, "quarantine_status", None) not in {None, "quarantined"}:
+            raise SystemExit("--only-quarantined conflicts with --quarantine-status")
+        args.quarantine_status = "quarantined"
+    elif preset == "only_needs_review":
+        if getattr(args, "review_status", None) not in {None, "needs_review"}:
+            raise SystemExit("--only-needs-review conflicts with --review-status")
+        args.review_status = "needs_review"
+
+
+def _filter_unproven_validation_queue(queue: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    items = [item for item in queue.get("top_items", []) if _scope_filter_match(item, args)]
+    kind_summary: dict[str, int] = {}
+    age_summary = {"0_7d": 0, "8_30d": 0, "31d_plus": 0, "unknown": 0}
+    for item in items:
+        knowledge_kind = str(item.get("knowledge_kind") or "pattern")
+        kind_summary[knowledge_kind] = kind_summary.get(knowledge_kind, 0) + 1
+        age_bucket = str(item.get("age_bucket") or "unknown")
+        age_summary[age_bucket] = age_summary.get(age_bucket, 0) + 1
+    return {
+        **queue,
+        "asset_count": len(items),
+        "kind_summary": dict(sorted(kind_summary.items())),
+        "age_summary": age_summary,
+        "top_kind": sorted(kind_summary.items(), key=lambda pair: (-pair[1], pair[0]))[0][0] if kind_summary else None,
+        "recommended_batch_size": min(len(items), 3),
+        "top_items": items,
+    }
+
+
+def _filter_governance_queue(queue: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    items = [item for item in queue.get("items", []) if _scope_filter_match(item, args)]
+    return {
+        "items": items,
+        "total_assets": len(items),
+        "pending_validation_count": sum(
+            1
+            for item in items
+            if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+        ),
+    }
+
+
+def _activation_matches_scope(activation: dict[str, Any], args: argparse.Namespace) -> bool:
+    if not _active_scope_filters(args):
+        return True
+    selected_assets = activation.get("selected_assets", [])
+    if not isinstance(selected_assets, list):
+        return False
+    return any(isinstance(asset, dict) and _scope_filter_match(asset, args) for asset in selected_assets)
+
+
+def _filtered_governance_summary(queue: dict[str, Any]) -> dict[str, Any]:
+    review_status_counts: dict[str, int] = {}
+    temperature_counts: dict[str, int] = {}
+    quarantine_status_counts: dict[str, int] = {}
+    conflict_asset_count = 0
+    deprecated_asset_count = 0
+    for item in queue.get("items", []):
+        review_status = str(item.get("review_status") or "unknown")
+        temperature = str(item.get("temperature") or "unknown")
+        quarantine_status = str(item.get("quarantine_status") or "active")
+        review_status_counts[review_status] = review_status_counts.get(review_status, 0) + 1
+        temperature_counts[temperature] = temperature_counts.get(temperature, 0) + 1
+        quarantine_status_counts[quarantine_status] = quarantine_status_counts.get(quarantine_status, 0) + 1
+        if quarantine_status == "deprecated" or str(item.get("status") or "").lower() == "deprecated":
+            deprecated_asset_count += 1
+        if item.get("conflicts_with"):
+            conflict_asset_count += 1
+    items = list(queue.get("items", []))
+    return {
+        "asset_count": len(items),
+        "review_status_counts": review_status_counts,
+        "temperature_counts": temperature_counts,
+        "quarantine_status_counts": quarantine_status_counts,
+        "deprecated_asset_count": deprecated_asset_count,
+        "conflict_asset_count": conflict_asset_count,
+        "pending_validation_count": int(queue.get("pending_validation_count", 0) or 0),
+        "top_validation_items": items[: min(5, len(items))],
+    }
+
+
+def _filter_review_queue(queue: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    items = [item for item in queue.get("items", []) if _scope_filter_match(item, args)]
+    status_summary = {
+        "needs_review": sum(1 for item in items if item.get("status") == "needs_review"),
+        "approved": sum(1 for item in items if item.get("status") == "approved"),
+        "new": sum(1 for item in items if item.get("status") == "new"),
+        "rejected": sum(1 for item in items if item.get("status") == "rejected"),
+        "promoted": sum(1 for item in items if item.get("status") == "promoted"),
+    }
+    return {
+        **queue,
+        "candidate_count": len(items),
+        "status_summary": status_summary,
+        "knowledge_kind_summary": build_knowledge_kind_summary(items),
+        "items": items,
+        "top_items": items[:5],
+    }
+
+
+def _apply_scope_filters_to_status_payload(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    filters = _active_scope_filters(args)
+    if not filters:
+        return payload
+    filtered = dict(payload)
+    filtered_review_queue = _filter_review_queue(payload.get("candidate_review_queue", {}), args)
+    filtered_unproven_queue = _filter_unproven_validation_queue(payload.get("unproven_validation_queue", {}), args)
+    governance_queue = _filter_governance_queue(payload.get("governance_validation_queue", {}), args)
+    governance_summary = _filtered_governance_summary(governance_queue)
+    governance_views = {
+        "status": build_governance_status_view(governance_summary),
+        "validation_queue": build_validation_queue_view(governance_queue),
+    }
+    filtered["candidate_review_queue"] = filtered_review_queue
+    filtered["unproven_validation_queue"] = filtered_unproven_queue
+    filtered["governance_validation_queue"] = governance_queue
+    filtered["governance_summary"] = governance_summary
+    filtered["governance_views"] = governance_views
+    filtered["scope_filters"] = filters
+    return filtered
+
+
+def _persist_asset_state(*, workspace: Path, asset: dict[str, Any]) -> list[dict[str, str]]:
+    write_warnings: list[dict[str, str]] = []
+    knowledge_scope = str(asset.get("knowledge_scope") or "project")
+    asset_type = str(asset.get("asset_type") or "pattern")
+    asset_id = str(asset.get("asset_id") or "")
+    asset_db_path = shared_db_path() if knowledge_scope == "cross-project" else default_db_path(workspace)
+    asset_path = (
+        default_shared_asset_path({"asset_type": asset_type, "asset_id": asset_id})
+        if knowledge_scope == "cross-project"
+        else memory_root_for_workspace(workspace) / "assets" / f"{asset_type}s" / f"{asset_id}.json"
+    )
+    _safe_sqlite_write(
+        workspace=workspace,
+        db_path=asset_db_path,
+        kind="asset_effectiveness_unwritten",
+        action=lambda target_db_path, asset=asset: upsert_asset(target_db_path, asset),
+    )
+    _, asset_save_warning = _save_workspace_json(
+        workspace=workspace,
+        output_path=asset_path,
+        payload=asset,
+        requested_output=None,
+        reason="default_asset_output_unwritable",
+    )
+    if asset_save_warning:
+        write_warnings.append(asset_save_warning)
+    return write_warnings
+
+
+def _asset_effectiveness_summary_from_assets(assets: list[dict[str, Any]]) -> dict[str, Any]:
+    review_status_summary: dict[str, int] = {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}
+    temperature_summary: dict[str, int] = {"hot": 0, "warm": 0, "neutral": 0, "cool": 0}
+    for asset in assets:
+        review_status = str(asset.get("review_status") or "unproven")
+        temperature = str(asset.get("temperature") or "neutral")
+        review_status_summary[review_status] = review_status_summary.get(review_status, 0) + 1
+        temperature_summary[temperature] = temperature_summary.get(temperature, 0) + 1
+    return {
+        "review_status": review_status_summary,
+        "temperature": temperature_summary,
+    }
+
+
+def _apply_replay_verdict(
+    *,
+    workspace: Path,
+    db_path: Path,
+    asset: dict[str, Any],
+    target_hit: bool,
+    help_signal: str | None,
+    updated_at: str,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]]:
+    updated = dict(asset)
+    governance = dict(updated.get("governance", {}))
+    replay_stats = governance.get("replay_stats")
+    if not isinstance(replay_stats, dict):
+        replay_stats = {"hit_count": 0, "miss_count": 0}
+    history = updated.get("governance_history", [])
+    if not isinstance(history, list):
+        history = []
+    write_warnings: list[dict[str, str]] = []
+
+    if target_hit:
+        replay_stats["hit_count"] = int(replay_stats.get("hit_count", 0) or 0) + 1
+        replay_stats["miss_count"] = 0
+        feedback_stats = summarize_asset_feedback(db_path, asset_ids=[str(updated.get("asset_id") or "")])
+        updated = apply_asset_effectiveness(
+            updated,
+            feedback_stats.get(str(updated.get("asset_id") or ""), {}),
+            updated_at=updated_at,
+        )
+        governance = dict(updated.get("governance", {}))
+        verdict = "replay_hit"
+        recommendation = (
+            "Replay exact hit confirmed this asset still helps. Keep it active, and consider unquarantine if it was isolated only for lack of evidence."
+        )
+    else:
+        replay_stats["miss_count"] = int(replay_stats.get("miss_count", 0) or 0) + 1
+        miss_count = int(replay_stats["miss_count"])
+        updated["temperature"] = "cool"
+        updated["review_status"] = "watch" if miss_count == 1 else "needs_review"
+        effectiveness_summary = dict(updated.get("effectiveness_summary", {}))
+        effectiveness_summary["temperature"] = updated["temperature"]
+        effectiveness_summary["review_status"] = updated["review_status"]
+        updated["effectiveness_summary"] = effectiveness_summary
+        governance["temperature"] = updated["temperature"]
+        governance["review_status"] = updated["review_status"]
+        governance.setdefault("quarantine_status", str(updated.get("quarantine_status") or "active"))
+        verdict = "replay_miss"
+        recommendation = (
+            "Replay missed twice; consider quarantine-asset or deprecating this asset if the next scoped validation also misses."
+            if miss_count >= 2
+            else "Replay missed once; keep it on watch and retry only in a closer scope match before promoting it further."
+        )
+
+    governance["replay_stats"] = replay_stats
+    history.append(
+        {
+            "action": "replay_verdict",
+            "verdict": verdict,
+            "target_hit": target_hit,
+            "help_signal": help_signal,
+            "updated_at": updated_at,
+            "replay_stats": dict(replay_stats),
+            "recommendation": recommendation,
+        }
+    )
+    updated["governance_history"] = history
+    updated["governance"] = governance
+    updated["updated_at"] = updated_at
+    write_warnings.extend(_persist_asset_state(workspace=workspace, asset=updated))
+    verdict_payload = {
+        "verdict": verdict,
+        "target_hit": target_hit,
+        "review_status": updated.get("review_status"),
+        "temperature": updated.get("temperature"),
+        "replay_stats": replay_stats,
+        "recommendation": recommendation,
+    }
+    return updated, verdict_payload, write_warnings
+
+
+def _handle_validation_queue(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    bounded_limit = max(int(args.limit or 10), 1)
+    governance_summary, governance_queue, governance_views = _build_governance_snapshot(
+        workspace=workspace,
+        db_path=db_path,
+        limit=bounded_limit,
+    )
+    governance_queue = _filter_governance_queue(governance_queue, args)
+    governance_summary = _filtered_governance_summary(governance_queue)
+    governance_views = {
+        "status": build_governance_status_view(governance_summary),
+        "validation_queue": build_validation_queue_view(governance_queue),
+    }
+    payload = {
+        "kind": "governance_validation_queue_report",
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "summary": governance_summary,
+        "queue": governance_queue,
+        "views": governance_views,
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "governance_validation_queue.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_governance_validation_queue_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "validation_queue": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
+def _handle_quarantine_asset(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    updated_at = now_utc()
+    asset = set_asset_quarantine_status(
+        db_path,
+        asset_id=str(args.asset_id),
+        quarantine_status=str(args.status),
+        reason=args.reason,
+        updated_at=updated_at,
+    )
+    if asset is None:
+        raise SystemExit(f"asset not found: {args.asset_id}")
+    write_warnings = _persist_asset_state(workspace=workspace, asset=asset)
+    governance_summary, governance_queue, governance_views = _build_governance_snapshot(
+        workspace=workspace,
+        db_path=db_path,
+        limit=10,
+    )
+    payload = {
+        "kind": "governance_quarantine_action",
+        "workspace": str(workspace),
+        "updated_at": updated_at,
+        "action": "set_quarantine_status",
+        "asset": {
+            "asset_id": asset.get("asset_id"),
+            "title": asset.get("title"),
+            "review_status": asset.get("review_status"),
+            "quarantine_status": asset.get("quarantine_status"),
+            "conflicts_with": asset.get("conflicts_with", []),
+            "governance_history_tail": list(asset.get("governance_history", []))[-3:],
+        },
+        "reason": args.reason,
+        "governance": {
+            "summary": governance_summary,
+            "queue": governance_queue,
+            "views": governance_views,
+        },
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace)
+        / "reviews"
+        / ("governance_unquarantine_asset.json" if str(args.status) == "active" else "governance_quarantine_asset.json")
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_governance_quarantine_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "quarantine_action": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    if write_warnings:
+        result["write_warnings"] = write_warnings
+    _print_json(result)
+    return 0
+
+
+def _handle_deprecate_asset(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    updated_at = now_utc()
+    asset = deprecate_asset(
+        db_path,
+        asset_id=str(args.asset_id),
+        reason=args.reason,
+        updated_at=updated_at,
+    )
+    if asset is None:
+        raise SystemExit(f"asset not found: {args.asset_id}")
+    write_warnings = _persist_asset_state(workspace=workspace, asset=asset)
+    governance_summary, governance_queue, governance_views = _build_governance_snapshot(
+        workspace=workspace,
+        db_path=db_path,
+        limit=10,
+    )
+    payload = {
+        "kind": "governance_deprecate_action",
+        "workspace": str(workspace),
+        "updated_at": updated_at,
+        "action": "deprecate_asset",
+        "asset": {
+            "asset_id": asset.get("asset_id"),
+            "title": asset.get("title"),
+            "status": asset.get("status"),
+            "review_status": asset.get("review_status"),
+            "temperature": asset.get("temperature"),
+            "quarantine_status": asset.get("quarantine_status"),
+            "conflicts_with": asset.get("conflicts_with", []),
+            "governance_history_tail": list(asset.get("governance_history", []))[-3:],
+        },
+        "reason": args.reason,
+        "governance": {
+            "summary": governance_summary,
+            "queue": governance_queue,
+            "views": governance_views,
+        },
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "governance_deprecate_asset.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_governance_deprecate_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "deprecate_action": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    if write_warnings:
+        result["write_warnings"] = write_warnings
+    _print_json(result)
+    return 0
+
+
+def _handle_reactivate_asset(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    updated_at = now_utc()
+    asset = reactivate_asset(
+        db_path,
+        asset_id=str(args.asset_id),
+        reason=args.reason,
+        updated_at=updated_at,
+    )
+    if asset is None:
+        raise SystemExit(f"asset not found: {args.asset_id}")
+    write_warnings = _persist_asset_state(workspace=workspace, asset=asset)
+    governance_summary, governance_queue, governance_views = _build_governance_snapshot(
+        workspace=workspace,
+        db_path=db_path,
+        limit=10,
+    )
+    payload = {
+        "kind": "governance_reactivate_action",
+        "workspace": str(workspace),
+        "updated_at": updated_at,
+        "action": "reactivate_asset",
+        "asset": {
+            "asset_id": asset.get("asset_id"),
+            "title": asset.get("title"),
+            "status": asset.get("status"),
+            "review_status": asset.get("review_status"),
+            "temperature": asset.get("temperature"),
+            "quarantine_status": asset.get("quarantine_status"),
+            "conflicts_with": asset.get("conflicts_with", []),
+            "governance_history_tail": list(asset.get("governance_history", []))[-3:],
+        },
+        "reason": args.reason,
+        "governance": {
+            "summary": governance_summary,
+            "queue": governance_queue,
+            "views": governance_views,
+        },
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "governance_reactivate_asset.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_governance_reactivate_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "reactivate_action": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    if write_warnings:
+        result["write_warnings"] = write_warnings
+    _print_json(result)
+    return 0
+
+
+def _handle_conflict_action(args: argparse.Namespace, *, resolve: bool) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    ensure_db(db_path)
+    if str(args.asset_id) == str(args.conflicting_asset_id):
+        raise SystemExit("asset-id and conflicting-asset-id must be different")
+    updated_at = now_utc()
+    if resolve:
+        left, right = resolve_asset_conflict(
+            db_path,
+            asset_id=str(args.asset_id),
+            conflicting_asset_id=str(args.conflicting_asset_id),
+            reason=args.reason,
+            updated_at=updated_at,
+        )
+    else:
+        left, right = mark_asset_conflict(
+            db_path,
+            asset_id=str(args.asset_id),
+            conflicting_asset_id=str(args.conflicting_asset_id),
+            updated_at=updated_at,
+        )
+    if left is None or right is None:
+        missing = args.asset_id if left is None else args.conflicting_asset_id
+        raise SystemExit(f"asset not found: {missing}")
+    write_warnings = [
+        *_persist_asset_state(workspace=workspace, asset=left),
+        *_persist_asset_state(workspace=workspace, asset=right),
+    ]
+    governance_summary, governance_queue, governance_views = _build_governance_snapshot(
+        workspace=workspace,
+        db_path=db_path,
+        limit=10,
+    )
+    payload = {
+        "kind": "governance_conflict_action",
+        "workspace": str(workspace),
+        "updated_at": updated_at,
+        "action": "resolve_conflict" if resolve else "mark_conflict",
+        "assets": [
+            {
+                "asset_id": left.get("asset_id"),
+                "title": left.get("title"),
+                "conflicts_with": left.get("conflicts_with", []),
+                "governance_history_tail": list(left.get("governance_history", []))[-3:],
+            },
+            {
+                "asset_id": right.get("asset_id"),
+                "title": right.get("title"),
+                "conflicts_with": right.get("conflicts_with", []),
+                "governance_history_tail": list(right.get("governance_history", []))[-3:],
+            },
+        ],
+        "governance": {
+            "summary": governance_summary,
+            "queue": governance_queue,
+            "views": governance_views,
+        },
+    }
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace)
+        / "reviews"
+        / ("governance_resolve_conflict.json" if resolve else "governance_mark_conflict.json")
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_governance_resolve_conflict_output_unwritable"
+        if resolve
+        else "default_governance_mark_conflict_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "conflict_action": payload}
+    if save_warning:
+        result["save_warning"] = save_warning
+    if write_warnings:
+        result["write_warnings"] = write_warnings
+    _print_json(result)
+    return 0
+
+
+def _handle_mark_conflict(args: argparse.Namespace) -> int:
+    return _handle_conflict_action(args, resolve=False)
+
+
+def _handle_resolve_conflict(args: argparse.Namespace) -> int:
+    return _handle_conflict_action(args, resolve=True)
+
+
 def _handle_prove_next(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
@@ -4006,7 +4893,7 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
         limit=bounded_limit,
         deep_retrieval_check=False,
     )
-    queue = status_payload["unproven_validation_queue"]
+    queue = _filter_unproven_validation_queue(status_payload["unproven_validation_queue"], args)
     top_items = queue.get("top_items", [])[:bounded_limit]
     result_items: list[dict[str, Any]] = []
 
@@ -4061,6 +4948,7 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
         target_rank = _target_asset_rank(selected_assets, asset_id)
         target_hit = target_rank is not None
         feedback_result = None
+        replay_verdict = None
         feedback_warnings: list[dict[str, str]] = []
         if target_hit and not args.dry_run:
             feedback_result, feedback_warnings = _apply_activation_feedback(
@@ -4076,6 +4964,16 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
                     "task_query": query_text,
                 },
             )
+        if not args.dry_run:
+            asset, replay_verdict, replay_warnings = _apply_replay_verdict(
+                workspace=workspace,
+                db_path=db_path,
+                asset=asset,
+                target_hit=target_hit,
+                help_signal=feedback_result.get("help_signal") if feedback_result else None,
+                updated_at=now_utc(),
+            )
+            feedback_warnings.extend(replay_warnings)
 
         result_items.append(
             {
@@ -4093,6 +4991,7 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
                 "target_asset_hit": target_hit,
                 "target_asset_rank": target_rank,
                 "help_signal_written": feedback_result.get("help_signal") if feedback_result else None,
+                "replay_verdict": replay_verdict,
                 "status": "proved" if feedback_result else "hit_without_feedback" if target_hit else "missed",
                 "activation_save_warning": activation_save_warning,
                 "activation_log_warning": activation_log_warning,
@@ -4554,6 +5453,20 @@ def _build_status_payload(
         activations=activations,
         limit=limit,
     )
+    governance_summary = build_governance_summary(
+        db_path,
+        workspace=str(workspace),
+        validation_limit=limit,
+    )
+    governance_validation_queue = build_asset_validation_queue(
+        db_path,
+        workspace=str(workspace),
+        limit=limit,
+    )
+    governance_views = {
+        "status": build_governance_status_view(governance_summary),
+        "validation_queue": build_validation_queue_view(governance_validation_queue),
+    }
 
     candidate_status_summary = {status: 0 for status in ALL_CANDIDATE_STATUSES}
     for candidate in candidates:
@@ -4781,6 +5694,9 @@ def _build_status_payload(
             "review_queue": review_queue["knowledge_kind_summary"],
         },
         "asset_review_backlog": asset_review_backlog,
+        "governance_summary": governance_summary,
+        "governance_validation_queue": governance_validation_queue,
+        "governance_views": governance_views,
         "unproven_validation_queue": unproven_validation_queue,
         "candidate_status_summary": candidate_status_summary,
         "candidate_review_queue": {
@@ -4863,6 +5779,7 @@ def _build_doctor_payload(
     deep_retrieval_check: bool,
     feedback_cleanup: dict[str, Any] | None = None,
     runtime_warnings: list[dict[str, Any]] | None = None,
+    scope_args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
     status_payload = _build_status_payload(
         workspace=workspace,
@@ -4871,6 +5788,8 @@ def _build_doctor_payload(
         feedback_cleanup=feedback_cleanup,
         runtime_warnings=runtime_warnings,
     )
+    if scope_args is not None:
+        status_payload = _apply_scope_filters_to_status_payload(status_payload, scope_args)
     memory_root = memory_root_for_workspace(workspace)
     local_milvus_path = default_milvus_db_path(workspace)
     shared_milvus_path = shared_milvus_db_path()
@@ -4888,6 +5807,16 @@ def _build_doctor_payload(
     asset_health = status_payload["asset_effectiveness_summary"]["review_status"]
     asset_backlog = status_payload["asset_review_backlog"]
     unproven_validation_queue = status_payload["unproven_validation_queue"]
+    governance_summary = status_payload.get("governance_summary") or {
+        "asset_count": int(counts.get("assets", 0) or 0),
+        "pending_validation_count": 0,
+        "conflict_asset_count": 0,
+        "review_status_counts": {},
+        "temperature_counts": {},
+        "quarantine_status_counts": {},
+        "top_validation_items": [],
+    }
+    governance_views = status_payload.get("governance_views") or {}
     primary_write_health = status_payload.get("primary_write_health") or {}
     hook_integration = status_payload.get("hook_integration") or {
         "integration_mode": DEFAULT_INTEGRATION_MODE,
@@ -5005,6 +5934,63 @@ def _build_doctor_payload(
                 "Use the unproven validation queue in status/dashboard to pick the next assets for real-task validation.",
             )
         )
+    governance_pending_validation = int(governance_summary.get("pending_validation_count", 0) or 0)
+    governance_conflict_assets = int(governance_summary.get("conflict_asset_count", 0) or 0)
+    governance_deprecated_assets = int(governance_summary.get("deprecated_asset_count", 0) or 0)
+    governance_quarantine_counts = governance_summary.get("quarantine_status_counts") or {}
+    quarantined_assets = int(governance_quarantine_counts.get("quarantined", 0) or 0)
+    top_governance_item = next(
+        (
+            item
+            for item in governance_summary.get("top_validation_items", [])
+            if isinstance(item, dict)
+        ),
+        {},
+    )
+    governance_headline = (
+        governance_views.get("status", {}).get("headline")
+        or build_governance_status_view(governance_summary).get("headline")
+        or "governance summary unavailable"
+    )
+    governance_status = (
+        "warn"
+        if governance_pending_validation > 0
+        or governance_conflict_assets > 0
+        or quarantined_assets > 0
+        or governance_deprecated_assets > 0
+        else "pass"
+    )
+    governance_recommendation = None
+    if governance_status == "warn":
+        if governance_pending_validation > 0 and top_governance_item.get("asset_id"):
+            governance_recommendation = (
+                f"Prioritize validation for {top_governance_item.get('asset_id')} "
+                f"({top_governance_item.get('suggested_action') or 'review'}) and clear governance backlog before promoting new broad-scope memory."
+            )
+        elif governance_conflict_assets > 0:
+            governance_recommendation = (
+                "Resolve or quarantine conflicting assets before letting them co-exist in the same retrieval scope."
+            )
+        elif quarantined_assets > 0:
+            governance_recommendation = (
+                "Review quarantined assets and decide whether they should stay isolated, be repaired, or be deprecated."
+            )
+        elif governance_deprecated_assets > 0:
+            governance_recommendation = (
+                "Review deprecated assets and decide whether any should stay retired or be reactivated with tighter scope and fresh replay evidence."
+            )
+    checks.append(
+        _diagnostic_check(
+            "governance_backlog",
+            governance_status,
+            (
+                f"Governance backlog: {governance_headline}; "
+                f"quarantined={quarantined_assets}, deprecated={governance_deprecated_assets}, conflicts={governance_conflict_assets}, "
+                f"pending_validation={governance_pending_validation}."
+            ),
+            governance_recommendation,
+        )
+    )
     missing = int(feedback.get("missing", 0) or 0)
     pending = int(feedback.get("pending", 0) or 0)
     oldest_unresolved = unresolved_activations[0] if unresolved_activations else None
@@ -5156,11 +6142,16 @@ def _build_doctor_payload(
             "local": local_lock,
             "shared": shared_lock,
         },
+        "governance": {
+            "summary": governance_summary,
+            "views": governance_views,
+        },
         "status": status_payload,
         "memory_root": str(memory_root),
         "local_milvus_db": str(local_milvus_path),
         "shared_milvus_db": str(shared_milvus_path),
         "counts": counts,
+        "scope_filters": _active_scope_filters(scope_args) if scope_args is not None else {},
     }
 
 
@@ -5238,6 +6229,7 @@ def _build_dashboard_payload(
     days: int,
     deep_retrieval_check: bool,
     runtime_warnings: list[dict[str, Any]] | None = None,
+    scope_args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
     workspace = workspace.resolve()
     db_path = default_db_path(workspace)
@@ -5249,11 +6241,17 @@ def _build_dashboard_payload(
         deep_retrieval_check=deep_retrieval_check,
         runtime_warnings=runtime_warnings,
     )
+    if scope_args is not None:
+        status_payload = _apply_scope_filters_to_status_payload(status_payload, scope_args)
 
     assets, candidates, activations, _, _ = _load_status_records(
         workspace=workspace,
         db_path=db_path,
     )
+    if scope_args is not None:
+        assets = [asset for asset in assets if _scope_filter_match(asset, scope_args)]
+        candidates = [candidate for candidate in candidates if _scope_filter_match(candidate, scope_args)]
+        activations = [activation for activation in activations if _activation_matches_scope(activation, scope_args)]
     assets = sorted(
         assets,
         key=lambda item: item.get("updated_at") or item.get("created_at") or "",
@@ -5283,6 +6281,7 @@ def _build_dashboard_payload(
             "source_context_summary": _source_context_summary(asset.get("source_context")),
             "content_policy": asset.get("content_policy"),
             "content_policy_summary": _content_policy_summary(asset.get("content_policy")),
+            "scope_profile": asset.get("scope_profile"),
             "last_used_at": asset.get("last_used_at"),
             "updated_at": asset.get("updated_at") or asset.get("created_at"),
         }
@@ -5300,6 +6299,7 @@ def _build_dashboard_payload(
             "source_context_summary": _source_context_summary(candidate.get("source_context")),
             "content_policy": candidate.get("content_policy"),
             "content_policy_summary": _content_policy_summary(candidate.get("content_policy")),
+            "scope_profile": candidate.get("scope_profile"),
             "updated_at": candidate.get("updated_at") or candidate.get("created_at"),
         }
         for candidate in _dashboard_item_rows(candidates, limit=bounded_limit)
@@ -5356,15 +6356,34 @@ def _build_dashboard_payload(
         }
         for day in asset_writes
     ]
-    feedback_summary = status_payload["activation_feedback_summary"]
+    filtered_review_queue = status_payload["candidate_review_queue"]
+    filtered_knowledge_kind_summary = {
+        "assets": build_knowledge_kind_summary(assets),
+        "candidates": build_knowledge_kind_summary(candidates),
+        "review_queue": filtered_review_queue.get("knowledge_kind_summary", build_knowledge_kind_summary([])),
+    }
+    filtered_feedback_summary = _summarize_activation_feedback(activations)
+    filtered_milvus_effectiveness = _summarize_milvus_retrieval_effectiveness(activations)
+    filtered_injection_policy_summary = _summarize_injection_policy(activations)
+    proof_tracked_assets = [
+        asset
+        for asset in assets
+        if str(asset.get("knowledge_kind", asset.get("asset_type", "pattern")) or "pattern") != CODEMAP
+    ]
+    filtered_asset_effectiveness_summary = _asset_effectiveness_summary_from_assets(proof_tracked_assets)
+    filtered_asset_review_backlog = _build_asset_review_backlog(
+        filtered_asset_effectiveness_summary["review_status"],
+        total_assets=len(proof_tracked_assets),
+    )
+    feedback_summary = filtered_feedback_summary
     supported_count = int(feedback_summary.get("supported_strong", 0) or 0) + int(
         feedback_summary.get("supported_weak", 0) or 0
     )
     resolved_feedback_count = supported_count + int(feedback_summary.get("unclear", 0) or 0) + int(
         feedback_summary.get("missing", 0) or 0
     )
-    total_assets = int(status_payload["asset_review_backlog"]["total_assets"] or 0)
-    healthy_assets = int(status_payload["asset_review_backlog"]["healthy_count"] or 0)
+    total_assets = int(filtered_asset_review_backlog["total_assets"] or 0)
+    healthy_assets = int(filtered_asset_review_backlog["healthy_count"] or 0)
     recent_writes = sum(item["assets"] + item["candidates"] + item["activations"] for item in write_frequency)
     asset_quality_ratio = _clamp_ratio(healthy_assets / total_assets) if total_assets else 0.0
     help_rate = _clamp_ratio(supported_count / resolved_feedback_count) if resolved_feedback_count else 0.0
@@ -5394,23 +6413,34 @@ def _build_dashboard_payload(
         "generated_at": now_utc(),
         "limit": bounded_limit,
         "days": bounded_days,
+        "scope_filters": _active_scope_filters(scope_args) if scope_args is not None else {},
         "status": status_payload,
+        "governance": {
+            "summary": status_payload.get("governance_summary", {}),
+            "views": {
+                **status_payload.get("governance_views", {}),
+                "dashboard": build_governance_dashboard_view(
+                    status_payload.get("governance_summary", {}),
+                    status_payload.get("governance_validation_queue", {}),
+                ),
+            },
+        },
         "cards": {
-            "assets": status_payload["counts"]["assets"],
-            "candidates": status_payload["counts"]["candidates"],
-            "activation_logs": status_payload["counts"]["activation_logs"],
-            "healthy_assets": status_payload["asset_review_backlog"]["healthy_count"],
-            "unproven_assets": status_payload["asset_review_backlog"]["unproven_count"],
-            "local_prior_assets": status_payload["knowledge_kind_summary"]["assets"]["local_prior_count"],
-            "high_priority_prior_assets": status_payload["knowledge_kind_summary"]["assets"]["high_priority_count"],
-            "governance_focus_assets": status_payload["knowledge_kind_summary"]["assets"]["governance_focus_count"],
-            "emotional_feedback_assets": status_payload["knowledge_kind_summary"]["assets"]["by_kind"].get(EMOTIONAL_FEEDBACK, 0),
-            "org_convention_assets": status_payload["knowledge_kind_summary"]["assets"]["by_kind"].get(ORG_CONVENTION, 0),
-            "system_prompt_items": status_payload["injection_policy_summary"]["channel_counts"]["system_prompt"],
-            "reference_summary_items": status_payload["injection_policy_summary"]["channel_counts"]["reference_summary"],
-            "milvus_selected_ratio": status_payload["milvus_retrieval_effectiveness"]["milvus_selected_ratio"],
-            "activation_selected_ratio": status_payload["milvus_retrieval_effectiveness"]["activation_selected_ratio"],
-            "stale_missing_feedback": status_payload["activation_feedback_summary"]["missing"],
+            "assets": len(assets),
+            "candidates": len(candidates),
+            "activation_logs": len(activations),
+            "healthy_assets": filtered_asset_review_backlog["healthy_count"],
+            "unproven_assets": filtered_asset_review_backlog["unproven_count"],
+            "local_prior_assets": filtered_knowledge_kind_summary["assets"]["local_prior_count"],
+            "high_priority_prior_assets": filtered_knowledge_kind_summary["assets"]["high_priority_count"],
+            "governance_focus_assets": filtered_knowledge_kind_summary["assets"]["governance_focus_count"],
+            "emotional_feedback_assets": filtered_knowledge_kind_summary["assets"]["by_kind"].get(EMOTIONAL_FEEDBACK, 0),
+            "org_convention_assets": filtered_knowledge_kind_summary["assets"]["by_kind"].get(ORG_CONVENTION, 0),
+            "system_prompt_items": filtered_injection_policy_summary["channel_counts"]["system_prompt"],
+            "reference_summary_items": filtered_injection_policy_summary["channel_counts"]["reference_summary"],
+            "milvus_selected_ratio": filtered_milvus_effectiveness["milvus_selected_ratio"],
+            "activation_selected_ratio": filtered_milvus_effectiveness["activation_selected_ratio"],
+            "stale_missing_feedback": filtered_feedback_summary["missing"],
         },
         "effectiveness_snapshot": {
             "overall_score": overall_score,
@@ -5456,20 +6486,20 @@ def _build_dashboard_payload(
         "unproven_validation_queue": status_payload["unproven_validation_queue"],
         "unproven_assets": unproven_rows,
         "activations": activation_rows,
-        "review_queue": status_payload["candidate_review_queue"],
-        "knowledge_kind_summary": status_payload["knowledge_kind_summary"],
-        "injection_policy_summary": status_payload["injection_policy_summary"],
+        "review_queue": filtered_review_queue,
+        "knowledge_kind_summary": filtered_knowledge_kind_summary,
+        "injection_policy_summary": filtered_injection_policy_summary,
         "knowledge_save_layers": status_payload["knowledge_save_layers"],
         "retrieval": {
             "milvus": status_payload["retrieval_backends"]["milvus"],
-            "effectiveness": status_payload["milvus_retrieval_effectiveness"],
+            "effectiveness": filtered_milvus_effectiveness,
         },
         "quality": {
-            "asset_effectiveness_summary": status_payload["asset_effectiveness_summary"],
-            "asset_review_backlog": status_payload["asset_review_backlog"],
-            "activation_feedback_summary": status_payload["activation_feedback_summary"],
-            "knowledge_kind_summary": status_payload["knowledge_kind_summary"],
-            "injection_policy_summary": status_payload["injection_policy_summary"],
+            "asset_effectiveness_summary": filtered_asset_effectiveness_summary,
+            "asset_review_backlog": filtered_asset_review_backlog,
+            "activation_feedback_summary": filtered_feedback_summary,
+            "knowledge_kind_summary": filtered_knowledge_kind_summary,
+            "injection_policy_summary": filtered_injection_policy_summary,
             "knowledge_save_layers": status_payload["knowledge_save_layers"],
         },
     }
@@ -5678,6 +6708,9 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
     quality = payload["quality"]
     kind_summary = payload["knowledge_kind_summary"]
     injection_summary = payload["injection_policy_summary"]
+    governance = payload.get("governance", {})
+    governance_status = governance.get("views", {}).get("status", {})
+    governance_dashboard = governance.get("views", {}).get("dashboard", {})
     unproven_queue = payload.get("unproven_validation_queue") or {"asset_count": 0, "top_kind": None, "recommended_batch_size": 0, "age_summary": {}, "kind_summary": {}}
     raw_json = html_escape(json.dumps(payload, ensure_ascii=False, indent=2), quote=False)
     write_rows = [
@@ -5766,6 +6799,18 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
             ("Candidates", kind_summary["candidates"]),
             ("Review queue", kind_summary["review_queue"]),
         ]
+    ]
+    governance_top_items = governance_dashboard.get("cards", {}).get("top_validation_items", [])
+    governance_rows = [
+        [
+            item.get("asset_id"),
+            item.get("knowledge_kind"),
+            item.get("review_status"),
+            item.get("suggested_action"),
+            item.get("validation_priority"),
+            "；".join(item.get("reasons", [])[:2]),
+        ]
+        for item in governance_top_items
     ]
 
     return f"""<!doctype html>
@@ -5885,6 +6930,16 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
   </section>
 
   <section class="panel">
+    <h2>Governance Status</h2>
+    <div class="metric-line"><span>Headline</span><strong>{_safe_text(governance_status.get("headline") or "n/a")}</strong></div>
+    <div class="metric-line"><span>Review status counts</span><strong>{_safe_text(governance_status.get("cards", {}).get("review_status_counts"))}</strong></div>
+    <div class="metric-line"><span>Quarantine counts</span><strong>{_safe_text(governance_status.get("cards", {}).get("quarantine_status_counts"))}</strong></div>
+    <div class="metric-line"><span>Deprecated assets</span><strong>{_safe_text(governance_status.get("cards", {}).get("deprecated_asset_count"))}</strong></div>
+    <div class="metric-line"><span>Top validation action</span><strong>{_safe_text(governance_status.get("focus", {}).get("top_validation_action") or "none")}</strong></div>
+    {_render_dashboard_table(["Asset ID", "Kind", "Review", "Action", "Priority", "Reasons"], governance_rows)}
+  </section>
+
+  <section class="panel">
     <h2>Write Frequency</h2>
     {_render_dashboard_table(["Date", "Assets", "Candidates", "Activations"], write_rows)}
   </section>
@@ -5946,6 +7001,7 @@ def _handle_dashboard(args: argparse.Namespace) -> int:
         days=args.days,
         deep_retrieval_check=args.deep_retrieval_check,
         runtime_warnings=[cleanup_warning] if cleanup_warning else None,
+        scope_args=args,
     )
     if feedback_cleanup is not None:
         payload["status"]["feedback_cleanup"] = feedback_cleanup
@@ -5985,6 +7041,9 @@ def _handle_dashboard(args: argparse.Namespace) -> int:
             "effectiveness_snapshot": payload["effectiveness_snapshot"],
             "review_queue_count": payload["review_queue"]["candidate_count"],
             "unproven_validation_count": payload["unproven_validation_queue"]["asset_count"],
+            "governance_headline": payload.get("governance", {}).get("views", {}).get("status", {}).get("headline"),
+            "governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("status", {}).get("cards", {}).get("pending_validation_count"),
+            "scope_filters": payload.get("scope_filters", {}),
         },
     }
     if save_warning:
@@ -6005,6 +7064,7 @@ def _handle_status(args: argparse.Namespace) -> int:
         feedback_cleanup=feedback_cleanup,
         runtime_warnings=[cleanup_warning] if cleanup_warning else None,
     )
+    payload = _apply_scope_filters_to_status_payload(payload, args)
     output_path = (
         Path(args.output)
         if args.output
@@ -6035,6 +7095,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
         deep_retrieval_check=args.deep_retrieval_check,
         feedback_cleanup=feedback_cleanup,
         runtime_warnings=[cleanup_warning] if cleanup_warning else None,
+        scope_args=args,
     )
     output_path = (
         Path(args.output)
@@ -6058,6 +7119,7 @@ def _handle_doctor(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
+    _apply_governance_filter_presets(args)
 
     if args.command == "ingest":
         return _handle_ingest(args)
@@ -6095,6 +7157,21 @@ def main() -> int:
         return _handle_review_candidates(args)
     if args.command == "validation-plan":
         return _handle_validation_plan(args)
+    if args.command == "validation-queue":
+        return _handle_validation_queue(args)
+    if args.command == "quarantine-asset":
+        return _handle_quarantine_asset(args)
+    if args.command == "unquarantine-asset":
+        args.status = "active"
+        return _handle_quarantine_asset(args)
+    if args.command == "deprecate-asset":
+        return _handle_deprecate_asset(args)
+    if args.command == "reactivate-asset":
+        return _handle_reactivate_asset(args)
+    if args.command == "mark-conflict":
+        return _handle_mark_conflict(args)
+    if args.command == "resolve-conflict":
+        return _handle_resolve_conflict(args)
     if args.command == "prove-next":
         return _handle_prove_next(args)
     if args.command == "project-prompt":

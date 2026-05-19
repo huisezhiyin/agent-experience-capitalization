@@ -6039,9 +6039,17 @@ def _build_doctor_payload(
     local_milvus_permission_induced = _milvus_runtime_probe_cause(local_milvus.get("runtime_probe")) == "permission_or_sandbox"
     local_milvus_status = "pass" if local_milvus["status"] == "ready" else "warn"
     milvus_backend_label = "Hosted Milvus" if local_milvus.get("mode") == "remote" else "Local Milvus Lite"
+    local_runtime_probe = local_milvus.get("runtime_probe") or {}
+    local_milvus_reason = (
+        local_milvus.get("degraded_reason")
+        or local_runtime_probe.get("reason")
+        or "no degraded reason"
+    )
     milvus_recommendation = (
         "Set EXPCAP_RETRIEVAL_INDEX_URI or switch EXPCAP_RETRIEVAL_BACKEND back to milvus-lite."
         if local_milvus.get("degraded_reason") == "missing_retrieval_index_uri"
+        else "pymilvus is unavailable in the current Python environment; install the Milvus client extras/dependencies before treating this as a lock or runtime-path issue."
+        if local_milvus_reason in {"pymilvus_unavailable", "client_unavailable"}
         else "Milvus runtime probing looks blocked by sandbox or filesystem permissions; verify in a less restricted environment or provide a writable runtime path before treating this as a real retrieval outage."
         if local_milvus.get("degraded_reason") == "unix_socket_bind_unavailable" and local_milvus_permission_induced
         else "Lock metadata points to a dead pid; clear the stale lock or run a reset before retrying Milvus."
@@ -6056,7 +6064,7 @@ def _build_doctor_payload(
                 f"{milvus_backend_label} is {local_milvus['status']} "
                 f"({local_milvus.get('degraded_reason') or 'no degraded reason'}; permission/sandbox-induced runtime probe degradation)."
                 if local_milvus.get("degraded_reason") == "unix_socket_bind_unavailable" and local_milvus_permission_induced
-                else f"{milvus_backend_label} is {local_milvus['status']} ({local_milvus.get('degraded_reason') or 'no degraded reason'})."
+                else f"{milvus_backend_label} is {local_milvus['status']} ({local_milvus_reason})."
             ),
             None
             if local_milvus_status == "pass"
@@ -6711,6 +6719,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
     governance = payload.get("governance", {})
     governance_status = governance.get("views", {}).get("status", {})
     governance_dashboard = governance.get("views", {}).get("dashboard", {})
+    governance_validation = governance.get("views", {}).get("validation_queue", {})
     unproven_queue = payload.get("unproven_validation_queue") or {"asset_count": 0, "top_kind": None, "recommended_batch_size": 0, "age_summary": {}, "kind_summary": {}}
     raw_json = html_escape(json.dumps(payload, ensure_ascii=False, indent=2), quote=False)
     write_rows = [
@@ -6932,6 +6941,7 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
   <section class="panel">
     <h2>Governance Status</h2>
     <div class="metric-line"><span>Headline</span><strong>{_safe_text(governance_status.get("headline") or "n/a")}</strong></div>
+    <div class="metric-line"><span>Pending validation actions</span><strong>{_safe_text(governance_status.get("cards", {}).get("pending_validation_count"))}</strong></div>
     <div class="metric-line"><span>Review status counts</span><strong>{_safe_text(governance_status.get("cards", {}).get("review_status_counts"))}</strong></div>
     <div class="metric-line"><span>Quarantine counts</span><strong>{_safe_text(governance_status.get("cards", {}).get("quarantine_status_counts"))}</strong></div>
     <div class="metric-line"><span>Deprecated assets</span><strong>{_safe_text(governance_status.get("cards", {}).get("deprecated_asset_count"))}</strong></div>
@@ -6968,7 +6978,8 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
 
   <section class="panel">
     <h2>Unproven Validation Queue</h2>
-    <div class="metric-line"><span>Backlog</span><strong>{_safe_text(unproven_queue.get("asset_count", 0))}</strong></div>
+    <div class="metric-line"><span>Unproven asset pool</span><strong>{_safe_text(unproven_queue.get("asset_count", 0))}</strong></div>
+    <div class="metric-line"><span>Visible governance replay items</span><strong>{_safe_text(governance_validation.get("summary", {}).get("visible_pending_validation_count", 0))}</strong></div>
     <div class="metric-line"><span>Top kind</span><strong>{_safe_text(unproven_queue.get("top_kind") or "none")}</strong></div>
     <div class="metric-line"><span>Recommended batch</span><strong>{_safe_text(unproven_queue.get("recommended_batch_size", 0))}</strong></div>
     <div class="metric-line"><span>Age buckets</span><strong>{_safe_text(unproven_queue.get("age_summary"))}</strong></div>
@@ -7043,6 +7054,17 @@ def _handle_dashboard(args: argparse.Namespace) -> int:
             "unproven_validation_count": payload["unproven_validation_queue"]["asset_count"],
             "governance_headline": payload.get("governance", {}).get("views", {}).get("status", {}).get("headline"),
             "governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("status", {}).get("cards", {}).get("pending_validation_count"),
+            "validation_counts": {
+                "review_queue_count": payload["review_queue"]["candidate_count"],
+                "governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("status", {}).get("cards", {}).get("pending_validation_count"),
+                "visible_governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("validation_queue", {}).get("summary", {}).get("visible_pending_validation_count"),
+                "unproven_validation_asset_count": payload["unproven_validation_queue"]["asset_count"],
+                "notes": {
+                    "governance_pending_validation_count": "Total governance actions across the full asset set, independent of the current display limit.",
+                    "visible_governance_pending_validation_count": "Governance actions currently visible in the limited validation queue panel.",
+                    "unproven_validation_asset_count": "Broader pool of unproven assets that may need future validation work.",
+                },
+            },
             "scope_filters": payload.get("scope_filters", {}),
         },
     }

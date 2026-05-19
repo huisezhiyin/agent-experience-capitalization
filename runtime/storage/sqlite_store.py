@@ -994,15 +994,25 @@ def build_asset_validation_queue(
         ),
         reverse=True,
     )
+    total_pending_validation_count = sum(
+        1
+        for item in queue_items
+        if item["suggested_action"] in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+    )
+    visible_items = queue_items
     if limit is not None:
-        queue_items = queue_items[:limit]
+        visible_items = queue_items[:limit]
 
     return {
-        "items": queue_items,
+        "items": visible_items,
         "total_assets": len(assets),
-        "pending_validation_count": sum(
-            1 for item in queue_items if item["suggested_action"] in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+        "visible_items_count": len(visible_items),
+        "visible_pending_validation_count": sum(
+            1
+            for item in visible_items
+            if item["suggested_action"] in {"replay", "replay_or_quarantine", "review_or_quarantine"}
         ),
+        "pending_validation_count": total_pending_validation_count,
     }
 
 

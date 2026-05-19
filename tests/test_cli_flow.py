@@ -2761,6 +2761,8 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("Effectiveness Snapshot", html)
             self.assertIn("Backend Runtime", html)
             self.assertIn("Unproven Validation Queue", html)
+            self.assertIn("Pending validation actions", html)
+            self.assertIn("Unproven asset pool", html)
             self.assertIn("Local Prior Distribution", html)
             self.assertIn("Governance focus", html)
             self.assertIn("Org Conventions", html)
@@ -2778,6 +2780,14 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["dashboard"]["cards"]["reference_summary_items"], 1)
             self.assertIn("effectiveness_snapshot", payload["dashboard"])
             self.assertEqual(payload["dashboard"]["unproven_validation_count"], 0)
+            self.assertEqual(payload["dashboard"]["validation_counts"]["review_queue_count"], 0)
+            self.assertEqual(payload["dashboard"]["validation_counts"]["governance_pending_validation_count"], 0)
+            self.assertEqual(payload["dashboard"]["validation_counts"]["visible_governance_pending_validation_count"], 0)
+            self.assertEqual(payload["dashboard"]["validation_counts"]["unproven_validation_asset_count"], 0)
+            self.assertIn(
+                "Total governance actions",
+                payload["dashboard"]["validation_counts"]["notes"]["governance_pending_validation_count"],
+            )
             self.assertEqual(dashboard["cards"]["healthy_assets"], 2)
             self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["by_kind"]["preference"], 1)
             self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["by_kind"]["org_convention"], 1)
@@ -4436,6 +4446,97 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("2 assets", validation_check["summary"])
         self.assertIn("pending_validation", governance_check["summary"])
         self.assertEqual(doctor["governance"]["summary"]["pending_validation_count"], 0)
+
+    def test_build_doctor_payload_reports_missing_pymilvus_without_lock_advice(self) -> None:
+        status_payload = {
+            "counts": {"traces": 0, "episodes": 0, "candidates": 0, "assets": 0, "activation_logs": 0},
+            "retrieval_backends": {
+                "sqlite": {
+                    "available": True,
+                    "source_mode": "primary_sqlite",
+                    "asset_rows": 0,
+                    "candidate_rows": 0,
+                    "activation_log_rows": 0,
+                },
+                "milvus": {
+                    "local": {
+                        "status": "unavailable",
+                        "mode": "local",
+                        "available": False,
+                        "runtime_available": False,
+                        "degraded_reason": None,
+                        "runtime_probe": {
+                            "available": False,
+                            "reason": "pymilvus_unavailable",
+                            "successful_probe_path": None,
+                            "probe_paths": [],
+                            "errors": [],
+                        },
+                    },
+                },
+            },
+            "milvus_retrieval_effectiveness": {
+                "selected_from_milvus": 0,
+                "selected_total": 0,
+                "activations_with_milvus_selected": 0,
+                "activation_count": 0,
+                "activation_selected_ratio": 0.0,
+                "avg_selected_vector_score": 0.0,
+            },
+            "activation_feedback_summary": {
+                "supported_strong": 0,
+                "supported_weak": 0,
+                "pending": 0,
+                "missing": 0,
+            },
+            "unresolved_activations": [],
+            "candidate_review_queue": {"candidate_count": 0},
+            "unproven_validation_queue": {"asset_count": 0, "top_items": []},
+            "asset_effectiveness_summary": {"review_status": {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}},
+            "asset_review_backlog": {
+                "healthy_count": 0,
+                "total_assets": 0,
+                "unproven_count": 0,
+                "unproven_ratio": 0.0,
+            },
+            "governance_summary": {
+                "asset_count": 0,
+                "pending_validation_count": 0,
+                "conflict_asset_count": 0,
+                "review_status_counts": {},
+                "temperature_counts": {},
+                "quarantine_status_counts": {},
+                "top_validation_items": [],
+            },
+            "governance_views": {"status": {"headline": "assets=0 | pending_validation=0 | conflicts=0"}},
+            "primary_write_health": {"status": "primary_writable", "failed_targets": []},
+            "hook_integration": {"recent_events": [], "last_event": None, "codex": {"files_present": True}, "claude": {"files_present": False}},
+        }
+        clean_lock = {
+            "lock_path": "/tmp/local.lock",
+            "lock_exists": True,
+            "locked": False,
+            "lock_error": None,
+            "metadata_raw": "",
+            "metadata": {},
+            "pid_exists": None,
+            "age_seconds": None,
+            "stale_hint": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            cli_main, "_build_status_payload", return_value=status_payload
+        ), patch.object(cli_main, "milvus_lock_summary", side_effect=[clean_lock, clean_lock]):
+            doctor = cli_main._build_doctor_payload(
+                workspace=(Path(tmpdir) / "workspace").resolve(),
+                limit=3,
+                deep_retrieval_check=False,
+            )
+
+        local_milvus_check = next(item for item in doctor["checks"] if item["name"] == "local_milvus")
+        self.assertIn("pymilvus_unavailable", local_milvus_check["summary"])
+        self.assertIn("pymilvus", local_milvus_check["recommendation"])
+        self.assertNotIn("locked", local_milvus_check["recommendation"])
 
     def test_build_doctor_payload_surfaces_governance_backlog(self) -> None:
         status_payload = {

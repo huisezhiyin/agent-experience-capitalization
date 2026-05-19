@@ -18,6 +18,8 @@ def build_validation_queue_view(queue: dict[str, Any]) -> dict[str, Any]:
         "summary": {
             "total_assets": int(queue.get("total_assets", 0) or 0),
             "pending_validation_count": int(queue.get("pending_validation_count", 0) or 0),
+            "visible_items_count": int(queue.get("visible_items_count", len(items)) or 0),
+            "visible_pending_validation_count": int(queue.get("visible_pending_validation_count", 0) or 0),
             "action_counts": action_counts,
             "review_status_counts": review_status_counts,
         },

@@ -569,6 +569,17 @@ def _ensure_collection(client: Any) -> None:
     )
 
 
+def _ensure_collection_loaded(client: Any) -> bool:
+    load_collection = getattr(client, "load_collection", None)
+    if not callable(load_collection):
+        return True
+    try:
+        load_collection(collection_name=_milvus_collection_name())
+    except Exception:
+        return False
+    return True
+
+
 def prepare_asset_document(asset: dict[str, Any]) -> dict[str, Any]:
     scope = asset.get("scope", {})
     raw_workspace = asset.get("workspace")
@@ -709,6 +720,8 @@ def search_asset_vectors(
             if not client.has_collection(collection_name=_milvus_collection_name()):
                 return []
         except Exception:
+            return []
+        if not _ensure_collection_loaded(client):
             return []
 
         output_fields = [

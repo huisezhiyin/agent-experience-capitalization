@@ -127,6 +127,7 @@ from runtime.storage.sqlite_store import (
 ALL_CANDIDATE_STATUSES = ("new", "needs_review", "approved", "rejected", "promoted")
 DEFAULT_REVIEW_QUEUE_STATUSES = ("needs_review", "approved", "new")
 DEFAULT_FEEDBACK_PENDING_HOURS = 24.0
+SELF_REFERENTIAL_VALIDATION_COOLDOWN_HOURS = 72.0
 STALE_FEEDBACK_HELP_SIGNAL = "unclear"
 PROJECT_PROMPT_MANAGED_START = "<!-- EXPCAP PROJECT PROMOTED START -->"
 PROJECT_PROMPT_MANAGED_END = "<!-- EXPCAP PROJECT PROMOTED END -->"
@@ -397,7 +398,11 @@ def _add_scope_filter_arguments(parser: argparse.ArgumentParser) -> None:
         )
 
 
-def _is_fresh_self_referential_validation_asset(asset: dict[str, Any]) -> bool:
+def _is_fresh_self_referential_validation_asset(
+    asset: dict[str, Any],
+    *,
+    reference_now: datetime | None = None,
+) -> bool:
     """Skip freshly-generated meta assets that only describe the proof workflow itself.
 
     These assets are useful as historical trace output, but if they immediately top the
@@ -410,8 +415,11 @@ def _is_fresh_self_referential_validation_asset(asset: dict[str, Any]) -> bool:
         return False
     if updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=timezone.utc)
-    age_hours = max((datetime.now(timezone.utc) - updated_at).total_seconds() / 3600.0, 0.0)
-    if age_hours > 24.0:
+    reference_now = reference_now or datetime.now(timezone.utc)
+    if reference_now.tzinfo is None:
+        reference_now = reference_now.replace(tzinfo=timezone.utc)
+    age_hours = max((reference_now - updated_at).total_seconds() / 3600.0, 0.0)
+    if age_hours > SELF_REFERENTIAL_VALIDATION_COOLDOWN_HOURS:
         return False
 
     title = str(asset.get("title") or "").lower()
@@ -697,13 +705,23 @@ def _build_unproven_validation_queue(
     limit: int,
 ) -> dict[str, Any]:
     recent_topics = _recent_validation_topics(activations)
+    asset_timestamps = [
+        parsed
+        for parsed in (
+            _parse_datetime(asset.get("updated_at") or asset.get("created_at"))
+            for asset in assets
+            if asset.get("review_status", "unproven") == "unproven"
+        )
+        if parsed is not None
+    ]
+    reference_now = max(asset_timestamps) if asset_timestamps else datetime.now(timezone.utc)
     queue_items: list[dict[str, Any]] = []
     kind_summary: dict[str, int] = {}
     age_summary = {"0_7d": 0, "8_30d": 0, "31d_plus": 0, "unknown": 0}
     for asset in assets:
         if asset.get("review_status", "unproven") != "unproven":
             continue
-        if _is_fresh_self_referential_validation_asset(asset):
+        if _is_fresh_self_referential_validation_asset(asset, reference_now=reference_now):
             continue
         title = str(asset.get("title") or "")
         content = str(asset.get("content") or "")
@@ -1714,7 +1732,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _print_json(payload: Any) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
 
 
 def _infer_activation_help_signal(*, verification_status: str, result_status: str) -> str:
@@ -3810,10 +3828,12 @@ def _build_milvus_benchmark_payload(
             {**item, "milvus_index": "shared"}
             for item in shared_results
         ]
-        results = sorted(results, key=lambda item: float(item.get("vector_score", 0.0) or 0.0), reverse=True)[
-            :bounded_limit
-        ]
-        if not results and not milvus_is_available:
+        results = sorted(
+            results,
+            key=lambda item: _benchmark_result_rank(item, sample["query"]),
+            reverse=True,
+        )[:bounded_limit]
+        if not results:
             results = _state_index_benchmark_fallback_results(
                 db_path=db_path,
                 workspace=workspace,
@@ -3895,7 +3915,13 @@ def _build_milvus_benchmark_payload(
         },
         "fallback_retrieval": {
             "used": fallback_sample_count > 0,
-            "reason": "milvus_unavailable" if not milvus_is_available else None,
+            "reason": (
+                "milvus_unavailable"
+                if fallback_sample_count > 0 and not milvus_is_available
+                else "empty_milvus_results"
+                if fallback_sample_count > 0
+                else None
+            ),
             "sample_count": fallback_sample_count,
         },
         "limit": bounded_limit,
@@ -3952,6 +3978,27 @@ def _result_matches_expected_source_document(item: dict[str, Any], expected_sour
 
 def _benchmark_tokens(value: str) -> set[str]:
     return {token for token in re.findall(r"[a-z0-9_]+", value.lower()) if len(token) > 1}
+
+
+def _benchmark_result_rank(item: dict[str, Any], query_text: str) -> tuple[float, float, str]:
+    query_tokens = _benchmark_tokens(query_text)
+    text = " ".join(
+        str(item.get(key) or "")
+        for key in ("title", "content", "source_document", "knowledge_kind", "asset_type")
+    )
+    text_tokens = _benchmark_tokens(text)
+    lexical_score = 0.0
+    if query_tokens:
+        lexical_score = len(query_tokens & text_tokens) / len(query_tokens)
+    source_document = str(item.get("source_document") or "").lower()
+    lowered_query = query_text.lower()
+    if source_document and source_document in lowered_query:
+        lexical_score += 0.1
+    return (
+        round(lexical_score, 6),
+        float(item.get("vector_score", 0.0) or 0.0),
+        str(item.get("asset_id") or ""),
+    )
 
 
 def _state_index_benchmark_fallback_results(

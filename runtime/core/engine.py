@@ -184,6 +184,10 @@ def _task_tokens(value: str) -> list[str]:
     return _unique_preserve_order([item for item in tokens if len(item) >= 3 and not item.isdigit()])
 
 
+def _normalized_match_text(value: str) -> str:
+    return " ".join(_task_tokens(value))
+
+
 def _build_turning_points(
     *,
     errors: list[str],
@@ -875,6 +879,9 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
     knowledge_kind = asset.get("knowledge_kind", asset.get("asset_type", "pattern"))
     vector_score = float(asset.get("vector_score", 0.0))
     task_tokens = _task_tokens(task)
+    normalized_task_text = _normalized_match_text(task)
+    normalized_title = _normalized_match_text(str(asset.get("title") or ""))
+    normalized_content = _normalized_match_text(str(asset.get("content") or ""))
     title_hits = [token for token in task_tokens if token in title]
     content_hits = [token for token in task_tokens if token in content]
     evidence: list[str] = []
@@ -994,6 +1001,13 @@ def _match_details(task: str, scope: dict[str, str], asset: dict[str, Any], work
         score += distinctive_bonus
         evidence_bonus += distinctive_bonus
         evidence.append(f"特征关键词命中：{', '.join(distinctive_hits[:3])}")
+    if normalized_task_text and (
+        normalized_task_text in normalized_title or normalized_task_text in normalized_content
+    ):
+        exact_phrase_bonus = 0.42
+        score += exact_phrase_bonus
+        evidence_bonus += exact_phrase_bonus
+        evidence.append("任务短语与资产标题/内容精确对齐")
     if asset.get("status") == "active":
         score += 0.05
         evidence_bonus += 0.05

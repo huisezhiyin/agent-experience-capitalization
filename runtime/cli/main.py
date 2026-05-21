@@ -2469,6 +2469,29 @@ def _build_persistence_summary(
     }
 
 
+def _derive_memory_root_mode(
+    *,
+    primary_write_health: dict[str, Any],
+    sqlite_backend: dict[str, Any],
+    runtime_degradation_summary: dict[str, Any],
+) -> str:
+    primary_status = str(primary_write_health.get("status") or "unknown")
+    state_counts = runtime_degradation_summary.get("state_counts") or {}
+    if (
+        primary_status == "fallback_only"
+        or bool(sqlite_backend.get("fallback_in_use", False))
+        or int(state_counts.get("fallback_active", 0) or 0) > 0
+    ):
+        return "fallback_active"
+    if (
+        primary_status == "partial_primary_write"
+        or int(state_counts.get("degraded_primary", 0) or 0) > 0
+        or int(state_counts.get("hard_failure", 0) or 0) > 0
+    ):
+        return "degraded_primary"
+    return "primary_only"
+
+
 def _upsert_warning(*, kind: str, path: Path, error: BaseException) -> dict[str, str]:
     warning = {
         "kind": kind,
@@ -4168,15 +4191,22 @@ def _handle_review_candidates(args: argparse.Namespace) -> int:
         if args.output
         else memory_root_for_workspace(workspace) / "reviews" / "candidate_review_queue.json"
     )
-    save_json(output_path, queue)
-    _print_json(
-        {
-            "saved_to": str(output_path),
-            "candidate_count": queue["candidate_count"],
-            "review_queue": queue,
-            "action_result": action_result,
-        }
+    saved_to, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=queue,
+        requested_output=args.output,
+        reason="default_candidate_review_queue_output_unwritable",
     )
+    result = {
+        "saved_to": str(saved_to),
+        "candidate_count": queue["candidate_count"],
+        "review_queue": queue,
+        "action_result": action_result,
+    }
+    if save_warning is not None:
+        result["save_warning"] = save_warning
+    _print_json(result)
     return 0
 
 
@@ -5663,7 +5693,11 @@ def _build_status_payload(
         sqlite_backend=sqlite_backend,
     )
     backend_runtime = {
-        "memory_root_mode": "fallback_active" if fallback_runtime_present else "primary_only",
+        "memory_root_mode": _derive_memory_root_mode(
+            primary_write_health=primary_write_health,
+            sqlite_backend=sqlite_backend,
+            runtime_degradation_summary=runtime_degradation_summary,
+        ),
         "primary_memory_root": str(memory_root),
         "fallback_memory_root": str(fallback_root),
         "fallback_memory_root_present": fallback_runtime_present,
@@ -6735,6 +6769,7 @@ def _render_backend_runtime_panel(payload: dict[str, Any]) -> str:
     summary = {
         "primary_only": "Running on primary storage only.",
         "fallback_active": "Primary storage is degraded; fallback runtime storage is active.",
+        "degraded_primary": "Primary storage is partially degraded, but runtime fallback is not the active write path.",
     }.get(backend_runtime.get("memory_root_mode"), "Runtime storage state is unknown.")
     return f"""
     <section class="panel">

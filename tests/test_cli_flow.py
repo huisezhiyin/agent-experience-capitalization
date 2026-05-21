@@ -3003,6 +3003,64 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue(Path(captured["data_saved_to"]).exists())
             self.assertIn("expcap-reviews", str(fallback_path))
 
+    def test_cli_review_candidates_falls_back_when_default_output_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            _write_candidate(
+                workspace / ".agent-memory" / "candidates" / "cand_review_fallback_001.json",
+                workspace=workspace,
+                candidate_id="cand_review_fallback_001",
+                status="new",
+                promotion_readiness="unknown",
+                help_signal=None,
+            )
+            captured: dict[str, object] = {}
+            default_queue_path = workspace / ".agent-memory" / "reviews" / "candidate_review_queue.json"
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                if Path(path) == default_queue_path:
+                    raise PermissionError("permission denied for default candidate review queue")
+                original_save_json(path, payload)
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                statuses=None,
+                action=None,
+                candidate_id=None,
+                knowledge_scope=None,
+                knowledge_kind=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                output=None,
+            )
+
+            with patch.object(
+                cli_main,
+                "save_json",
+                side_effect=flaky_save_json,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_review_candidates(args)
+
+            self.assertEqual(result, 0)
+            self.assertIn("save_warning", captured)
+            warning = captured["save_warning"]
+            assert isinstance(warning, dict)
+            self.assertEqual(warning["reason"], "default_candidate_review_queue_output_unwritable")
+            fallback_path = Path(captured["saved_to"])
+            self.assertTrue(fallback_path.exists())
+            self.assertIn("expcap-reviews", str(fallback_path))
+            self.assertEqual(captured["candidate_count"], 1)
+
     def test_cli_doctor_reports_unproven_assets_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()
@@ -3226,8 +3284,37 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(status["retrieval_backends"]["sqlite"]["source_mode"], "fallback_sqlite")
             self.assertTrue(status["backend_runtime"]["fallback_state_index_in_use"])
             self.assertEqual(status["backend_runtime"]["state_index_mode"], "fallback_sqlite")
+            self.assertEqual(status["backend_runtime"]["memory_root_mode"], "fallback_active")
             self.assertEqual(status["primary_write_health"]["status"], "primary_writable")
             self.assertEqual(status["counts"]["activation_logs"], 1)
+
+    def test_cli_status_keeps_primary_only_when_fallback_root_exists_but_is_not_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            fallback_root = fallback_memory_root_for_workspace(workspace)
+            fallback_root.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_status(args)
+
+            self.assertEqual(result, 0)
+            status = captured["status"]
+            assert isinstance(status, dict)
+            self.assertTrue(status["backend_runtime"]["fallback_memory_root_present"])
+            self.assertFalse(status["backend_runtime"]["fallback_state_index_in_use"])
+            self.assertEqual(status["primary_write_health"]["status"], "primary_writable")
+            self.assertEqual(status["backend_runtime"]["memory_root_mode"], "primary_only")
 
     def test_cli_status_surfaces_milvus_probe_fallback_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

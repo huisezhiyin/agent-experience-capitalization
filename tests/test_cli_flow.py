@@ -697,6 +697,129 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(updated_asset["temperature"], "cool")
             self.assertEqual(updated_asset["governance"]["replay_stats"]["miss_count"], 1)
 
+    def test_cli_prove_next_keeps_scanning_until_hit_target_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+
+            first_asset = {
+                "asset_id": "pattern_target_scan_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "第一条治理模式",
+                "content": "第一条会 miss。",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.86,
+                "status": "active",
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            second_asset = {
+                "asset_id": "pattern_target_scan_002",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "第二条治理模式",
+                "content": "第二条会 hit。",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.85,
+                "status": "active",
+                "created_at": "2026-05-08T08:16:38+00:00",
+                "updated_at": "2026-05-08T08:16:38+00:00",
+            }
+            for asset in (first_asset, second_asset):
+                asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / f"{asset['asset_id']}.json"
+                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+            activation_calls: list[str] = []
+
+            status_payload = {
+                "unproven_validation_queue": {
+                    "top_items": [
+                        {"asset_id": "pattern_target_scan_001", "knowledge_scope": "project"},
+                        {"asset_id": "pattern_target_scan_002", "knowledge_scope": "project"},
+                    ]
+                }
+            }
+
+            def fake_build_status_payload(**kwargs):
+                return status_payload
+
+            def fake_activate_assets(**kwargs):
+                activation_calls.append(kwargs["task"])
+                if len(activation_calls) == 1:
+                    selected_asset_ids = ["pattern_other_999"]
+                else:
+                    selected_asset_ids = ["pattern_target_scan_002"]
+                return {
+                    "activation_id": f"act_prove_next_batch_{len(activation_calls)}",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [
+                        {
+                            "asset_id": asset_id,
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                        }
+                        for asset_id in selected_asset_ids
+                    ],
+                    "selected_asset_ids": selected_asset_ids,
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=1,
+                help_signal="supported_strong",
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                dry_run=False,
+                output=None,
+            )
+
+            with patch.object(cli_main, "_build_status_payload", side_effect=fake_build_status_payload), patch.object(
+                cli_main, "activate_assets", side_effect=fake_activate_assets
+            ), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_prove_next(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["prove_next"]
+            assert isinstance(payload, dict)
+            self.assertEqual(payload["requested_limit"], 1)
+            self.assertEqual(payload["processed_count"], 2)
+            self.assertEqual(payload["attempted_count"], 2)
+            self.assertEqual(payload["target_hit_count"], 1)
+            self.assertEqual(payload["proved_count"], 1)
+            self.assertEqual(payload["items"][0]["status"], "missed")
+            self.assertEqual(payload["items"][1]["status"], "proved")
+            self.assertEqual(payload["items"][1]["asset_id"], "pattern_target_scan_002")
+            self.assertEqual(len(activation_calls), 2)
+
     def test_cli_validation_queue_filters_by_scope_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()
@@ -2574,6 +2697,76 @@ class CliFlowTests(unittest.TestCase):
             fallback_asset = json.loads(fallback_asset_path.read_text(encoding="utf-8"))
             self.assertEqual(fallback_asset["historical_help"]["supported_count"], 1)
             self.assertEqual(fallback_asset["review_status"], "healthy")
+
+    def test_cli_auto_finish_rejects_duplicate_followup_governance_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+
+            asset = {
+                "asset_id": "pattern_existing_governance_followup_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "继续压降 expcap governance backlog，proof 队首治理 CLI 模式资产并复核 dashboard/doctor",
+                "content": "继续压降 expcap governance backlog，proof 队首治理 CLI 模式资产并复核 dashboard/doctor 后应沉淀成可复用经验。",
+                "scope": {"level": "task-family", "value": "general-coding-task"},
+                "scope_profile": {"task_type": "implementation", "module": None, "language": None, "framework": None},
+                "source_episode_ids": ["ep_existing_governance_followup_001"],
+                "source_candidate_ids": ["cand_existing_governance_followup_001"],
+                "confidence": 0.9,
+                "status": "active",
+                "review_status": "healthy",
+                "temperature": "hot",
+                "quarantine_status": "active",
+                "created_at": "2026-05-24T00:00:00+00:00",
+                "updated_at": "2026-05-24T00:00:00+00:00",
+            }
+            asset_path = workspace / ".agent-memory" / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            upsert_asset(db_path, asset)
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="继续推进 expcap governance backlog proof，验证新队首模式资产并复核 doctor/dashboard",
+                user_request=None,
+                constraints=[],
+                commands=[],
+                errors=[],
+                files_changed=[],
+                verification_status="passed",
+                verification_summary="1 passed",
+                result_status="success",
+                result_summary="治理 proof 成功",
+                host=None,
+                session_id=None,
+                trace_id="trace_duplicate_governance_followup",
+                no_promote=False,
+                promote_threshold=0.7,
+                knowledge_scope="project",
+                knowledge_kind="pattern",
+            )
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_auto_finish(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(captured["promoted_assets"], [])
+            candidate_payload = captured["candidates"][0]
+            assert isinstance(candidate_payload, dict)
+            self.assertEqual(candidate_payload["status"], "rejected")
+
+            candidate_path = Path(candidate_payload["path"])
+            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+            self.assertEqual(candidate["status"], "rejected")
+            self.assertEqual(candidate["duplicate_of_asset_id"], asset["asset_id"])
+            self.assertGreaterEqual(candidate["duplicate_similarity"], 0.72)
+            self.assertEqual(candidate["review_history"][0]["reason"], "duplicate_followup_pattern")
 
     def test_cli_doctor_reports_workspace_health_and_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

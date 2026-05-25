@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 import hashlib
 from html import escape as html_escape
 import json
@@ -126,6 +127,27 @@ from runtime.storage.sqlite_store import (
 
 ALL_CANDIDATE_STATUSES = ("new", "needs_review", "approved", "rejected", "promoted")
 DEFAULT_REVIEW_QUEUE_STATUSES = ("needs_review", "approved", "new")
+FOLLOWUP_PATTERN_PREFIXES = (
+    "继续推进",
+    "继续压降",
+    "继续 proof",
+    "继续proof",
+    "继续收尾",
+    "继续完成",
+    "继续追",
+)
+FOLLOWUP_PATTERN_GOVERNANCE_MARKERS = (
+    "expcap",
+    "governance",
+    "backlog",
+    "proof",
+    "doctor",
+    "dashboard",
+    "daily review",
+    "validation",
+    "replay",
+)
+PROVE_NEXT_SCAN_MULTIPLIER = 3
 DEFAULT_FEEDBACK_PENDING_HOURS = 24.0
 SELF_REFERENTIAL_VALIDATION_COOLDOWN_HOURS = 72.0
 STALE_FEEDBACK_HELP_SIGNAL = "unclear"
@@ -482,6 +504,74 @@ def _proof_query_for_asset(asset: dict[str, Any]) -> str:
     if not segments:
         segments = [str(asset.get("asset_id") or "")]
     return " ".join(segments)[:240].strip()
+
+
+def _normalized_similarity_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").lower()).strip()[:512]
+
+
+def _is_followup_governance_candidate(candidate: dict[str, Any]) -> bool:
+    if str(candidate.get("candidate_type") or "") != "pattern":
+        return False
+    combined = _normalized_similarity_text(
+        f"{candidate.get('goal', '')} {candidate.get('title', '')} {candidate.get('content', '')}"
+    )
+    if not any(marker in combined for marker in FOLLOWUP_PATTERN_PREFIXES):
+        return False
+    marker_hits = sum(1 for marker in FOLLOWUP_PATTERN_GOVERNANCE_MARKERS if marker in combined)
+    if marker_hits < 2:
+        return False
+    scope_profile = candidate.get("scope_profile") or {}
+    task_type = str(scope_profile.get("task_type") or "")
+    return task_type in {"review", "implementation", "docs"}
+
+
+def _find_similar_healthy_asset_for_candidate(
+    *,
+    candidate: dict[str, Any],
+    workspace: Path,
+    db_path: Path,
+) -> dict[str, Any] | None:
+    if not _is_followup_governance_candidate(candidate):
+        return None
+    candidate_text = _normalized_similarity_text(
+        f"{candidate.get('goal', '')} {candidate.get('title', '')} {candidate.get('content', '')}"
+    )
+    if not candidate_text:
+        return None
+    candidate_goal = _normalized_similarity_text(str(candidate.get("goal") or ""))
+    candidate_scope_profile = candidate.get("scope_profile") or {}
+    candidate_task_type = str(candidate_scope_profile.get("task_type") or "")
+    for asset in list_assets(db_path, workspace=str(workspace)):
+        if str(asset.get("status") or "active") == "deprecated":
+            continue
+        if str(asset.get("review_status") or "unproven") != "healthy":
+            continue
+        asset_scope_profile = asset.get("scope_profile") or {}
+        asset_task_type = str(asset_scope_profile.get("task_type") or "")
+        if candidate_task_type and asset_task_type and candidate_task_type != asset_task_type:
+            paired_governance_types = {candidate_task_type, asset_task_type}
+            if paired_governance_types != {"implementation", "review"}:
+                continue
+        asset_text = _normalized_similarity_text(
+            f"{asset.get('title', '')} {asset.get('content', '')}"
+        )
+        if not asset_text:
+            continue
+        title_similarity = SequenceMatcher(
+            None,
+            candidate_goal or candidate_text,
+            _normalized_similarity_text(str(asset.get("title") or "")) or asset_text,
+        ).ratio()
+        similarity = max(
+            SequenceMatcher(None, candidate_text, asset_text).ratio(),
+            title_similarity,
+        )
+        if similarity >= 0.6:
+            matched = dict(asset)
+            matched["duplicate_similarity"] = round(similarity, 4)
+            return matched
+    return None
 
 
 def _target_asset_rank(selected_assets: list[dict[str, Any]], target_asset_id: str) -> int | None:
@@ -3498,6 +3588,25 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
             candidate,
             activation_feedback=activation_feedback,
         )
+        candidate["goal"] = episode.get("goal")
+        duplicate_asset = _find_similar_healthy_asset_for_candidate(
+            candidate=candidate,
+            workspace=workspace,
+            db_path=db_path,
+        )
+        if duplicate_asset:
+            candidate["status"] = "rejected"
+            candidate["duplicate_of_asset_id"] = duplicate_asset.get("asset_id")
+            candidate["duplicate_similarity"] = duplicate_asset.get("duplicate_similarity")
+            candidate["review_history"] = [
+                {
+                    "action": "reject",
+                    "reason": "duplicate_followup_pattern",
+                    "asset_id": duplicate_asset.get("asset_id"),
+                    "similarity": duplicate_asset.get("duplicate_similarity"),
+                    "reviewed_at": episode.get("created_at"),
+                }
+            ]
         candidate_path = memory_root / "candidates" / f"{candidate['candidate_id']}.json"
         candidate_path, candidate_save_warning = _save_workspace_json(
             workspace=workspace,
@@ -3517,7 +3626,9 @@ def _handle_auto_finish(args: argparse.Namespace) -> int:
         if candidate_upsert_warning:
             sqlite_warnings.append(candidate_upsert_warning)
 
-        if not args.no_promote and should_promote_candidate(
+        if duplicate_asset:
+            pass
+        elif not args.no_promote and should_promote_candidate(
             candidate,
             verification_status=args.verification_status,
             result_status=args.result_status,
@@ -4965,13 +5076,14 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
     bounded_limit = max(int(args.limit or 3), 1)
+    scan_limit = max(bounded_limit * PROVE_NEXT_SCAN_MULTIPLIER, bounded_limit)
     status_payload = _build_status_payload(
         workspace=workspace,
-        limit=bounded_limit,
+        limit=scan_limit,
         deep_retrieval_check=False,
     )
     queue = _filter_unproven_validation_queue(status_payload["unproven_validation_queue"], args)
-    top_items = queue.get("top_items", [])[:bounded_limit]
+    top_items = queue.get("top_items", [])[:scan_limit]
     result_items: list[dict[str, Any]] = []
 
     for index, item in enumerate(top_items, start=1):
@@ -5076,12 +5188,16 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
                 "feedback_warnings": feedback_warnings,
             }
         )
+        if sum(1 for item in result_items if item.get("target_asset_hit")) >= bounded_limit:
+            break
 
     payload = {
         "workspace": str(workspace),
         "generated_at": now_utc(),
         "requested_limit": bounded_limit,
+        "scan_limit": scan_limit,
         "processed_count": len(result_items),
+        "attempted_count": len(result_items),
         "target_hit_count": sum(1 for item in result_items if item.get("target_asset_hit")),
         "proved_count": sum(1 for item in result_items if item.get("help_signal_written")),
         "dry_run": bool(args.dry_run),

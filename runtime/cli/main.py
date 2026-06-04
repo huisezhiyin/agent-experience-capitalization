@@ -102,7 +102,6 @@ from runtime.storage.milvus_store import (
 )
 from runtime.storage.sqlite_store import (
     build_asset_validation_queue,
-    build_governance_summary,
     deprecate_asset,
     ensure_db,
     find_latest_activation,
@@ -148,6 +147,7 @@ FOLLOWUP_PATTERN_GOVERNANCE_MARKERS = (
     "replay",
 )
 PROVE_NEXT_SCAN_MULTIPLIER = 3
+DEFAULT_AUTO_QUARANTINE_MISS_THRESHOLD = 3
 DEFAULT_FEEDBACK_PENDING_HOURS = 24.0
 SELF_REFERENTIAL_VALIDATION_COOLDOWN_HOURS = 72.0
 STALE_FEEDBACK_HELP_SIGNAL = "unclear"
@@ -432,15 +432,15 @@ def _is_fresh_self_referential_validation_asset(
     the latest backlog-digestion summary instead of the next substantive project pattern.
     """
 
-    updated_at = _parse_datetime(asset.get("updated_at") or asset.get("created_at"))
-    if not updated_at:
+    created_at = _parse_datetime(asset.get("created_at") or asset.get("updated_at"))
+    if not created_at:
         return False
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
     reference_now = reference_now or datetime.now(timezone.utc)
     if reference_now.tzinfo is None:
         reference_now = reference_now.replace(tzinfo=timezone.utc)
-    age_hours = max((reference_now - updated_at).total_seconds() / 3600.0, 0.0)
+    age_hours = max((reference_now - created_at).total_seconds() / 3600.0, 0.0)
     if age_hours > SELF_REFERENTIAL_VALIDATION_COOLDOWN_HOURS:
         return False
 
@@ -453,6 +453,17 @@ def _is_fresh_self_referential_validation_asset(
         "prove-next",
         "validation queue",
         "validation plan",
+        "daily review",
+        "expcap review",
+        "dashboard",
+        "doctor",
+        "review-maintenance",
+        "review maintenance",
+        "governance queue",
+        "auto quarantine",
+        "quarantine",
+        "自动治理",
+        "治理队列",
         "回写帮助反馈",
         "优先验证",
         "help feedback",
@@ -1674,9 +1685,70 @@ def _build_parser() -> argparse.ArgumentParser:
     prove_next.add_argument(
         "--dry-run",
         action="store_true",
-        help="Build activation attempts without writing automatic feedback.",
+        help="Preview activation attempts without running retrieval or writing automatic feedback.",
     )
     prove_next.add_argument("--output", help="Optional output path for the prove-next JSON report.")
+
+    review_maintenance = subparsers.add_parser(
+        "review-maintenance",
+        help="Run the daily review workflow and apply safe automatic maintenance actions.",
+    )
+    review_maintenance.add_argument("--workspace", required=True, help="Workspace path to maintain.")
+    review_maintenance.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="How many recent rows and queue items to include. Defaults to 5.",
+    )
+    review_maintenance.add_argument(
+        "--days",
+        type=int,
+        default=14,
+        help="How many recent days to include in the dashboard write snapshot. Defaults to 14.",
+    )
+    review_maintenance.add_argument(
+        "--prove-limit",
+        type=int,
+        default=3,
+        help="How many governance replay hits to prove automatically. Defaults to 3.",
+    )
+    review_maintenance.add_argument(
+        "--help-signal",
+        choices=["supported_strong", "supported_weak", "unclear"],
+        default="supported_strong",
+        help="Feedback signal written only when replay selects the exact target asset.",
+    )
+    review_maintenance.add_argument(
+        "--deep-retrieval-check",
+        action="store_true",
+        help="Open retrieval backends for deeper health checks. Defaults to lightweight checks only.",
+    )
+    _add_scope_filter_arguments(review_maintenance)
+    review_maintenance.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build the maintenance report and replay attempts without writing automatic replay feedback.",
+    )
+    review_maintenance.add_argument(
+        "--skip-prove-next",
+        action="store_true",
+        help="Skip automatic governance replay/proof attempts.",
+    )
+    review_maintenance.add_argument(
+        "--skip-auto-quarantine",
+        action="store_true",
+        help="Skip automatic quarantine for active non-codemap assets with repeated exact replay misses.",
+    )
+    review_maintenance.add_argument(
+        "--auto-quarantine-miss-threshold",
+        type=int,
+        default=DEFAULT_AUTO_QUARANTINE_MISS_THRESHOLD,
+        help=(
+            "Replay miss count required before review-maintenance auto-quarantines a non-codemap asset. "
+            f"Defaults to {DEFAULT_AUTO_QUARANTINE_MISS_THRESHOLD}."
+        ),
+    )
+    review_maintenance.add_argument("--output", help="Optional output path for the maintenance JSON report.")
 
     project_prompt = subparsers.add_parser(
         "project-prompt",
@@ -4332,14 +4404,9 @@ def _handle_validation_plan(args: argparse.Namespace) -> int:
     )
     queue = _filter_unproven_validation_queue(status_payload["unproven_validation_queue"], args)
     top_items = queue.get("top_items", [])[:bounded_limit]
-    governance_summary = status_payload.get("governance_summary") or build_governance_summary(
-        db_path,
-        workspace=str(workspace),
-        validation_limit=bounded_limit,
-    )
-    governance_queue = build_asset_validation_queue(
-        db_path,
-        workspace=str(workspace),
+    governance_summary, governance_queue, _ = _build_governance_snapshot(
+        workspace=workspace,
+        db_path=db_path,
         limit=bounded_limit,
     )
     governance_queue = _filter_governance_queue(governance_queue, args)
@@ -4416,16 +4483,13 @@ def _handle_validation_plan(args: argparse.Namespace) -> int:
 
 def _build_governance_snapshot(*, workspace: Path, db_path: Path, limit: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     bounded_limit = max(int(limit or 1), 1)
-    governance_summary = build_governance_summary(
-        db_path,
-        workspace=str(workspace),
-        validation_limit=bounded_limit,
+    full_governance_queue = _build_filtered_governance_queue(
+        workspace=workspace,
+        db_path=db_path,
+        limit=None,
     )
-    governance_queue = build_asset_validation_queue(
-        db_path,
-        workspace=str(workspace),
-        limit=bounded_limit,
-    )
+    governance_summary = _filtered_governance_summary(full_governance_queue)
+    governance_queue = _limit_governance_queue(full_governance_queue, limit=bounded_limit)
     governance_views = {
         "status": build_governance_status_view(governance_summary),
         "validation_queue": build_validation_queue_view(governance_queue),
@@ -4538,14 +4602,116 @@ def _filter_unproven_validation_queue(queue: dict[str, Any], args: argparse.Name
 def _filter_governance_queue(queue: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     items = [item for item in queue.get("items", []) if _scope_filter_match(item, args)]
     return {
+        **queue,
         "items": items,
         "total_assets": len(items),
+        "visible_items_count": len(items),
         "pending_validation_count": sum(
             1
             for item in items
             if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
         ),
+        "visible_pending_validation_count": sum(
+            1
+            for item in items
+            if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+        ),
     }
+
+
+def _pending_governance_validation_count(items: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for item in items
+        if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+    )
+
+
+def _limit_governance_queue(queue: dict[str, Any], *, limit: int | None) -> dict[str, Any]:
+    all_items = list(queue.get("items", []))
+    visible_items = all_items if limit is None else all_items[: max(int(limit or 0), 0)]
+    return {
+        **queue,
+        "items": visible_items,
+        "visible_items_count": len(visible_items),
+        "visible_pending_validation_count": _pending_governance_validation_count(visible_items),
+    }
+
+
+def _suppress_self_referential_governance_queue_items(
+    queue: dict[str, Any],
+    *,
+    workspace: Path,
+    db_path: Path,
+) -> dict[str, Any]:
+    items = list(queue.get("items", []))
+    loaded_assets: dict[str, dict[str, Any]] = {}
+    asset_timestamps: list[datetime] = []
+    for item in items:
+        asset_id = str(item.get("asset_id") or "")
+        if not asset_id:
+            continue
+        asset = _load_asset_for_workspace(
+            workspace=workspace,
+            db_path=db_path,
+            asset_id=asset_id,
+            knowledge_scope=str(item.get("knowledge_scope") or "project"),
+        )
+        if not asset:
+            continue
+        loaded_assets[asset_id] = asset
+        parsed = _parse_datetime(asset.get("updated_at") or asset.get("created_at"))
+        if parsed is not None:
+            asset_timestamps.append(parsed)
+
+    reference_now = max(asset_timestamps) if asset_timestamps else datetime.now(timezone.utc)
+    kept_items: list[dict[str, Any]] = []
+    suppressed_items: list[dict[str, Any]] = []
+    for item in items:
+        asset_id = str(item.get("asset_id") or "")
+        asset = loaded_assets.get(asset_id)
+        if asset and _is_fresh_self_referential_validation_asset(asset, reference_now=reference_now):
+            suppressed_items.append(
+                {
+                    "asset_id": asset_id,
+                    "title": item.get("title"),
+                    "reason": "fresh_self_referential_validation_asset",
+                }
+            )
+            continue
+        kept_items.append(item)
+
+    suppressed_count = len(suppressed_items)
+    pending_count = _pending_governance_validation_count(kept_items)
+    return {
+        **queue,
+        "items": kept_items,
+        "total_assets": max(int(queue.get("total_assets", len(items)) or len(items)) - suppressed_count, 0),
+        "visible_items_count": len(kept_items),
+        "visible_pending_validation_count": pending_count,
+        "pending_validation_count": pending_count,
+        "suppressed_self_referential_count": suppressed_count,
+        "suppressed_self_referential_items": suppressed_items[:10],
+    }
+
+
+def _build_filtered_governance_queue(
+    *,
+    workspace: Path,
+    db_path: Path,
+    limit: int | None,
+) -> dict[str, Any]:
+    full_queue = build_asset_validation_queue(
+        db_path,
+        workspace=str(workspace),
+        limit=None,
+    )
+    filtered_full_queue = _suppress_self_referential_governance_queue_items(
+        full_queue,
+        workspace=workspace,
+        db_path=db_path,
+    )
+    return _limit_governance_queue(filtered_full_queue, limit=limit)
 
 
 def _activation_matches_scope(activation: dict[str, Any], args: argparse.Namespace) -> bool:
@@ -5072,21 +5238,20 @@ def _handle_resolve_conflict(args: argparse.Namespace) -> int:
     return _handle_conflict_action(args, resolve=True)
 
 
-def _handle_prove_next(args: argparse.Namespace) -> int:
-    workspace = Path(args.workspace).resolve()
-    db_path = default_db_path(workspace)
-    bounded_limit = max(int(args.limit or 3), 1)
-    scan_limit = max(bounded_limit * PROVE_NEXT_SCAN_MULTIPLIER, bounded_limit)
-    status_payload = _build_status_payload(
-        workspace=workspace,
-        limit=scan_limit,
-        deep_retrieval_check=False,
-    )
-    queue = _filter_unproven_validation_queue(status_payload["unproven_validation_queue"], args)
-    top_items = queue.get("top_items", [])[:scan_limit]
+def _run_asset_replay_attempts(
+    *,
+    workspace: Path,
+    db_path: Path,
+    top_items: list[dict[str, Any]],
+    requested_limit: int,
+    scan_limit: int,
+    help_signal: str,
+    dry_run: bool,
+    source_queue: str,
+) -> dict[str, Any]:
     result_items: list[dict[str, Any]] = []
 
-    for index, item in enumerate(top_items, start=1):
+    for index, item in enumerate(top_items[:scan_limit], start=1):
         asset_id = str(item.get("asset_id") or "")
         knowledge_scope = str(item.get("knowledge_scope") or "project")
         asset = _load_asset_for_workspace(
@@ -5110,6 +5275,29 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
             continue
 
         query_text = _proof_query_for_asset(asset)
+        if dry_run:
+            result_items.append(
+                {
+                    "rank": index,
+                    "asset_id": asset_id,
+                    "title": asset.get("title"),
+                    "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type", "pattern")),
+                    "query_text": query_text,
+                    "activation_id": None,
+                    "selected_asset_ids": [],
+                    "target_asset_hit": False,
+                    "target_asset_rank": None,
+                    "help_signal_written": None,
+                    "replay_verdict": None,
+                    "status": "would_attempt",
+                    "activation_save_warning": None,
+                    "activation_log_warning": None,
+                    "injection_artifact_warning": None,
+                    "feedback_warnings": [],
+                }
+            )
+            continue
+
         assets_dir, candidates_dir = _activation_source_dirs(workspace)
         view = activate_assets(
             task=query_text,
@@ -5139,13 +5327,13 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
         feedback_result = None
         replay_verdict = None
         feedback_warnings: list[dict[str, str]] = []
-        if target_hit and not args.dry_run:
+        if target_hit and not dry_run:
             feedback_result, feedback_warnings = _apply_activation_feedback(
                 workspace=workspace,
                 db_path=db_path,
                 activation_id=str(view["activation_id"]),
                 feedback={
-                    "help_signal": args.help_signal,
+                    "help_signal": help_signal,
                     "feedback_at": now_utc(),
                     "feedback_summary": (
                         f"prove-next auto validated target asset {asset_id} via exact target hit in selected_assets."
@@ -5153,7 +5341,7 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
                     "task_query": query_text,
                 },
             )
-        if not args.dry_run:
+        if not dry_run:
             asset, replay_verdict, replay_warnings = _apply_replay_verdict(
                 workspace=workspace,
                 db_path=db_path,
@@ -5188,21 +5376,188 @@ def _handle_prove_next(args: argparse.Namespace) -> int:
                 "feedback_warnings": feedback_warnings,
             }
         )
-        if sum(1 for item in result_items if item.get("target_asset_hit")) >= bounded_limit:
+        if sum(1 for item in result_items if item.get("target_asset_hit")) >= requested_limit:
             break
 
-    payload = {
+    return {
         "workspace": str(workspace),
         "generated_at": now_utc(),
-        "requested_limit": bounded_limit,
+        "source_queue": source_queue,
+        "requested_limit": requested_limit,
         "scan_limit": scan_limit,
         "processed_count": len(result_items),
         "attempted_count": len(result_items),
         "target_hit_count": sum(1 for item in result_items if item.get("target_asset_hit")),
         "proved_count": sum(1 for item in result_items if item.get("help_signal_written")),
-        "dry_run": bool(args.dry_run),
+        "dry_run": bool(dry_run),
         "items": result_items,
     }
+
+
+def _empty_auto_quarantine_payload(
+    *,
+    workspace: Path,
+    miss_threshold: int,
+    dry_run: bool,
+    skipped: bool = False,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "dry_run": bool(dry_run),
+        "skipped": bool(skipped),
+        "skip_reason": reason,
+        "miss_threshold": miss_threshold,
+        "evaluated_count": 0,
+        "quarantined_count": 0,
+        "items": [],
+    }
+
+
+def _is_auto_quarantine_protected_asset(asset: dict[str, Any]) -> bool:
+    knowledge_kind = str(asset.get("knowledge_kind") or asset.get("asset_type") or "").lower()
+    asset_type = str(asset.get("asset_type") or "").lower()
+    if knowledge_kind in {"codemap", "context"} or asset_type == "context":
+        return True
+    return False
+
+
+def _auto_quarantine_replay_misses(
+    *,
+    workspace: Path,
+    db_path: Path,
+    replay_payload: dict[str, Any],
+    miss_threshold: int,
+    dry_run: bool,
+) -> dict[str, Any]:
+    threshold = max(int(miss_threshold or DEFAULT_AUTO_QUARANTINE_MISS_THRESHOLD), 1)
+    items: list[dict[str, Any]] = []
+    seen_asset_ids: set[str] = set()
+
+    for replay_item in replay_payload.get("items", []):
+        if not isinstance(replay_item, dict):
+            continue
+        asset_id = str(replay_item.get("asset_id") or "")
+        if not asset_id or asset_id in seen_asset_ids:
+            continue
+        seen_asset_ids.add(asset_id)
+
+        asset = _load_asset_for_workspace(
+            workspace=workspace,
+            db_path=db_path,
+            asset_id=asset_id,
+            knowledge_scope=str(replay_item.get("knowledge_scope") or "project"),
+        )
+        if not asset:
+            items.append({"asset_id": asset_id, "action": "skip", "reason": "asset_missing"})
+            continue
+
+        governance = asset.get("governance", {}) if isinstance(asset.get("governance"), dict) else {}
+        replay_stats = governance.get("replay_stats", {}) if isinstance(governance.get("replay_stats"), dict) else {}
+        miss_count = int(replay_stats.get("miss_count", 0) or 0)
+        hit_count = int(replay_stats.get("hit_count", 0) or 0)
+        review_status = str(asset.get("review_status") or governance.get("review_status") or "")
+        quarantine_status = str(asset.get("quarantine_status") or governance.get("quarantine_status") or "active")
+        asset_status = str(asset.get("status") or "active")
+
+        reasons: list[str] = []
+        if _is_auto_quarantine_protected_asset(asset):
+            reasons.append("protected_knowledge_kind")
+        if quarantine_status != "active":
+            reasons.append(f"quarantine_status={quarantine_status}")
+        if asset_status != "active":
+            reasons.append(f"asset_status={asset_status}")
+        if review_status not in {"needs_review", "watch"}:
+            reasons.append(f"review_status={review_status or 'unknown'}")
+        if miss_count < threshold:
+            reasons.append(f"miss_count={miss_count}<threshold={threshold}")
+        if hit_count > 0:
+            reasons.append(f"hit_count={hit_count}>0")
+
+        if reasons:
+            items.append(
+                {
+                    "asset_id": asset_id,
+                    "title": asset.get("title"),
+                    "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type")),
+                    "miss_count": miss_count,
+                    "hit_count": hit_count,
+                    "action": "skip",
+                    "reasons": reasons,
+                }
+            )
+            continue
+
+        reason = (
+            f"Auto-quarantined by review-maintenance after {miss_count} exact replay misses "
+            "and no replay hits; keep evidence but stop active retrieval until narrower proof exists."
+        )
+        write_warnings: list[dict[str, str]] = []
+        updated_asset = asset
+        if not dry_run:
+            updated = set_asset_quarantine_status(
+                db_path,
+                asset_id=asset_id,
+                quarantine_status="quarantined",
+                reason=reason,
+                updated_at=now_utc(),
+            )
+            if updated is None:
+                items.append({"asset_id": asset_id, "action": "skip", "reason": "asset_missing_on_update"})
+                continue
+            updated_asset = updated
+            write_warnings = _persist_asset_state(workspace=workspace, asset=updated_asset)
+
+        items.append(
+            {
+                "asset_id": asset_id,
+                "title": asset.get("title"),
+                "knowledge_kind": asset.get("knowledge_kind", asset.get("asset_type")),
+                "miss_count": miss_count,
+                "hit_count": hit_count,
+                "action": "would_quarantine" if dry_run else "quarantined",
+                "reason": reason,
+                "quarantine_status": "quarantined" if dry_run else updated_asset.get("quarantine_status"),
+                "write_warnings": write_warnings,
+            }
+        )
+
+    return {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "dry_run": bool(dry_run),
+        "skipped": False,
+        "skip_reason": None,
+        "miss_threshold": threshold,
+        "evaluated_count": len(items),
+        "quarantined_count": sum(1 for item in items if item.get("action") in {"quarantined", "would_quarantine"}),
+        "items": items,
+    }
+
+
+def _handle_prove_next(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    bounded_limit = max(int(args.limit or 3), 1)
+    scan_limit = max(bounded_limit * PROVE_NEXT_SCAN_MULTIPLIER, bounded_limit)
+    status_payload = _build_status_payload(
+        workspace=workspace,
+        limit=scan_limit,
+        deep_retrieval_check=False,
+    )
+    queue = _filter_unproven_validation_queue(status_payload["unproven_validation_queue"], args)
+    top_items = queue.get("top_items", [])[:scan_limit]
+    payload = _run_asset_replay_attempts(
+        workspace=workspace,
+        db_path=db_path,
+        top_items=top_items,
+        requested_limit=bounded_limit,
+        scan_limit=scan_limit,
+        help_signal=args.help_signal,
+        dry_run=bool(args.dry_run),
+        source_queue="unproven_validation_queue",
+    )
     output_path = (
         Path(args.output)
         if args.output
@@ -5646,20 +6001,11 @@ def _build_status_payload(
         activations=activations,
         limit=limit,
     )
-    governance_summary = build_governance_summary(
-        db_path,
-        workspace=str(workspace),
-        validation_limit=limit,
-    )
-    governance_validation_queue = build_asset_validation_queue(
-        db_path,
-        workspace=str(workspace),
+    governance_summary, governance_validation_queue, governance_views = _build_governance_snapshot(
+        workspace=workspace,
+        db_path=db_path,
         limit=limit,
     )
-    governance_views = {
-        "status": build_governance_status_view(governance_summary),
-        "validation_queue": build_validation_queue_view(governance_validation_queue),
-    }
 
     candidate_status_summary = {status: 0 for status in ALL_CANDIDATE_STATUSES}
     for candidate in candidates:
@@ -7200,6 +7546,66 @@ def _render_dashboard_html(payload: dict[str, Any]) -> str:
 """
 
 
+def _save_dashboard_payload(
+    *,
+    workspace: Path,
+    payload: dict[str, Any],
+    requested_output: str | None,
+) -> tuple[Path, Path, dict[str, str] | None]:
+    output_path = (
+        Path(requested_output)
+        if requested_output
+        else memory_root_for_workspace(workspace) / "reviews" / "dashboard.html"
+    )
+    save_warning = None
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(_render_dashboard_html(payload), encoding="utf-8")
+        data_output_path = output_path.with_suffix(".json")
+        save_json(data_output_path, payload)
+    except OSError as error:
+        if requested_output:
+            raise
+        fallback_path = _fallback_review_output_path(workspace, output_path)
+        fallback_path.parent.mkdir(parents=True, exist_ok=True)
+        fallback_path.write_text(_render_dashboard_html(payload), encoding="utf-8")
+        data_output_path = fallback_path.with_suffix(".json")
+        save_json(data_output_path, payload)
+        save_warning = _fallback_warning(
+            reason="default_dashboard_output_unwritable",
+            requested_path=output_path,
+            fallback_path=fallback_path,
+            error=error,
+        )
+        output_path = fallback_path
+    return output_path, data_output_path, save_warning
+
+
+def _dashboard_command_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "workspace": payload["workspace"],
+        "generated_at": payload["generated_at"],
+        "cards": payload["cards"],
+        "effectiveness_snapshot": payload["effectiveness_snapshot"],
+        "review_queue_count": payload["review_queue"]["candidate_count"],
+        "unproven_validation_count": payload["unproven_validation_queue"]["asset_count"],
+        "governance_headline": payload.get("governance", {}).get("views", {}).get("status", {}).get("headline"),
+        "governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("status", {}).get("cards", {}).get("pending_validation_count"),
+        "validation_counts": {
+            "review_queue_count": payload["review_queue"]["candidate_count"],
+            "governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("status", {}).get("cards", {}).get("pending_validation_count"),
+            "visible_governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("validation_queue", {}).get("summary", {}).get("visible_pending_validation_count"),
+            "unproven_validation_asset_count": payload["unproven_validation_queue"]["asset_count"],
+            "notes": {
+                "governance_pending_validation_count": "Total governance actions across the full asset set, independent of the current display limit.",
+                "visible_governance_pending_validation_count": "Governance actions currently visible in the limited validation queue panel.",
+                "unproven_validation_asset_count": "Broader pool of unproven assets that may need future validation work.",
+            },
+        },
+        "scope_filters": payload.get("scope_filters", {}),
+    }
+
+
 def _handle_dashboard(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     db_path = default_db_path(workspace)
@@ -7214,58 +7620,232 @@ def _handle_dashboard(args: argparse.Namespace) -> int:
     )
     if feedback_cleanup is not None:
         payload["status"]["feedback_cleanup"] = feedback_cleanup
-    output_path = (
-        Path(args.output)
-        if args.output
-        else memory_root_for_workspace(workspace) / "reviews" / "dashboard.html"
+    output_path, data_output_path, save_warning = _save_dashboard_payload(
+        workspace=workspace,
+        payload=payload,
+        requested_output=args.output,
     )
-    save_warning = None
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(_render_dashboard_html(payload), encoding="utf-8")
-        data_output_path = output_path.with_suffix(".json")
-        save_json(data_output_path, payload)
-    except OSError as error:
-        if args.output:
-            raise
-        fallback_path = _fallback_review_output_path(workspace, output_path)
-        fallback_path.parent.mkdir(parents=True, exist_ok=True)
-        fallback_path.write_text(_render_dashboard_html(payload), encoding="utf-8")
-        data_output_path = fallback_path.with_suffix(".json")
-        save_json(data_output_path, payload)
-        save_warning = _fallback_warning(
-            reason="default_dashboard_output_unwritable",
-            requested_path=output_path,
-            fallback_path=fallback_path,
-            error=error,
-        )
-        output_path = fallback_path
     result = {
         "saved_to": str(output_path),
         "data_saved_to": str(data_output_path),
-        "dashboard": {
-            "workspace": payload["workspace"],
-            "generated_at": payload["generated_at"],
-            "cards": payload["cards"],
-            "effectiveness_snapshot": payload["effectiveness_snapshot"],
-            "review_queue_count": payload["review_queue"]["candidate_count"],
-            "unproven_validation_count": payload["unproven_validation_queue"]["asset_count"],
-            "governance_headline": payload.get("governance", {}).get("views", {}).get("status", {}).get("headline"),
-            "governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("status", {}).get("cards", {}).get("pending_validation_count"),
-            "validation_counts": {
-                "review_queue_count": payload["review_queue"]["candidate_count"],
-                "governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("status", {}).get("cards", {}).get("pending_validation_count"),
-                "visible_governance_pending_validation_count": payload.get("governance", {}).get("views", {}).get("validation_queue", {}).get("summary", {}).get("visible_pending_validation_count"),
-                "unproven_validation_asset_count": payload["unproven_validation_queue"]["asset_count"],
-                "notes": {
-                    "governance_pending_validation_count": "Total governance actions across the full asset set, independent of the current display limit.",
-                    "visible_governance_pending_validation_count": "Governance actions currently visible in the limited validation queue panel.",
-                    "unproven_validation_asset_count": "Broader pool of unproven assets that may need future validation work.",
-                },
-            },
-            "scope_filters": payload.get("scope_filters", {}),
-        },
+        "dashboard": _dashboard_command_summary(payload),
     }
+    if save_warning:
+        result["save_warning"] = save_warning
+    _print_json(result)
+    return 0
+
+
+def _maintenance_dashboard_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    summary = _dashboard_command_summary(payload)
+    effectiveness = summary.get("effectiveness_snapshot", {})
+    return {
+        "overall_score": effectiveness.get("overall_score"),
+        "verdict": effectiveness.get("verdict"),
+        "asset_quality_ratio": effectiveness.get("asset_quality_ratio"),
+        "help_rate": effectiveness.get("help_rate"),
+        "milvus_contribution_ratio": effectiveness.get("milvus_contribution_ratio"),
+        "write_activity_ratio": effectiveness.get("write_activity_ratio"),
+        "persistence_summary": effectiveness.get("persistence_summary"),
+        "cards": summary.get("cards", {}),
+        "validation_counts": summary.get("validation_counts", {}),
+        "governance_headline": summary.get("governance_headline"),
+    }
+
+
+def _maintenance_remaining_actions(
+    *,
+    doctor_payload: dict[str, Any],
+    status_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    remaining: list[dict[str, Any]] = []
+    for check in doctor_payload.get("checks", []):
+        if check.get("status") != "warn":
+            continue
+        remaining.append(
+            {
+                "kind": "doctor_warning",
+                "name": check.get("name"),
+                "summary": check.get("summary"),
+                "recommendation": check.get("recommendation"),
+            }
+        )
+
+    feedback = status_payload.get("activation_feedback_summary") or {}
+    pending = int(feedback.get("pending", 0) or 0)
+    if pending:
+        remaining.append(
+            {
+                "kind": "feedback_pending",
+                "name": "activation_feedback_pending",
+                "summary": f"{pending} activation feedback entries are still inside the pending window.",
+                "recommendation": "Leave them for automatic stale cleanup unless the current task has enough evidence to write explicit feedback.",
+            }
+        )
+    return remaining
+
+
+def _empty_replay_payload(
+    *,
+    workspace: Path,
+    requested_limit: int,
+    scan_limit: int,
+    dry_run: bool,
+    source_queue: str,
+) -> dict[str, Any]:
+    return {
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "source_queue": source_queue,
+        "requested_limit": requested_limit,
+        "scan_limit": scan_limit,
+        "processed_count": 0,
+        "attempted_count": 0,
+        "target_hit_count": 0,
+        "proved_count": 0,
+        "dry_run": bool(dry_run),
+        "items": [],
+    }
+
+
+def _handle_review_maintenance(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    db_path = default_db_path(workspace)
+    bounded_limit = max(int(args.limit or 5), 1)
+    bounded_days = max(int(args.days or 14), 1)
+    prove_limit = max(int(args.prove_limit or 0), 0)
+    feedback_cleanup, cleanup_warning = _safe_feedback_cleanup(workspace=workspace, db_path=db_path)
+    runtime_warnings = [cleanup_warning] if cleanup_warning else None
+
+    pre_dashboard_payload = _build_dashboard_payload(
+        workspace=workspace,
+        limit=bounded_limit,
+        days=bounded_days,
+        deep_retrieval_check=args.deep_retrieval_check,
+        runtime_warnings=runtime_warnings,
+        scope_args=args,
+    )
+    if feedback_cleanup is not None:
+        pre_dashboard_payload["status"]["feedback_cleanup"] = feedback_cleanup
+
+    replay_payload = _empty_replay_payload(
+        workspace=workspace,
+        requested_limit=prove_limit,
+        scan_limit=max(prove_limit * PROVE_NEXT_SCAN_MULTIPLIER, prove_limit),
+        dry_run=bool(args.dry_run),
+        source_queue="governance_validation_queue",
+    )
+    if prove_limit > 0 and not args.skip_prove_next:
+        governance_queue = _filter_governance_queue(
+            pre_dashboard_payload["status"].get("governance_validation_queue", {}),
+            args,
+        )
+        replay_candidates = [
+            item
+            for item in governance_queue.get("items", [])
+            if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+        ]
+        scan_limit = max(prove_limit * PROVE_NEXT_SCAN_MULTIPLIER, prove_limit)
+        replay_payload = _run_asset_replay_attempts(
+            workspace=workspace,
+            db_path=db_path,
+            top_items=replay_candidates,
+            requested_limit=prove_limit,
+            scan_limit=scan_limit,
+            help_signal=args.help_signal,
+            dry_run=bool(args.dry_run),
+            source_queue="governance_validation_queue",
+        )
+
+    quarantine_threshold = max(
+        int(getattr(args, "auto_quarantine_miss_threshold", DEFAULT_AUTO_QUARANTINE_MISS_THRESHOLD) or 0),
+        1,
+    )
+    if bool(getattr(args, "skip_auto_quarantine", False)):
+        quarantine_payload = _empty_auto_quarantine_payload(
+            workspace=workspace,
+            miss_threshold=quarantine_threshold,
+            dry_run=bool(args.dry_run),
+            skipped=True,
+            reason="skip_auto_quarantine",
+        )
+    else:
+        quarantine_payload = _auto_quarantine_replay_misses(
+            workspace=workspace,
+            db_path=db_path,
+            replay_payload=replay_payload,
+            miss_threshold=quarantine_threshold,
+            dry_run=bool(args.dry_run),
+        )
+
+    post_dashboard_payload = _build_dashboard_payload(
+        workspace=workspace,
+        limit=bounded_limit,
+        days=bounded_days,
+        deep_retrieval_check=args.deep_retrieval_check,
+        runtime_warnings=runtime_warnings,
+        scope_args=args,
+    )
+    if feedback_cleanup is not None:
+        post_dashboard_payload["status"]["feedback_cleanup"] = feedback_cleanup
+    dashboard_path, dashboard_data_path, dashboard_save_warning = _save_dashboard_payload(
+        workspace=workspace,
+        payload=post_dashboard_payload,
+        requested_output=None,
+    )
+    doctor_payload = _build_doctor_payload(
+        workspace=workspace,
+        limit=bounded_limit,
+        deep_retrieval_check=args.deep_retrieval_check,
+        feedback_cleanup=feedback_cleanup,
+        runtime_warnings=runtime_warnings,
+        scope_args=args,
+    )
+    remaining_actions = _maintenance_remaining_actions(
+        doctor_payload=doctor_payload,
+        status_payload=post_dashboard_payload["status"],
+    )
+    payload = {
+        "kind": "review_maintenance_report",
+        "workspace": str(workspace),
+        "generated_at": now_utc(),
+        "dry_run": bool(args.dry_run),
+        "pre_snapshot": _maintenance_dashboard_snapshot(pre_dashboard_payload),
+        "post_snapshot": _maintenance_dashboard_snapshot(post_dashboard_payload),
+        "dashboard_saved_to": str(dashboard_path),
+        "dashboard_data_saved_to": str(dashboard_data_path),
+        "doctor": {
+            "overall_status": doctor_payload.get("overall_status"),
+            "checks": doctor_payload.get("checks", []),
+            "recommendations": doctor_payload.get("recommendations", []),
+        },
+        "automated_actions": {
+            "feedback_cleanup": feedback_cleanup,
+            "governance_replay": replay_payload,
+            "governance_quarantine": quarantine_payload,
+        },
+        "remaining_actions": remaining_actions,
+        "remaining_action_count": len(remaining_actions),
+        "scope_filters": _active_scope_filters(args),
+    }
+    if cleanup_warning:
+        payload["feedback_cleanup_warning"] = cleanup_warning
+    if dashboard_save_warning:
+        payload["dashboard_save_warning"] = dashboard_save_warning
+
+    output_path = (
+        Path(args.output)
+        if args.output
+        else memory_root_for_workspace(workspace) / "reviews" / "review_maintenance.json"
+    )
+    output_path, save_warning = _save_review_json(
+        workspace=workspace,
+        output_path=output_path,
+        payload=payload,
+        requested_output=args.output,
+        reason="default_review_maintenance_output_unwritable",
+    )
+    result = {"saved_to": str(output_path), "review_maintenance": payload}
     if save_warning:
         result["save_warning"] = save_warning
     _print_json(result)
@@ -7363,6 +7943,8 @@ def main() -> int:
         return _handle_benchmark_milvus(args)
     if args.command == "dashboard":
         return _handle_dashboard(args)
+    if args.command == "review-maintenance":
+        return _handle_review_maintenance(args)
     if args.command == "review":
         return _handle_review(args)
     if args.command == "extract":

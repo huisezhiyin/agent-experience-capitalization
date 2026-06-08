@@ -392,6 +392,62 @@ class MilvusStoreLockTests(unittest.TestCase):
                 milvus_store.fcntl.flock(lock_file.fileno(), milvus_store.fcntl.LOCK_UN)
                 lock_file.close()
 
+    def test_search_asset_vectors_loads_collection_before_search(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.loaded = False
+                self.searched = False
+
+            def has_collection(self, collection_name: str) -> bool:
+                return True
+
+            def load_collection(self, collection_name: str) -> None:
+                self.loaded = True
+
+            def search(self, collection_name: str, data: list[list[float]], filter: str, limit: int, output_fields: list[str]):
+                self.searched = True
+                return [
+                    [
+                        {
+                            "id": "asset_loaded",
+                            "distance": 0.73,
+                            "entity": {
+                                "asset_id": "asset_loaded",
+                                "knowledge_scope": "project",
+                                "knowledge_kind": "pattern",
+                                "title": "Loaded before search",
+                                "content": "Ensure the collection is loaded before querying Milvus.",
+                            },
+                        }
+                    ]
+                ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "milvus.db"
+            db_path.touch()
+            fake_client = FakeClient()
+
+            with patch.object(milvus_store, "milvus_available", return_value=True), patch.object(
+                milvus_store,
+                "milvus_runtime_probe",
+                return_value=self._runtime_probe(),
+            ), patch.object(
+                milvus_store,
+                "_safe_client_unlocked",
+                return_value=fake_client,
+            ):
+                results = milvus_store.search_asset_vectors(
+                    db_path,
+                    query_text="loaded search",
+                    limit=3,
+                    knowledge_scope="project",
+                    workspace="/tmp/demo",
+                )
+
+        self.assertTrue(fake_client.loaded)
+        self.assertTrue(fake_client.searched)
+        self.assertEqual(results[0]["asset_id"], "asset_loaded")
+
     def test_runtime_probe_tries_multiple_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             blocked_dir = Path(tmpdir) / "blocked"

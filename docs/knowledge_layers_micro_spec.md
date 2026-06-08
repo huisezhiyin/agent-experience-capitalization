@@ -20,9 +20,29 @@ Make expcap's knowledge injection and knowledge save architecture explicit in ru
 ## Save Layers
 
 - `milvus`: semantic retrieval index.
-- `sqlite`: lightweight state index for candidates, feedback, review queues, and activation logs.
+- `sqlite`: governance ledger for candidates, assets, feedback, review queues, lifecycle state, and activation logs.
 - `markdown_files`: human-readable and reviewable knowledge artifacts such as injection markdown, docs, and prompt files.
 - `logs`: raw execution evidence such as traces, episodes, hook events, and activation views.
+
+## Boundary Clarification
+
+- `milvus` is responsible for findability, not source-of-truth trust.
+- `sqlite` is responsible for lifecycle, relationships, and governance status, not semantic understanding.
+- `markdown_files` carry small, stable, reviewable rules rather than large-scale episodic recall.
+- `logs` remain the recoverable evidence source for raw task memory.
+
+## Governance Gates
+
+- Saved candidates and assets should carry a `scope_profile` with at least `task_type`, `module`, `language`, and `framework` when derivable.
+- Retrieval should reward matching `scope_profile` metadata instead of relying only on broad `task-family` scope.
+- Assets marked `quarantined` or `deprecated` should not enter the final activation set by default.
+- Assets listed in each other's `conflicts_with` set should not be injected together in the same activation batch.
+
+## View Adapters
+
+- Runtime should expose governance-native summaries before any CLI/dashboard rendering layer.
+- Validation queue and governance summary should have dedicated view adapters so status/dashboard can consume stable shapes instead of rebuilding counts ad hoc.
+- Governance-facing commands should support both explicit filters (`review_status`, `quarantine_status`, `asset_status`) and a few high-signal presets such as `only_deprecated`, `only_quarantined`, and `only_needs_review`.
 
 ## Done Contract
 

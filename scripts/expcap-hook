@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import importlib
 import json
 import os
 import re
@@ -395,14 +396,118 @@ def _recent_progressive_recall_duplicate(workspace: Path, *, signal: str) -> dic
 
 
 def _run_expcap(command: list[str]) -> dict[str, Any]:
-    completed = subprocess.run(
-        command,
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return json.loads(completed.stdout)
+    timeout = 5.0 if "progressive-recall" in command else None
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+        )
+        return json.loads(completed.stdout)
+    except subprocess.TimeoutExpired as exc:
+        partial_stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        if partial_stdout.strip():
+            result = json.loads(partial_stdout)
+            if isinstance(result, dict):
+                result.setdefault("timeout_warning", "process_exit_timeout_after_stdout")
+                return result
+        raise
+
+
+def _run_progressive_recall_inline(
+    *,
+    workspace: Path,
+    task: str,
+    message: str,
+    files: list[str],
+    errors: list[str],
+    phase: str,
+    cooldown_minutes: float,
+) -> dict[str, Any]:
+    cli_main = importlib.import_module("runtime.cli.main")
+    payload: dict[str, Any] = {}
+
+    def _capture_print_json(result: Any) -> None:
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["result"] = result
+
+    original_print_json = cli_main._print_json
+    cli_main._print_json = _capture_print_json
+    try:
+        args = argparse.Namespace(
+            workspace=str(workspace),
+            task=task,
+            messages=[message],
+            constraints=[],
+            files=files,
+            errors=errors,
+            phase=phase,
+            cooldown_minutes=cooldown_minutes,
+            lookback=5,
+            force=False,
+            output=None,
+        )
+        exit_code = cli_main._handle_progressive_recall(args)
+    finally:
+        cli_main._print_json = original_print_json
+    if exit_code != 0:
+        raise subprocess.CalledProcessError(exit_code, ["progressive-recall-inline"])
+    return payload
+
+
+def _run_auto_finish_inline(
+    *,
+    workspace: Path,
+    task: str,
+    verification_status: str,
+    result_status: str,
+    result_summary: str,
+    commands: list[str],
+    errors: list[str],
+) -> dict[str, Any]:
+    cli_main = importlib.import_module("runtime.cli.main")
+    payload: dict[str, Any] = {}
+
+    def _capture_print_json(result: Any) -> None:
+        if isinstance(result, dict):
+            payload.update(result)
+        else:
+            payload["result"] = result
+
+    original_print_json = cli_main._print_json
+    cli_main._print_json = _capture_print_json
+    try:
+        args = argparse.Namespace(
+            workspace=str(workspace),
+            task=task,
+            user_request=None,
+            constraints=[],
+            commands=commands,
+            errors=errors,
+            files_changed=[],
+            verification_status=verification_status,
+            verification_summary=None,
+            result_status=result_status,
+            result_summary=result_summary,
+            host="codex",
+            session_id=None,
+            trace_id=None,
+            promote_threshold=0.70,
+            no_promote=False,
+            knowledge_scope="project",
+            knowledge_kind=None,
+        )
+        exit_code = cli_main._handle_auto_finish(args)
+    finally:
+        cli_main._print_json = original_print_json
+    if exit_code != 0:
+        raise subprocess.CalledProcessError(exit_code, ["auto-finish-inline"])
+    return payload
 
 
 def _user_prompt_hook_output(result: dict[str, Any]) -> dict[str, Any]:
@@ -473,27 +578,17 @@ def _run_post_tool_progressive_recall(
         return "", {"triggered": False, "decision": {"skip_reason": "hook_duplicate_cooldown", **duplicate}}, signal
 
     task = _latest_activation_task(workspace) or _truncate(command, limit=180) or "post tool failure"
-    recall_command = [
-        str(PROJECT_ROOT / "scripts" / "expcap"),
-        "progressive-recall",
-        "--workspace",
-        str(workspace),
-        "--task",
-        task,
-        "--phase",
-        "fix",
-        "--cooldown-minutes",
-        str(_progressive_recall_cooldown_minutes()),
-        "--message",
-        _truncate(f"PostToolUse observed failed command: {command}", limit=600) or "PostToolUse observed failed command.",
-    ]
-    if error:
-        recall_command.extend(["--error", error])
-    for file_signal in _file_signals(command, error):
-        recall_command.extend(["--file", file_signal])
-
     try:
-        result = _run_expcap(recall_command)
+        result = _run_progressive_recall_inline(
+            workspace=workspace,
+            task=task,
+            message=_truncate(f"PostToolUse observed failed command: {command}", limit=600)
+            or "PostToolUse observed failed command.",
+            files=_file_signals(command, error),
+            errors=[error] if error else [],
+            phase="fix",
+            cooldown_minutes=_progressive_recall_cooldown_minutes(),
+        )
     except subprocess.CalledProcessError as exc:
         return "", {"triggered": False, "error": exc.stderr.strip() or exc.stdout.strip() or str(exc)}, signal
 
@@ -747,26 +842,16 @@ def main() -> int:
             )
             print(json.dumps(_skip_output("skip duplicate stop within cooldown"), ensure_ascii=False))
             return 0
-        command = [
-            str(PROJECT_ROOT / "scripts" / "expcap"),
-            "auto-finish",
-            "--workspace",
-            str(workspace),
-            "--task",
-            task,
-            "--verification-status",
-            verification_status,
-            "--result-status",
-            result_status,
-            "--result-summary",
-            args.result_summary or result_summary or f"hook auto-finish from {args.host} stop event",
-        ]
         recent_commands, recent_errors = _recent_tool_evidence(workspace)
-        for recent_command in recent_commands:
-            command.extend(["--command", recent_command])
-        for recent_error in recent_errors:
-            command.extend(["--error", recent_error])
-        result = _run_expcap(command)
+        result = _run_auto_finish_inline(
+            workspace=workspace,
+            task=task,
+            verification_status=verification_status,
+            result_status=result_status,
+            result_summary=args.result_summary or result_summary or f"hook auto-finish from {args.host} stop event",
+            commands=recent_commands,
+            errors=recent_errors,
+        )
         _record(
             workspace,
             host=args.host,

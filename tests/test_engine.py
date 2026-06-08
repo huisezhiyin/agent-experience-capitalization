@@ -37,6 +37,10 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(episode["episode_id"], "ep_20260413_001")
         self.assertEqual(episode["scope_hint"], "python-import-error")
+        self.assertEqual(episode["scope_profile"]["task_type"], "bugfix")
+        self.assertEqual(episode["scope_profile"]["module"], "pkg/module.py")
+        self.assertEqual(episode["scope_profile"]["language"], "python")
+        self.assertEqual(episode["scope_profile"]["framework"], "pytest")
         self.assertTrue(episode["turning_points"])
         self.assertIn("优先检查真实包结构与导入路径", episode["lesson"])
         self.assertTrue(any("优先满足显式约束" in item for item in episode["decision_rationale"]))
@@ -70,8 +74,16 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(candidate["title"], "Python 导入错误处理模式")
         self.assertEqual(candidate["workspace"], "/tmp/demo")
         self.assertEqual(candidate["status"], "new")
+        self.assertEqual(candidate["governance"]["knowledge_scope"], "project")
+        self.assertEqual(candidate["governance"]["owner"], "project")
+        self.assertEqual(candidate["review_status"], "unproven")
+        self.assertEqual(candidate["scope_profile"]["task_type"], "bugfix")
+        self.assertEqual(candidate["scope_profile"]["language"], "python")
         self.assertEqual(asset["workspace"], "/tmp/demo")
         self.assertEqual(asset["asset_type"], "pattern")
+        self.assertEqual(asset["governance"]["knowledge_scope"], "project")
+        self.assertEqual(asset["governance"]["owner"], "project")
+        self.assertEqual(asset["scope_profile"]["language"], "python")
         self.assertGreaterEqual(asset["confidence"], 0.75)
 
     def test_extract_candidates_infers_local_prior_kinds_from_strong_signals(self) -> None:
@@ -485,6 +497,153 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(any(item["asset_id"] == "pattern_preference_001" for item in runtime_items))
             self.assertEqual(runtime_items[0]["injection_layer"], "task_start_runtime_injection")
             self.assertIn("知识类型 preference 具有当前排序权重", activation["selected_assets"][0]["match_evidence"])
+
+    def test_activate_assets_uses_scope_profile_and_skips_quarantined_or_conflicting_assets(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            assets_dir = workspace / ".agent-memory" / "assets" / "patterns"
+            candidates_dir = workspace / ".agent-memory" / "candidates"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            candidates_dir.mkdir(parents=True, exist_ok=True)
+
+            (assets_dir / "pattern_docs_001.json").write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_docs_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "README 文档改写模式",
+                        "content": "更新 README 时先统一定位语言，再改细节文案。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "scope_profile": {
+                            "task_type": "docs",
+                            "module": "docs",
+                            "language": None,
+                            "framework": None,
+                        },
+                        "source_episode_ids": ["ep_docs_001"],
+                        "source_candidate_ids": ["cand_docs_001"],
+                        "confidence": 0.88,
+                        "status": "active",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (assets_dir / "pattern_quarantined_001.json").write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_quarantined_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "旧的 README 写法",
+                        "content": "继续把 expcap 写成 memory tool。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "scope_profile": {"task_type": "docs", "module": "docs"},
+                        "confidence": 0.95,
+                        "status": "active",
+                        "quarantine_status": "quarantined",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (assets_dir / "pattern_conflict_a_001.json").write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_conflict_a_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "README 用 governance layer 表述",
+                        "content": "文档里统一用 experience governance layer。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "scope_profile": {"task_type": "docs", "module": "docs"},
+                        "confidence": 0.86,
+                        "status": "active",
+                        "conflicts_with": ["pattern_conflict_b_001"],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (assets_dir / "pattern_conflict_b_001.json").write_text(
+                json.dumps(
+                    {
+                        "asset_id": "pattern_conflict_b_001",
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": "README 用 memory tool 表述",
+                        "content": "文档里继续用 coding agent memory tool。",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "scope_profile": {"task_type": "docs", "module": "docs"},
+                        "confidence": 0.84,
+                        "status": "active",
+                        "conflicts_with": ["pattern_conflict_a_001"],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            activation = activate_assets(
+                task="更新 README 和 docs，统一 expcap 的治理定位",
+                workspace=workspace,
+                constraints=[],
+                assets_dir=workspace / ".agent-memory" / "assets",
+                candidates_dir=candidates_dir,
+                db_path=None,
+            )
+
+            selected_ids = [item["asset_id"] for item in activation["selected_assets"]]
+            self.assertIn("pattern_docs_001", selected_ids)
+            self.assertNotIn("pattern_quarantined_001", selected_ids)
+            self.assertFalse(
+                {"pattern_conflict_a_001", "pattern_conflict_b_001"}.issubset(set(selected_ids))
+            )
+            self.assertTrue(any("任务类型命中 docs" in item for item in activation["selected_assets"][0]["match_evidence"]))
+            self.assertTrue(any("quarantine" in item for item in activation["selection_risks"]))
+
+    def test_explain_object_supports_validation_queue_and_governance_summary(self) -> None:
+        validation_queue = {
+            "items": [
+                {
+                    "asset_id": "pattern_unproven_001",
+                    "suggested_action": "replay",
+                    "reasons": ["当前治理状态为 unproven", "尚无历史激活，适合优先做首轮 replay/validation"],
+                }
+            ],
+            "total_assets": 8,
+            "pending_validation_count": 3,
+        }
+        governance_summary = {
+            "asset_count": 8,
+            "review_status_counts": {"healthy": 4, "unproven": 2, "needs_review": 2},
+            "temperature_counts": {"hot": 2, "neutral": 4, "cool": 2},
+            "quarantine_status_counts": {"active": 7, "quarantined": 1},
+            "conflict_asset_count": 1,
+            "pending_validation_count": 3,
+            "top_validation_items": [{"asset_id": "pattern_unproven_001"}],
+        }
+
+        queue_explained = explain_object(validation_queue)
+        summary_explained = explain_object(governance_summary)
+
+        self.assertEqual(queue_explained["kind"], "validation_queue")
+        self.assertIn("replay", " ".join(queue_explained["explanation"]))
+        self.assertEqual(summary_explained["kind"], "governance_summary")
+        self.assertIn("待验证 3 条", " ".join(summary_explained["explanation"]))
 
     def test_activate_assets_routes_stable_small_priors_to_system_prompt(self) -> None:
         import json

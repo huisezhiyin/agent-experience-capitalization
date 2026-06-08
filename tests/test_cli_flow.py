@@ -582,6 +582,11 @@ class CliFlowTests(unittest.TestCase):
                 workspace=str(workspace),
                 limit=1,
                 help_signal="supported_strong",
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
                 dry_run=False,
                 output=None,
             )
@@ -601,11 +606,14 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["proved_count"], 1)
             self.assertEqual(payload["items"][0]["status"], "proved")
             self.assertEqual(payload["items"][0]["help_signal_written"], "supported_strong")
+            self.assertEqual(payload["items"][0]["replay_verdict"]["verdict"], "replay_hit")
+            self.assertIn("still helps", payload["items"][0]["replay_verdict"]["recommendation"])
 
             updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
             self.assertEqual(updated_asset["review_status"], "healthy")
             self.assertEqual(updated_asset["temperature"], "warm")
             self.assertEqual(updated_asset["historical_help"]["supported_strong_count"], 1)
+            self.assertEqual(updated_asset["governance"]["replay_stats"]["hit_count"], 1)
 
     def test_cli_prove_next_skips_feedback_when_target_asset_is_not_selected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
@@ -658,6 +666,11 @@ class CliFlowTests(unittest.TestCase):
                 workspace=str(workspace),
                 limit=1,
                 help_signal="supported_strong",
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
                 dry_run=False,
                 output=None,
             )
@@ -676,9 +689,1304 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["proved_count"], 0)
             self.assertEqual(payload["items"][0]["status"], "missed")
             self.assertIsNone(payload["items"][0]["help_signal_written"])
+            self.assertEqual(payload["items"][0]["replay_verdict"]["verdict"], "replay_miss")
+            self.assertIn("keep it on watch", payload["items"][0]["replay_verdict"]["recommendation"])
 
             updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
-            self.assertEqual(updated_asset, original_asset)
+            self.assertEqual(updated_asset["review_status"], "watch")
+            self.assertEqual(updated_asset["temperature"], "cool")
+            self.assertEqual(updated_asset["governance"]["replay_stats"]["miss_count"], 1)
+
+    def test_cli_prove_next_dry_run_does_not_run_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / "pattern_target_dry_run.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset = {
+                "asset_id": "pattern_target_dry_run",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "substantive dry run validation target",
+                "content": "validate this reusable implementation pattern before writing feedback",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.86,
+                "status": "active",
+                "review_status": "unproven",
+                "temperature": "neutral",
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+            activation_calls: list[str] = []
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=1,
+                help_signal="supported_strong",
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                dry_run=True,
+                output=None,
+            )
+
+            def fake_activate_assets(**kwargs):
+                activation_calls.append(kwargs["task"])
+                return {"selected_assets": [], "selected_asset_ids": []}
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_prove_next(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(activation_calls, [])
+            payload = captured["prove_next"]
+            assert isinstance(payload, dict)
+            self.assertTrue(payload["dry_run"])
+            self.assertEqual(payload["attempted_count"], 1)
+            self.assertEqual(payload["target_hit_count"], 0)
+            self.assertEqual(payload["proved_count"], 0)
+            self.assertEqual(payload["items"][0]["status"], "would_attempt")
+            updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertNotIn("governance", updated_asset)
+
+    def test_cli_prove_next_keeps_scanning_until_hit_target_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+
+            first_asset = {
+                "asset_id": "pattern_target_scan_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "第一条治理模式",
+                "content": "第一条会 miss。",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.86,
+                "status": "active",
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            second_asset = {
+                "asset_id": "pattern_target_scan_002",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "第二条治理模式",
+                "content": "第二条会 hit。",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.85,
+                "status": "active",
+                "created_at": "2026-05-08T08:16:38+00:00",
+                "updated_at": "2026-05-08T08:16:38+00:00",
+            }
+            for asset in (first_asset, second_asset):
+                asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / f"{asset['asset_id']}.json"
+                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+            activation_calls: list[str] = []
+
+            status_payload = {
+                "unproven_validation_queue": {
+                    "top_items": [
+                        {"asset_id": "pattern_target_scan_001", "knowledge_scope": "project"},
+                        {"asset_id": "pattern_target_scan_002", "knowledge_scope": "project"},
+                    ]
+                }
+            }
+
+            def fake_build_status_payload(**kwargs):
+                return status_payload
+
+            def fake_activate_assets(**kwargs):
+                activation_calls.append(kwargs["task"])
+                if len(activation_calls) == 1:
+                    selected_asset_ids = ["pattern_other_999"]
+                else:
+                    selected_asset_ids = ["pattern_target_scan_002"]
+                return {
+                    "activation_id": f"act_prove_next_batch_{len(activation_calls)}",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [
+                        {
+                            "asset_id": asset_id,
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                        }
+                        for asset_id in selected_asset_ids
+                    ],
+                    "selected_asset_ids": selected_asset_ids,
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=1,
+                help_signal="supported_strong",
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                dry_run=False,
+                output=None,
+            )
+
+            with patch.object(cli_main, "_build_status_payload", side_effect=fake_build_status_payload), patch.object(
+                cli_main, "activate_assets", side_effect=fake_activate_assets
+            ), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_prove_next(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["prove_next"]
+            assert isinstance(payload, dict)
+            self.assertEqual(payload["requested_limit"], 1)
+            self.assertEqual(payload["processed_count"], 2)
+            self.assertEqual(payload["attempted_count"], 2)
+            self.assertEqual(payload["target_hit_count"], 1)
+            self.assertEqual(payload["proved_count"], 1)
+            self.assertEqual(payload["items"][0]["status"], "missed")
+            self.assertEqual(payload["items"][1]["status"], "proved")
+            self.assertEqual(payload["items"][1]["asset_id"], "pattern_target_scan_002")
+            self.assertEqual(len(activation_calls), 2)
+
+    def test_cli_review_maintenance_runs_governance_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            asset = {
+                "asset_id": "pattern_maintenance_replay_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "维护命令自动 replay 治理资产",
+                "content": "review maintenance should automatically replay a queued governance asset and write feedback only on exact target hit.",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.89,
+                "status": "active",
+                "review_status": "watch",
+                "temperature": "cool",
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs):
+                return {
+                    "activation_id": "act_review_maintenance_hit",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [
+                        {
+                            "asset_id": "pattern_maintenance_replay_001",
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                        }
+                    ],
+                    "selected_asset_ids": ["pattern_maintenance_replay_001"],
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                days=14,
+                prove_limit=1,
+                help_signal="supported_strong",
+                deep_retrieval_check=False,
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                dry_run=False,
+                skip_prove_next=False,
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_review_maintenance(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["review_maintenance"]
+            assert isinstance(payload, dict)
+            self.assertEqual(payload["automated_actions"]["governance_replay"]["source_queue"], "governance_validation_queue")
+            self.assertEqual(payload["automated_actions"]["governance_replay"]["target_hit_count"], 1)
+            self.assertEqual(payload["automated_actions"]["governance_replay"]["proved_count"], 1)
+            self.assertTrue(Path(payload["dashboard_saved_to"]).exists())
+            self.assertTrue(Path(payload["dashboard_data_saved_to"]).exists())
+
+            updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_asset["review_status"], "healthy")
+            self.assertEqual(updated_asset["governance"]["replay_stats"]["hit_count"], 1)
+
+    def test_cli_review_maintenance_skips_fresh_self_referential_governance_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            asset = {
+                "asset_id": "pattern_fresh_maintenance_summary",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "实现 review-maintenance 自动治理",
+                "content": "实现 review-maintenance 自动治理后应沉淀成可复用经验。",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.9,
+                "status": "active",
+                "review_status": "unproven",
+                "temperature": "neutral",
+                "created_at": "2026-06-04T02:00:00+00:00",
+                "updated_at": "2026-06-04T02:00:00+00:00",
+            }
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+            activation_calls: list[str] = []
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                days=14,
+                prove_limit=1,
+                help_signal="supported_strong",
+                deep_retrieval_check=False,
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                dry_run=False,
+                skip_prove_next=False,
+                skip_auto_quarantine=False,
+                auto_quarantine_miss_threshold=3,
+                output=None,
+            )
+
+            def fake_activate_assets(**kwargs):
+                activation_calls.append(kwargs["task"])
+                return {"selected_assets": [], "selected_asset_ids": []}
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_review_maintenance(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(activation_calls, [])
+            payload = captured["review_maintenance"]
+            assert isinstance(payload, dict)
+            replay = payload["automated_actions"]["governance_replay"]
+            self.assertEqual(replay["attempted_count"], 0)
+            self.assertEqual(payload["pre_snapshot"]["validation_counts"]["governance_pending_validation_count"], 0)
+            self.assertEqual(payload["pre_snapshot"]["validation_counts"]["visible_governance_pending_validation_count"], 0)
+
+    def test_cli_review_maintenance_auto_quarantines_repeated_pattern_misses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            asset = {
+                "asset_id": "pattern_maintenance_miss_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "maintenance miss target",
+                "content": "review maintenance should quarantine after repeated replay misses.",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.82,
+                "status": "active",
+                "review_status": "needs_review",
+                "temperature": "cool",
+                "quarantine_status": "active",
+                "governance": {
+                    "review_status": "needs_review",
+                    "temperature": "cool",
+                    "quarantine_status": "active",
+                    "replay_stats": {"hit_count": 0, "miss_count": 2},
+                },
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs):
+                return {
+                    "activation_id": "act_review_maintenance_miss",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [
+                        {
+                            "asset_id": "pattern_other",
+                            "asset_type": "pattern",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                        }
+                    ],
+                    "selected_asset_ids": ["pattern_other"],
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                days=14,
+                prove_limit=1,
+                help_signal="supported_strong",
+                deep_retrieval_check=False,
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                dry_run=False,
+                skip_prove_next=False,
+                skip_auto_quarantine=False,
+                auto_quarantine_miss_threshold=3,
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_review_maintenance(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["review_maintenance"]
+            assert isinstance(payload, dict)
+            quarantine = payload["automated_actions"]["governance_quarantine"]
+            self.assertEqual(quarantine["quarantined_count"], 1)
+            self.assertEqual(quarantine["items"][0]["asset_id"], "pattern_maintenance_miss_001")
+            self.assertEqual(quarantine["items"][0]["action"], "quarantined")
+
+            updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_asset["quarantine_status"], "quarantined")
+            self.assertEqual(updated_asset["governance"]["replay_stats"]["miss_count"], 3)
+
+    def test_cli_review_maintenance_dry_run_reports_auto_quarantine_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            asset = {
+                "asset_id": "pattern_maintenance_dry_run_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "maintenance dry run target",
+                "content": "review maintenance dry run should not write quarantine state.",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.82,
+                "status": "active",
+                "review_status": "needs_review",
+                "temperature": "cool",
+                "quarantine_status": "active",
+                "governance": {
+                    "review_status": "needs_review",
+                    "temperature": "cool",
+                    "quarantine_status": "active",
+                    "replay_stats": {"hit_count": 0, "miss_count": 3},
+                },
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs):
+                return {
+                    "activation_id": "act_review_maintenance_dry_run",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [{"asset_id": "pattern_other", "asset_type": "pattern", "knowledge_scope": "project"}],
+                    "selected_asset_ids": ["pattern_other"],
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                days=14,
+                prove_limit=1,
+                help_signal="supported_strong",
+                deep_retrieval_check=False,
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                dry_run=True,
+                skip_prove_next=False,
+                skip_auto_quarantine=False,
+                auto_quarantine_miss_threshold=3,
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_review_maintenance(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["review_maintenance"]
+            assert isinstance(payload, dict)
+            quarantine = payload["automated_actions"]["governance_quarantine"]
+            self.assertEqual(quarantine["quarantined_count"], 1)
+            self.assertEqual(quarantine["items"][0]["action"], "would_quarantine")
+
+            updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_asset["quarantine_status"], "active")
+            self.assertEqual(updated_asset["governance"]["replay_stats"]["miss_count"], 3)
+
+    def test_cli_review_maintenance_skip_auto_quarantine_leaves_state_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            asset = {
+                "asset_id": "pattern_maintenance_skip_quarantine_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "maintenance skip quarantine target",
+                "content": "review maintenance skip flag should leave quarantine state unchanged.",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.82,
+                "status": "active",
+                "review_status": "needs_review",
+                "temperature": "cool",
+                "quarantine_status": "active",
+                "governance": {
+                    "review_status": "needs_review",
+                    "temperature": "cool",
+                    "quarantine_status": "active",
+                    "replay_stats": {"hit_count": 0, "miss_count": 3},
+                },
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs):
+                return {
+                    "activation_id": "act_review_maintenance_skip_quarantine",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [{"asset_id": "pattern_other", "asset_type": "pattern", "knowledge_scope": "project"}],
+                    "selected_asset_ids": ["pattern_other"],
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                days=14,
+                prove_limit=1,
+                help_signal="supported_strong",
+                deep_retrieval_check=False,
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                dry_run=False,
+                skip_prove_next=False,
+                skip_auto_quarantine=True,
+                auto_quarantine_miss_threshold=3,
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_review_maintenance(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["review_maintenance"]
+            assert isinstance(payload, dict)
+            quarantine = payload["automated_actions"]["governance_quarantine"]
+            self.assertTrue(quarantine["skipped"])
+            self.assertEqual(quarantine["skip_reason"], "skip_auto_quarantine")
+            self.assertEqual(quarantine["quarantined_count"], 0)
+
+            updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_asset["quarantine_status"], "active")
+
+    def test_cli_review_maintenance_does_not_auto_quarantine_codemap_misses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            asset = {
+                "asset_id": "context_maintenance_codemap_001",
+                "workspace": str(workspace),
+                "asset_type": "context",
+                "knowledge_scope": "project",
+                "knowledge_kind": "codemap",
+                "title": "maintenance codemap target",
+                "content": "codemap context should remain manually reviewed even after replay misses.",
+                "scope": {"level": "workspace", "value": "general-coding-task"},
+                "confidence": 0.72,
+                "status": "active",
+                "review_status": "needs_review",
+                "temperature": "cool",
+                "quarantine_status": "active",
+                "governance": {
+                    "review_status": "needs_review",
+                    "temperature": "cool",
+                    "quarantine_status": "active",
+                    "replay_stats": {"hit_count": 0, "miss_count": 3},
+                },
+                "created_at": "2026-05-08T08:16:37+00:00",
+                "updated_at": "2026-05-08T08:16:37+00:00",
+            }
+            asset_path = cli_main.memory_root_for_workspace(workspace) / "assets" / "contexts" / f"{asset['asset_id']}.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            upsert_asset(db_path, asset)
+
+            captured: dict[str, object] = {}
+
+            def fake_activate_assets(**kwargs):
+                return {
+                    "activation_id": "act_review_maintenance_codemap",
+                    "workspace": str(workspace),
+                    "task_query": kwargs["task"],
+                    "selected_assets": [{"asset_id": "pattern_other", "asset_type": "pattern", "knowledge_scope": "project"}],
+                    "selected_asset_ids": ["pattern_other"],
+                    "created_at": "2026-05-14T00:00:00+00:00",
+                }
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                days=14,
+                prove_limit=1,
+                help_signal="supported_strong",
+                deep_retrieval_check=False,
+                knowledge_scope=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                dry_run=False,
+                skip_prove_next=False,
+                skip_auto_quarantine=False,
+                auto_quarantine_miss_threshold=3,
+                output=None,
+            )
+
+            with patch.object(cli_main, "activate_assets", side_effect=fake_activate_assets), patch.object(
+                cli_main,
+                "_print_json",
+                side_effect=lambda payload: captured.update(payload),
+            ):
+                result = cli_main._handle_review_maintenance(args)
+
+            self.assertEqual(result, 0)
+            payload = captured["review_maintenance"]
+            assert isinstance(payload, dict)
+            quarantine = payload["automated_actions"]["governance_quarantine"]
+            self.assertEqual(quarantine["quarantined_count"], 0)
+            self.assertEqual(quarantine["items"][0]["action"], "skip")
+            self.assertIn("protected_knowledge_kind", quarantine["items"][0]["reasons"])
+
+            updated_asset = json.loads(asset_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_asset["quarantine_status"], "active")
+
+    def test_cli_validation_queue_filters_by_scope_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, module_name in (
+                ("pattern_storage_scope", "runtime/storage"),
+                ("pattern_docs_scope", "docs"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": asset_id,
+                        "content": asset_id,
+                        "scope": {"level": "module", "value": module_name},
+                        "scope_profile": {
+                            "task_type": "implementation",
+                            "module": module_name,
+                            "language": "python" if module_name != "docs" else None,
+                            "framework": None,
+                        },
+                        "confidence": 0.88,
+                        "status": "active",
+                        "review_status": "unproven",
+                        "temperature": "neutral",
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "validation-queue",
+                    "--workspace",
+                    str(workspace),
+                    "--module",
+                    "runtime/storage",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["validation_queue"]
+            self.assertEqual(payload["summary"]["asset_count"], 1)
+            self.assertEqual(payload["queue"]["items"][0]["asset_id"], "pattern_storage_scope")
+
+    def test_cli_validation_queue_filters_by_governance_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, review_status, quarantine_status, status in (
+                ("pattern_deprecated_scope", "needs_review", "deprecated", "deprecated"),
+                ("pattern_active_scope", "unproven", "active", "active"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": asset_id,
+                        "content": asset_id,
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.82,
+                        "status": status,
+                        "review_status": review_status,
+                        "temperature": "cool" if status == "deprecated" else "neutral",
+                        "quarantine_status": quarantine_status,
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "validation-queue",
+                    "--workspace",
+                    str(workspace),
+                    "--quarantine-status",
+                    "deprecated",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["validation_queue"]
+            self.assertEqual(payload["summary"]["asset_count"], 1)
+            self.assertEqual(payload["queue"]["items"][0]["asset_id"], "pattern_deprecated_scope")
+
+    def test_cli_status_applies_scope_filter_to_validation_views(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, module_name in (
+                ("pattern_storage_status", "runtime/storage"),
+                ("pattern_docs_status", "docs"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": asset_id,
+                        "content": asset_id,
+                        "scope": {"level": "module", "value": module_name},
+                        "scope_profile": {
+                            "task_type": "implementation",
+                            "module": module_name,
+                            "language": "python" if module_name != "docs" else None,
+                            "framework": None,
+                        },
+                        "confidence": 0.88,
+                        "status": "active",
+                        "review_status": "unproven",
+                        "temperature": "neutral",
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--module",
+                    "runtime/storage",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["status"]
+            self.assertEqual(payload["scope_filters"]["module"], "runtime/storage")
+            self.assertEqual(payload["unproven_validation_queue"]["asset_count"], 1)
+            self.assertEqual(payload["unproven_validation_queue"]["top_items"][0]["asset_id"], "pattern_storage_status")
+            self.assertEqual(payload["governance_summary"]["asset_count"], 1)
+
+    def test_cli_status_applies_governance_state_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, review_status, quarantine_status, status in (
+                ("pattern_status_deprecated", "needs_review", "deprecated", "deprecated"),
+                ("pattern_status_active", "unproven", "active", "active"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": asset_id,
+                        "content": asset_id,
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.88,
+                        "status": status,
+                        "review_status": review_status,
+                        "temperature": "cool" if status == "deprecated" else "neutral",
+                        "quarantine_status": quarantine_status,
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--quarantine-status",
+                    "deprecated",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["status"]
+            self.assertEqual(payload["scope_filters"]["quarantine_status"], "deprecated")
+            self.assertEqual(payload["governance_summary"]["asset_count"], 1)
+            self.assertEqual(payload["governance_summary"]["deprecated_asset_count"], 1)
+
+    def test_cli_doctor_applies_scope_filter_to_governance_backlog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, module_name in (
+                ("pattern_storage_doctor", "runtime/storage"),
+                ("pattern_docs_doctor", "docs"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": asset_id,
+                        "content": asset_id,
+                        "scope": {"level": "module", "value": module_name},
+                        "scope_profile": {
+                            "task_type": "implementation",
+                            "module": module_name,
+                            "language": "python" if module_name != "docs" else None,
+                            "framework": None,
+                        },
+                        "confidence": 0.88,
+                        "status": "active",
+                        "review_status": "unproven",
+                        "temperature": "neutral",
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "doctor",
+                    "--workspace",
+                    str(workspace),
+                    "--module",
+                    "runtime/storage",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["doctor"]
+            self.assertEqual(payload["scope_filters"]["module"], "runtime/storage")
+            self.assertEqual(payload["governance"]["summary"]["asset_count"], 1)
+            backlog_check = next(item for item in payload["checks"] if item["name"] == "governance_backlog")
+            self.assertIn("pending_validation=1", backlog_check["summary"])
+
+    def test_cli_dashboard_reports_scope_filters_in_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_storage_dashboard",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "pattern storage dashboard",
+                    "content": "dashboard scope filter target",
+                    "scope": {"level": "module", "value": "runtime/storage"},
+                    "scope_profile": {
+                        "task_type": "implementation",
+                        "module": "runtime/storage",
+                        "language": "python",
+                        "framework": None,
+                    },
+                    "confidence": 0.88,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "updated_at": "2026-04-28T00:00:00+00:00",
+                },
+            )
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_docs_dashboard",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "org_convention",
+                    "title": "pattern docs dashboard",
+                    "content": "dashboard scope filter non-target",
+                    "scope": {"level": "module", "value": "docs"},
+                    "scope_profile": {
+                        "task_type": "docs",
+                        "module": "docs",
+                        "language": None,
+                        "framework": None,
+                    },
+                    "confidence": 0.7,
+                    "status": "active",
+                    "review_status": "healthy",
+                    "temperature": "warm",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "updated_at": "2026-04-28T00:00:00+00:00",
+                },
+            )
+            log_activation(
+                db_path,
+                {
+                    "activation_id": "act_storage_dashboard",
+                    "workspace": str(workspace),
+                    "task_query": "review runtime storage dashboard",
+                    "selected_asset_ids": ["pattern_storage_dashboard"],
+                    "selected_assets": [
+                        {
+                            "asset_id": "pattern_storage_dashboard",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "pattern",
+                            "scope_profile": {
+                                "task_type": "implementation",
+                                "module": "runtime/storage",
+                                "language": "python",
+                                "framework": None,
+                            },
+                            "retrieval_sources": ["milvus"],
+                            "injection_channel": "system_prompt",
+                        }
+                    ],
+                    "injection_plan": {
+                        "channel_counts": {
+                            "system_prompt": 1,
+                            "runtime_context": 0,
+                            "reference_summary": 0,
+                        },
+                    },
+                    "retrieval_summary": {
+                        "milvus_project_candidates": 1,
+                        "milvus_shared_candidates": 0,
+                        "selected_from_milvus": 1,
+                    },
+                    "feedback": {"help_signal": "supported_strong"},
+                    "created_at": "2026-04-28T00:10:00+00:00",
+                },
+            )
+            log_activation(
+                db_path,
+                {
+                    "activation_id": "act_docs_dashboard",
+                    "workspace": str(workspace),
+                    "task_query": "review docs dashboard",
+                    "selected_asset_ids": ["pattern_docs_dashboard"],
+                    "selected_assets": [
+                        {
+                            "asset_id": "pattern_docs_dashboard",
+                            "knowledge_scope": "project",
+                            "knowledge_kind": "org_convention",
+                            "scope_profile": {
+                                "task_type": "docs",
+                                "module": "docs",
+                                "language": None,
+                                "framework": None,
+                            },
+                            "retrieval_sources": ["milvus"],
+                            "injection_channel": "reference_summary",
+                        }
+                    ],
+                    "injection_plan": {
+                        "channel_counts": {
+                            "system_prompt": 0,
+                            "runtime_context": 0,
+                            "reference_summary": 1,
+                        },
+                    },
+                    "retrieval_summary": {
+                        "milvus_project_candidates": 1,
+                        "milvus_shared_candidates": 0,
+                        "selected_from_milvus": 1,
+                    },
+                    "feedback": {"help_signal": "unclear"},
+                    "created_at": "2026-04-28T00:20:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "dashboard",
+                    "--workspace",
+                    str(workspace),
+                    "--module",
+                    "runtime/storage",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            sidecar = json.loads(Path(payload["data_saved_to"]).read_text(encoding="utf-8"))
+            self.assertEqual(payload["dashboard"]["scope_filters"]["module"], "runtime/storage")
+            self.assertEqual(sidecar["scope_filters"]["module"], "runtime/storage")
+            self.assertEqual(payload["dashboard"]["cards"]["assets"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["activation_logs"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["system_prompt_items"], 1)
+            self.assertEqual(payload["dashboard"]["cards"]["reference_summary_items"], 0)
+            self.assertEqual(sidecar["governance"]["summary"]["asset_count"], 1)
+
+    def test_cli_dashboard_applies_governance_state_filter_to_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, review_status, quarantine_status, status in (
+                ("pattern_dashboard_deprecated", "needs_review", "deprecated", "deprecated"),
+                ("pattern_dashboard_active", "healthy", "active", "active"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": asset_id,
+                        "content": asset_id,
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.81,
+                        "status": status,
+                        "review_status": review_status,
+                        "temperature": "cool" if status == "deprecated" else "warm",
+                        "quarantine_status": quarantine_status,
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "dashboard",
+                    "--workspace",
+                    str(workspace),
+                    "--quarantine-status",
+                    "deprecated",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            sidecar = json.loads(Path(payload["data_saved_to"]).read_text(encoding="utf-8"))
+            self.assertEqual(payload["dashboard"]["scope_filters"]["quarantine_status"], "deprecated")
+            self.assertEqual(payload["dashboard"]["cards"]["assets"], 1)
+            self.assertEqual(sidecar["governance"]["summary"]["deprecated_asset_count"], 1)
+            self.assertEqual(sidecar["cards"]["assets"], 1)
+
+    def test_cli_dashboard_supports_only_deprecated_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, quarantine_status, status in (
+                ("pattern_dashboard_only_deprecated", "deprecated", "deprecated"),
+                ("pattern_dashboard_only_active", "active", "active"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": asset_id,
+                        "content": asset_id,
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.81,
+                        "status": status,
+                        "review_status": "needs_review" if status == "deprecated" else "healthy",
+                        "temperature": "cool" if status == "deprecated" else "warm",
+                        "quarantine_status": quarantine_status,
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "dashboard",
+                    "--workspace",
+                    str(workspace),
+                    "--only-deprecated",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["dashboard"]["scope_filters"]["quarantine_status"], "deprecated")
+            self.assertEqual(payload["dashboard"]["scope_filters"]["asset_status"], "deprecated")
+            self.assertEqual(payload["dashboard"]["cards"]["assets"], 1)
 
     def test_filesystem_status_records_merge_primary_and_fallback_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
@@ -2003,6 +3311,76 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(fallback_asset["historical_help"]["supported_count"], 1)
             self.assertEqual(fallback_asset["review_status"], "healthy")
 
+    def test_cli_auto_finish_rejects_duplicate_followup_governance_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+
+            asset = {
+                "asset_id": "pattern_existing_governance_followup_001",
+                "workspace": str(workspace),
+                "asset_type": "pattern",
+                "knowledge_scope": "project",
+                "knowledge_kind": "pattern",
+                "title": "继续压降 expcap governance backlog，proof 队首治理 CLI 模式资产并复核 dashboard/doctor",
+                "content": "继续压降 expcap governance backlog，proof 队首治理 CLI 模式资产并复核 dashboard/doctor 后应沉淀成可复用经验。",
+                "scope": {"level": "task-family", "value": "general-coding-task"},
+                "scope_profile": {"task_type": "implementation", "module": None, "language": None, "framework": None},
+                "source_episode_ids": ["ep_existing_governance_followup_001"],
+                "source_candidate_ids": ["cand_existing_governance_followup_001"],
+                "confidence": 0.9,
+                "status": "active",
+                "review_status": "healthy",
+                "temperature": "hot",
+                "quarantine_status": "active",
+                "created_at": "2026-05-24T00:00:00+00:00",
+                "updated_at": "2026-05-24T00:00:00+00:00",
+            }
+            asset_path = workspace / ".agent-memory" / "assets" / "patterns" / f"{asset['asset_id']}.json"
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_text(json.dumps(asset, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            upsert_asset(db_path, asset)
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                task="继续推进 expcap governance backlog proof，验证新队首模式资产并复核 doctor/dashboard",
+                user_request=None,
+                constraints=[],
+                commands=[],
+                errors=[],
+                files_changed=[],
+                verification_status="passed",
+                verification_summary="1 passed",
+                result_status="success",
+                result_summary="治理 proof 成功",
+                host=None,
+                session_id=None,
+                trace_id="trace_duplicate_governance_followup",
+                no_promote=False,
+                promote_threshold=0.7,
+                knowledge_scope="project",
+                knowledge_kind="pattern",
+            )
+            captured: dict[str, object] = {}
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_auto_finish(args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(captured["promoted_assets"], [])
+            candidate_payload = captured["candidates"][0]
+            assert isinstance(candidate_payload, dict)
+            self.assertEqual(candidate_payload["status"], "rejected")
+
+            candidate_path = Path(candidate_payload["path"])
+            candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+            self.assertEqual(candidate["status"], "rejected")
+            self.assertEqual(candidate["duplicate_of_asset_id"], asset["asset_id"])
+            self.assertGreaterEqual(candidate["duplicate_similarity"], 0.72)
+            self.assertEqual(candidate["review_history"][0]["reason"], "duplicate_followup_pattern")
+
     def test_cli_doctor_reports_workspace_health_and_recommendations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"
@@ -2052,8 +3430,10 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("sqlite_index", check_names)
             self.assertIn("activation_feedback", check_names)
             self.assertIn("asset_proof_coverage", check_names)
+            self.assertIn("governance_backlog", check_names)
             self.assertIn("local_milvus", check_names)
             self.assertIn("milvus_locks", doctor)
+            self.assertIn("governance", doctor)
             self.assertEqual(doctor["status"]["activation_feedback_summary"]["pending"], 1)
             self.assertEqual(doctor["status"]["unresolved_activations"][0]["state"], "pending")
             self.assertIn("milvus_retrieval_effectiveness", doctor["status"])
@@ -2187,6 +3567,8 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("Effectiveness Snapshot", html)
             self.assertIn("Backend Runtime", html)
             self.assertIn("Unproven Validation Queue", html)
+            self.assertIn("Pending validation actions", html)
+            self.assertIn("Unproven asset pool", html)
             self.assertIn("Local Prior Distribution", html)
             self.assertIn("Governance focus", html)
             self.assertIn("Org Conventions", html)
@@ -2204,6 +3586,14 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(payload["dashboard"]["cards"]["reference_summary_items"], 1)
             self.assertIn("effectiveness_snapshot", payload["dashboard"])
             self.assertEqual(payload["dashboard"]["unproven_validation_count"], 0)
+            self.assertEqual(payload["dashboard"]["validation_counts"]["review_queue_count"], 0)
+            self.assertEqual(payload["dashboard"]["validation_counts"]["governance_pending_validation_count"], 0)
+            self.assertEqual(payload["dashboard"]["validation_counts"]["visible_governance_pending_validation_count"], 0)
+            self.assertEqual(payload["dashboard"]["validation_counts"]["unproven_validation_asset_count"], 0)
+            self.assertIn(
+                "Total governance actions",
+                payload["dashboard"]["validation_counts"]["notes"]["governance_pending_validation_count"],
+            )
             self.assertEqual(dashboard["cards"]["healthy_assets"], 2)
             self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["by_kind"]["preference"], 1)
             self.assertEqual(dashboard["knowledge_kind_summary"]["assets"]["by_kind"]["org_convention"], 1)
@@ -2227,6 +3617,10 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(dashboard["activations"][0]["help_signal"], "supported_strong")
             self.assertEqual(dashboard["unproven_validation_queue"]["asset_count"], 0)
             self.assertIn("runtime_degradation_summary", dashboard["status"])
+            self.assertIn("governance", dashboard)
+            self.assertIn("views", dashboard["governance"])
+            self.assertEqual(dashboard["governance"]["views"]["dashboard"]["kind"], "governance_dashboard_view")
+            self.assertIn("governance_headline", payload["dashboard"])
 
     def test_dashboard_html_shows_backend_runtime_panel_for_fallback_sqlite(self) -> None:
         payload = {
@@ -2362,6 +3756,10 @@ class CliFlowTests(unittest.TestCase):
 
     def test_build_primary_write_health_reports_fallback_only_when_all_probes_fail(self) -> None:
         workspace = Path("/tmp/demo-workspace")
+        writable_snapshot = {
+            "stat_available": True,
+            "current_user_write_bit": True,
+        }
         with patch.object(
             cli_main,
             "_probe_parent_dir_writable",
@@ -2370,12 +3768,44 @@ class CliFlowTests(unittest.TestCase):
             cli_main,
             "_probe_state_index_writable",
             return_value=(False, "attempt to write a readonly database", "/tmp/index.sqlite3"),
+        ), patch.object(
+            cli_main,
+            "_path_write_permission_snapshot",
+            return_value=writable_snapshot,
         ):
             health = cli_main._build_primary_write_health(workspace)
 
         self.assertEqual(health["status"], "fallback_only")
         self.assertTrue(health["permission_induced"])
+        self.assertEqual(health["write_block_class"], "environment_or_acl_restriction")
+        self.assertIn("agent/runtime sandbox", health["diagnostic_hint"])
         self.assertEqual(health["failed_target_count"], 7)
+
+    def test_build_primary_write_health_classifies_filesystem_permission_when_mode_blocks_user(self) -> None:
+        workspace = Path("/tmp/demo-workspace")
+        read_only_snapshot = {
+            "stat_available": True,
+            "current_user_write_bit": False,
+        }
+        with patch.object(
+            cli_main,
+            "_probe_parent_dir_writable",
+            return_value=(False, "permission denied", "/tmp"),
+        ), patch.object(
+            cli_main,
+            "_probe_state_index_writable",
+            return_value=(False, "permission denied", "/tmp/index.sqlite3"),
+        ), patch.object(
+            cli_main,
+            "_path_write_permission_snapshot",
+            return_value=read_only_snapshot,
+        ):
+            health = cli_main._build_primary_write_health(workspace)
+
+        self.assertEqual(health["status"], "fallback_only")
+        self.assertTrue(health["permission_induced"])
+        self.assertEqual(health["write_block_class"], "filesystem_permission")
+        self.assertIn("owner, group, chmod", health["diagnostic_hint"])
 
     def test_cli_dashboard_falls_back_when_default_json_sidecar_is_unwritable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2414,6 +3844,64 @@ class CliFlowTests(unittest.TestCase):
             self.assertTrue(fallback_path.exists())
             self.assertTrue(Path(captured["data_saved_to"]).exists())
             self.assertIn("expcap-reviews", str(fallback_path))
+
+    def test_cli_review_candidates_falls_back_when_default_output_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            _write_candidate(
+                workspace / ".agent-memory" / "candidates" / "cand_review_fallback_001.json",
+                workspace=workspace,
+                candidate_id="cand_review_fallback_001",
+                status="new",
+                promotion_readiness="unknown",
+                help_signal=None,
+            )
+            captured: dict[str, object] = {}
+            default_queue_path = workspace / ".agent-memory" / "reviews" / "candidate_review_queue.json"
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                if Path(path) == default_queue_path:
+                    raise PermissionError("permission denied for default candidate review queue")
+                original_save_json(path, payload)
+
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                statuses=None,
+                action=None,
+                candidate_id=None,
+                knowledge_scope=None,
+                knowledge_kind=None,
+                task_type=None,
+                scope_module=None,
+                language=None,
+                framework=None,
+                review_status=None,
+                quarantine_status=None,
+                asset_status=None,
+                only_deprecated=False,
+                only_quarantined=False,
+                only_needs_review=False,
+                output=None,
+            )
+
+            with patch.object(
+                cli_main,
+                "save_json",
+                side_effect=flaky_save_json,
+            ), patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_review_candidates(args)
+
+            self.assertEqual(result, 0)
+            self.assertIn("save_warning", captured)
+            warning = captured["save_warning"]
+            assert isinstance(warning, dict)
+            self.assertEqual(warning["reason"], "default_candidate_review_queue_output_unwritable")
+            fallback_path = Path(captured["saved_to"])
+            self.assertTrue(fallback_path.exists())
+            self.assertIn("expcap-reviews", str(fallback_path))
+            self.assertEqual(captured["candidate_count"], 1)
 
     def test_cli_doctor_reports_unproven_assets_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2638,8 +4126,37 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(status["retrieval_backends"]["sqlite"]["source_mode"], "fallback_sqlite")
             self.assertTrue(status["backend_runtime"]["fallback_state_index_in_use"])
             self.assertEqual(status["backend_runtime"]["state_index_mode"], "fallback_sqlite")
+            self.assertEqual(status["backend_runtime"]["memory_root_mode"], "fallback_active")
             self.assertEqual(status["primary_write_health"]["status"], "primary_writable")
             self.assertEqual(status["counts"]["activation_logs"], 1)
+
+    def test_cli_status_keeps_primary_only_when_fallback_root_exists_but_is_not_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str(Path(tmpdir) / "expcap-home")},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            fallback_root = fallback_memory_root_for_workspace(workspace)
+            fallback_root.mkdir(parents=True, exist_ok=True)
+            captured: dict[str, object] = {}
+            args = argparse.Namespace(
+                workspace=str(workspace),
+                limit=3,
+                deep_retrieval_check=False,
+                output=None,
+            )
+
+            with patch.object(cli_main, "_print_json", side_effect=lambda payload: captured.update(payload)):
+                result = cli_main._handle_status(args)
+
+            self.assertEqual(result, 0)
+            status = captured["status"]
+            assert isinstance(status, dict)
+            self.assertTrue(status["backend_runtime"]["fallback_memory_root_present"])
+            self.assertFalse(status["backend_runtime"]["fallback_state_index_in_use"])
+            self.assertEqual(status["primary_write_health"]["status"], "primary_writable")
+            self.assertEqual(status["backend_runtime"]["memory_root_mode"], "primary_only")
 
     def test_cli_status_surfaces_milvus_probe_fallback_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2761,6 +4278,8 @@ class CliFlowTests(unittest.TestCase):
                     "all_writable": False,
                     "failed_target_count": 7,
                     "permission_induced": True,
+                    "write_block_class": "environment_or_acl_restriction",
+                    "diagnostic_hint": "Permission-like write probes failed even though the probed paths look writable by the current user from mode bits.",
                     "checked_targets": [],
                     "failed_targets": [
                         {"target": "views", "error": "operation not permitted"},
@@ -2776,7 +4295,8 @@ class CliFlowTests(unittest.TestCase):
             write_check = next(item for item in doctor["checks"] if item["name"] == "primary_write_path")
             self.assertEqual(write_check["status"], "warn")
             self.assertIn("fallback paths", write_check["summary"])
-            self.assertIn("restore writable access", write_check["recommendation"])
+            self.assertIn("agent/runtime sandbox", write_check["recommendation"])
+            self.assertIn("before changing chmod/chown", write_check["recommendation"])
 
     def test_cli_doctor_describes_permission_induced_milvus_probe_degradation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2971,8 +4491,85 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(queue["kind_summary"]["pattern"], 1)
             self.assertEqual(queue["recommended_batch_size"], 1)
             self.assertIn("Needs first real activation", queue["top_items"][0]["validation_hint"])
-            self.assertEqual(queue["top_items"][0]["age_bucket"], "8_30d")
-            self.assertEqual(queue["age_summary"]["8_30d"], 1)
+            self.assertEqual(queue["top_items"][0]["age_bucket"], "31d_plus")
+            self.assertEqual(queue["age_summary"]["31d_plus"], 1)
+            self.assertIn("governance_summary", payload)
+            self.assertIn("governance_views", payload)
+            self.assertEqual(payload["governance_summary"]["pending_validation_count"], 1)
+            self.assertEqual(payload["governance_views"]["status"]["cards"]["pending_validation_count"], 1)
+            self.assertEqual(payload["governance_views"]["validation_queue"]["summary"]["pending_validation_count"], 1)
+
+    def test_cli_status_suppresses_fresh_self_referential_governance_queue_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_substantive_validation_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "substantive validation target",
+                    "content": "validate this implementation pattern against a real task",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.88,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-06-04T01:00:00+00:00",
+                    "updated_at": "2026-06-04T01:00:00+00:00",
+                },
+            )
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_fresh_review_maintenance_summary",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "实现 review-maintenance 自动治理",
+                    "content": "实现 review-maintenance 自动治理后应沉淀成可复用经验。",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.9,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-06-04T02:00:00+00:00",
+                    "updated_at": "2026-06-04T02:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "5",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["status"]
+            governance_queue = payload["governance_validation_queue"]
+            visible_ids = [item["asset_id"] for item in governance_queue["items"]]
+            self.assertIn("pattern_substantive_validation_target", visible_ids)
+            self.assertNotIn("pattern_fresh_review_maintenance_summary", visible_ids)
+            self.assertEqual(governance_queue["suppressed_self_referential_count"], 1)
+            self.assertEqual(payload["governance_summary"]["pending_validation_count"], 1)
+            self.assertEqual(payload["governance_views"]["validation_queue"]["summary"]["pending_validation_count"], 1)
 
     def test_cli_status_prioritizes_unproven_assets_relevant_to_recent_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3055,6 +4652,74 @@ class CliFlowTests(unittest.TestCase):
             self.assertIn("activation", queue["top_items"][0]["recent_topic_hits"])
             self.assertIn("Recent task overlap", queue["top_items"][0]["validation_hint"])
 
+    def test_cli_status_skips_fresh_self_referential_unproven_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_meta_backlog_digest",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "继续消化 unproven backlog",
+                    "content": "继续消化 unproven backlog，优先验证 daily review 相关高优先资产并回写帮助反馈 后应沉淀成可复用经验。",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.75,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-05-18T00:00:00+00:00",
+                    "updated_at": "2026-05-18T00:00:00+00:00",
+                },
+            )
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_runtime_warning_taxonomy",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "统一 runtime warning taxonomy",
+                    "content": "runtime warnings now distinguish fallback active degraded primary and hard failure",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.75,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-05-11T00:00:00+00:00",
+                    "updated_at": "2026-05-11T00:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "status",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["status"]
+            queue = payload["unproven_validation_queue"]
+            self.assertEqual(queue["asset_count"], 1)
+            self.assertEqual(queue["top_items"][0]["asset_id"], "pattern_runtime_warning_taxonomy")
+
     def test_cli_validation_plan_emits_ranked_unproven_followups(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()
@@ -3124,6 +4789,12 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(plan["items"][0]["rank"], 1)
             self.assertIn("activation", plan["items"][0]["recent_topic_hits"])
             self.assertIn("真实任务", plan["items"][0]["recommended_followup"])
+            self.assertEqual(plan["governance"]["summary"]["pending_validation_count"], 1)
+            self.assertEqual(
+                plan["governance"]["views"]["validation_queue"]["summary"]["pending_validation_count"],
+                1,
+            )
+            self.assertEqual(plan["governance"]["queue"]["items"][0]["suggested_action"], "replay")
             self.assertEqual(saved_plan["items"][0]["asset_id"], "pattern_validation_target")
 
     def test_cli_validation_plan_marks_stale_unproven_assets_for_review(self) -> None:
@@ -3174,6 +4845,452 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(plan["items"][0]["age_bucket"], "31d_plus")
             self.assertEqual(plan["summary"]["age_summary"]["31d_plus"], 1)
             self.assertIn("降温或复审", plan["items"][0]["recommended_followup"])
+
+    def test_cli_validation_queue_supports_only_needs_review_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, review_status in (
+                ("pattern_validation_needs_review", "needs_review"),
+                ("pattern_validation_unproven", "unproven"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": asset_id,
+                        "content": asset_id,
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.8,
+                        "status": "active",
+                        "review_status": review_status,
+                        "temperature": "cool" if review_status == "needs_review" else "neutral",
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "validation-queue",
+                    "--workspace",
+                    str(workspace),
+                    "--only-needs-review",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["validation_queue"]
+            self.assertEqual(payload["queue"]["items"][0]["asset_id"], "pattern_validation_needs_review")
+            self.assertEqual(payload["summary"]["review_status_counts"]["needs_review"], 1)
+
+    def test_cli_validation_queue_emits_governance_backed_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_validation_queue_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "validation queue target",
+                    "content": "use replay validation for this asset",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.87,
+                    "status": "active",
+                    "review_status": "unproven",
+                    "temperature": "neutral",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "updated_at": "2026-04-28T00:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "validation-queue",
+                    "--workspace",
+                    str(workspace),
+                    "--limit",
+                    "3",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["validation_queue"]
+            self.assertEqual(payload["kind"], "governance_validation_queue_report")
+            self.assertEqual(payload["summary"]["pending_validation_count"], 1)
+            self.assertEqual(payload["queue"]["items"][0]["asset_id"], "pattern_validation_queue_target")
+            self.assertEqual(payload["views"]["validation_queue"]["summary"]["pending_validation_count"], 1)
+
+    def test_cli_quarantine_asset_updates_governance_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_quarantine_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "quarantine target",
+                    "content": "temporarily isolate this asset",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.81,
+                    "status": "active",
+                    "review_status": "healthy",
+                    "temperature": "warm",
+                    "quarantine_status": "active",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "updated_at": "2026-04-28T00:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "quarantine-asset",
+                    "--workspace",
+                    str(workspace),
+                    "--asset-id",
+                    "pattern_quarantine_target",
+                    "--reason",
+                    "conflicting guidance observed",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["quarantine_action"]
+            asset = cli_main.get_asset(db_path, asset_id="pattern_quarantine_target")
+            assert asset is not None
+            self.assertEqual(payload["asset"]["quarantine_status"], "quarantined")
+            self.assertEqual(payload["asset"]["review_status"], "needs_review")
+            self.assertEqual(payload["governance"]["summary"]["quarantine_status_counts"]["quarantined"], 1)
+            self.assertEqual(asset["quarantine_status"], "quarantined")
+            self.assertEqual(asset["review_status"], "needs_review")
+
+    def test_cli_unquarantine_asset_restores_active_governance_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_unquarantine_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "unquarantine target",
+                    "content": "restore this asset after review",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.81,
+                    "status": "active",
+                    "review_status": "needs_review",
+                    "temperature": "cool",
+                    "quarantine_status": "quarantined",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "updated_at": "2026-04-28T00:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "unquarantine-asset",
+                    "--workspace",
+                    str(workspace),
+                    "--asset-id",
+                    "pattern_unquarantine_target",
+                    "--reason",
+                    "validated safe after review",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["quarantine_action"]
+            asset = cli_main.get_asset(db_path, asset_id="pattern_unquarantine_target")
+            assert asset is not None
+            self.assertEqual(payload["asset"]["quarantine_status"], "active")
+            self.assertEqual(asset["quarantine_status"], "active")
+
+    def test_cli_deprecate_asset_retires_asset_from_active_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_deprecate_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "deprecate target",
+                    "content": "retire this asset after repeated replay misses",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.74,
+                    "status": "active",
+                    "review_status": "watch",
+                    "temperature": "cool",
+                    "quarantine_status": "active",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "updated_at": "2026-04-28T00:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "deprecate-asset",
+                    "--workspace",
+                    str(workspace),
+                    "--asset-id",
+                    "pattern_deprecate_target",
+                    "--reason",
+                    "replay missed repeatedly in the correct scope",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["deprecate_action"]
+            asset = cli_main.get_asset(db_path, asset_id="pattern_deprecate_target")
+            assert asset is not None
+            self.assertEqual(payload["asset"]["status"], "deprecated")
+            self.assertEqual(payload["asset"]["quarantine_status"], "deprecated")
+            self.assertEqual(payload["asset"]["temperature"], "cool")
+            self.assertEqual(asset["status"], "deprecated")
+            self.assertEqual(asset["quarantine_status"], "deprecated")
+            self.assertEqual(asset["governance_history"][-1]["action"], "deprecate_asset")
+
+    def test_cli_reactivate_asset_restores_deprecated_asset_to_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_reactivate_target",
+                    "workspace": str(workspace),
+                    "asset_type": "pattern",
+                    "knowledge_scope": "project",
+                    "knowledge_kind": "pattern",
+                    "title": "reactivate target",
+                    "content": "restore after narrow-scope replay evidence",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "confidence": 0.74,
+                    "status": "deprecated",
+                    "review_status": "needs_review",
+                    "temperature": "cool",
+                    "quarantine_status": "deprecated",
+                    "created_at": "2026-04-28T00:00:00+00:00",
+                    "updated_at": "2026-04-28T00:00:00+00:00",
+                },
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "reactivate-asset",
+                    "--workspace",
+                    str(workspace),
+                    "--asset-id",
+                    "pattern_reactivate_target",
+                    "--reason",
+                    "fresh replay evidence supports limited reuse",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["reactivate_action"]
+            asset = cli_main.get_asset(db_path, asset_id="pattern_reactivate_target")
+            assert asset is not None
+            self.assertEqual(payload["asset"]["status"], "active")
+            self.assertEqual(payload["asset"]["quarantine_status"], "active")
+            self.assertEqual(payload["asset"]["review_status"], "watch")
+            self.assertEqual(asset["status"], "active")
+            self.assertEqual(asset["quarantine_status"], "active")
+            self.assertEqual(asset["review_status"], "watch")
+            self.assertEqual(asset["governance_history"][-1]["action"], "reactivate_asset")
+
+    def test_cli_mark_conflict_records_bidirectional_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, title in (
+                ("pattern_conflict_left", "conflict left"),
+                ("pattern_conflict_right", "conflict right"),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": title,
+                        "content": f"{title} content",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.79,
+                        "status": "active",
+                        "review_status": "healthy",
+                        "temperature": "warm",
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "mark-conflict",
+                    "--workspace",
+                    str(workspace),
+                    "--asset-id",
+                    "pattern_conflict_left",
+                    "--conflicting-asset-id",
+                    "pattern_conflict_right",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["conflict_action"]
+            left = cli_main.get_asset(db_path, asset_id="pattern_conflict_left")
+            right = cli_main.get_asset(db_path, asset_id="pattern_conflict_right")
+            assert left is not None and right is not None
+            self.assertIn("pattern_conflict_right", left["conflicts_with"])
+            self.assertIn("pattern_conflict_left", right["conflicts_with"])
+            self.assertEqual(payload["governance"]["summary"]["conflict_asset_count"], 2)
+            self.assertEqual(payload["assets"][0]["asset_id"], "pattern_conflict_left")
+
+    def test_cli_resolve_conflict_removes_bidirectional_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            for asset_id, title, conflicts_with in (
+                ("pattern_conflict_left", "conflict left", ["pattern_conflict_right"]),
+                ("pattern_conflict_right", "conflict right", ["pattern_conflict_left"]),
+            ):
+                upsert_asset(
+                    db_path,
+                    {
+                        "asset_id": asset_id,
+                        "workspace": str(workspace),
+                        "asset_type": "pattern",
+                        "knowledge_scope": "project",
+                        "knowledge_kind": "pattern",
+                        "title": title,
+                        "content": f"{title} content",
+                        "scope": {"level": "workspace", "value": "general-coding-task"},
+                        "confidence": 0.79,
+                        "status": "active",
+                        "review_status": "healthy",
+                        "temperature": "warm",
+                        "conflicts_with": conflicts_with,
+                        "created_at": "2026-04-28T00:00:00+00:00",
+                        "updated_at": "2026-04-28T00:00:00+00:00",
+                    },
+                )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "runtime.cli",
+                    "resolve-conflict",
+                    "--workspace",
+                    str(workspace),
+                    "--asset-id",
+                    "pattern_conflict_left",
+                    "--conflicting-asset-id",
+                    "pattern_conflict_right",
+                    "--reason",
+                    "replay showed both can coexist",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)["conflict_action"]
+            left = cli_main.get_asset(db_path, asset_id="pattern_conflict_left")
+            right = cli_main.get_asset(db_path, asset_id="pattern_conflict_right")
+            assert left is not None and right is not None
+            self.assertEqual(payload["action"], "resolve_conflict")
+            self.assertEqual(left["conflicts_with"], [])
+            self.assertEqual(right["conflicts_with"], [])
+            self.assertEqual(payload["governance"]["summary"]["conflict_asset_count"], 0)
 
     def test_cli_feedback_records_signal_and_refreshes_asset_effectiveness(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3326,10 +5443,197 @@ class CliFlowTests(unittest.TestCase):
         local_milvus_check = next(item for item in doctor["checks"] if item["name"] == "local_milvus")
         lock_check = next(item for item in doctor["checks"] if item["name"] == "local_milvus_lock")
         validation_check = next(item for item in doctor["checks"] if item["name"] == "unproven_validation_queue")
+        governance_check = next(item for item in doctor["checks"] if item["name"] == "governance_backlog")
         self.assertIn("dead pid", local_milvus_check["recommendation"])
         self.assertIn("stale pid", lock_check["summary"])
         self.assertIn("safe cleanup/reset", lock_check["recommendation"])
         self.assertIn("2 assets", validation_check["summary"])
+        self.assertIn("pending_validation", governance_check["summary"])
+        self.assertEqual(doctor["governance"]["summary"]["pending_validation_count"], 0)
+
+    def test_build_doctor_payload_reports_missing_pymilvus_without_lock_advice(self) -> None:
+        status_payload = {
+            "counts": {"traces": 0, "episodes": 0, "candidates": 0, "assets": 0, "activation_logs": 0},
+            "retrieval_backends": {
+                "sqlite": {
+                    "available": True,
+                    "source_mode": "primary_sqlite",
+                    "asset_rows": 0,
+                    "candidate_rows": 0,
+                    "activation_log_rows": 0,
+                },
+                "milvus": {
+                    "local": {
+                        "status": "unavailable",
+                        "mode": "local",
+                        "available": False,
+                        "runtime_available": False,
+                        "degraded_reason": None,
+                        "runtime_probe": {
+                            "available": False,
+                            "reason": "pymilvus_unavailable",
+                            "successful_probe_path": None,
+                            "probe_paths": [],
+                            "errors": [],
+                        },
+                    },
+                },
+            },
+            "milvus_retrieval_effectiveness": {
+                "selected_from_milvus": 0,
+                "selected_total": 0,
+                "activations_with_milvus_selected": 0,
+                "activation_count": 0,
+                "activation_selected_ratio": 0.0,
+                "avg_selected_vector_score": 0.0,
+            },
+            "activation_feedback_summary": {
+                "supported_strong": 0,
+                "supported_weak": 0,
+                "pending": 0,
+                "missing": 0,
+            },
+            "unresolved_activations": [],
+            "candidate_review_queue": {"candidate_count": 0},
+            "unproven_validation_queue": {"asset_count": 0, "top_items": []},
+            "asset_effectiveness_summary": {"review_status": {"healthy": 0, "watch": 0, "needs_review": 0, "unproven": 0}},
+            "asset_review_backlog": {
+                "healthy_count": 0,
+                "total_assets": 0,
+                "unproven_count": 0,
+                "unproven_ratio": 0.0,
+            },
+            "governance_summary": {
+                "asset_count": 0,
+                "pending_validation_count": 0,
+                "conflict_asset_count": 0,
+                "review_status_counts": {},
+                "temperature_counts": {},
+                "quarantine_status_counts": {},
+                "top_validation_items": [],
+            },
+            "governance_views": {"status": {"headline": "assets=0 | pending_validation=0 | conflicts=0"}},
+            "primary_write_health": {"status": "primary_writable", "failed_targets": []},
+            "hook_integration": {"recent_events": [], "last_event": None, "codex": {"files_present": True}, "claude": {"files_present": False}},
+        }
+        clean_lock = {
+            "lock_path": "/tmp/local.lock",
+            "lock_exists": True,
+            "locked": False,
+            "lock_error": None,
+            "metadata_raw": "",
+            "metadata": {},
+            "pid_exists": None,
+            "age_seconds": None,
+            "stale_hint": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            cli_main, "_build_status_payload", return_value=status_payload
+        ), patch.object(cli_main, "milvus_lock_summary", side_effect=[clean_lock, clean_lock]):
+            doctor = cli_main._build_doctor_payload(
+                workspace=(Path(tmpdir) / "workspace").resolve(),
+                limit=3,
+                deep_retrieval_check=False,
+            )
+
+        local_milvus_check = next(item for item in doctor["checks"] if item["name"] == "local_milvus")
+        self.assertIn("pymilvus_unavailable", local_milvus_check["summary"])
+        self.assertIn("pymilvus", local_milvus_check["recommendation"])
+        self.assertNotIn("locked", local_milvus_check["recommendation"])
+
+    def test_build_doctor_payload_surfaces_governance_backlog(self) -> None:
+        status_payload = {
+            "counts": {"traces": 0, "episodes": 0, "candidates": 0, "assets": 2, "activation_logs": 0},
+            "retrieval_backends": {
+                "sqlite": {
+                    "available": True,
+                    "source_mode": "primary_sqlite",
+                    "asset_rows": 2,
+                    "candidate_rows": 0,
+                    "activation_log_rows": 0,
+                },
+                "milvus": {
+                    "local": {"status": "ready", "mode": "local", "degraded_reason": None, "runtime_probe": {}},
+                },
+            },
+            "milvus_retrieval_effectiveness": {
+                "selected_from_milvus": 0,
+                "selected_total": 0,
+                "activations_with_milvus_selected": 0,
+                "activation_count": 0,
+                "activation_selected_ratio": 0.0,
+                "avg_selected_vector_score": 0.0,
+            },
+            "activation_feedback_summary": {
+                "supported_strong": 0,
+                "supported_weak": 0,
+                "pending": 0,
+                "missing": 0,
+            },
+            "unresolved_activations": [],
+            "candidate_review_queue": {"candidate_count": 0},
+            "unproven_validation_queue": {"asset_count": 0, "top_items": []},
+            "asset_effectiveness_summary": {"review_status": {"healthy": 1, "watch": 0, "needs_review": 0, "unproven": 1}},
+            "asset_review_backlog": {
+                "healthy_count": 1,
+                "total_assets": 2,
+                "unproven_count": 1,
+                "unproven_ratio": 0.5,
+            },
+            "governance_summary": {
+                "asset_count": 2,
+                "pending_validation_count": 1,
+                "conflict_asset_count": 1,
+                "deprecated_asset_count": 1,
+                "review_status_counts": {"healthy": 1, "unproven": 1},
+                "temperature_counts": {"warm": 1, "neutral": 1},
+                "quarantine_status_counts": {"active": 1, "deprecated": 1},
+                "top_validation_items": [
+                    {"asset_id": "pattern_conflicted", "suggested_action": "review_or_quarantine"},
+                ],
+            },
+            "governance_views": {
+                "status": {
+                    "headline": "assets=2 | pending_validation=1 | conflicts=1 | deprecated=1 | quarantine=active:1,deprecated:1"
+                }
+            },
+            "hook_integration": {
+                "integration_mode": cli_main.DEFAULT_INTEGRATION_MODE,
+                "recent_events": [],
+                "last_event": None,
+                "codex": {"files_present": False},
+                "claude": {"files_present": False},
+            },
+        }
+        local_lock = {
+            "lock_path": "/tmp/local.lock",
+            "lock_exists": False,
+            "locked": False,
+            "lock_error": None,
+            "metadata_raw": "",
+            "metadata": {},
+            "pid_exists": None,
+            "age_seconds": None,
+            "stale_hint": False,
+        }
+        shared_lock = dict(local_lock, lock_path="/tmp/shared.lock")
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            cli_main, "_build_status_payload", return_value=status_payload
+        ), patch.object(cli_main, "milvus_lock_summary", side_effect=[local_lock, shared_lock]):
+            doctor = cli_main._build_doctor_payload(
+                workspace=(Path(tmpdir) / "workspace").resolve(),
+                limit=3,
+                deep_retrieval_check=False,
+            )
+
+        governance_check = next(item for item in doctor["checks"] if item["name"] == "governance_backlog")
+        self.assertEqual(governance_check["status"], "warn")
+        self.assertIn("deprecated=1", governance_check["summary"])
+        self.assertIn("conflicts=1", governance_check["summary"])
+        self.assertIn("pattern_conflicted", governance_check["recommendation"])
+        self.assertEqual(doctor["governance"]["summary"]["conflict_asset_count"], 1)
 
     def test_build_doctor_payload_warns_when_milvus_probe_requires_fallback_path(self) -> None:
         status_payload = {

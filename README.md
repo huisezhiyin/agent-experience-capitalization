@@ -5,10 +5,10 @@
 [![Status](https://img.shields.io/badge/status-pre--1.0-orange.svg)](GOVERNANCE.md)
 [![Codex Skill](https://img.shields.io/badge/Codex%20Skill-ready-brightgreen.svg)](skills/expcap/SKILL.md)
 
-Project-owned memory for coding agents.
+Project-owned, team-shareable experience governance for coding agents.
 
-`expcap` turns useful agent work into reusable engineering assets that belong to
-the project, not to one person, one machine, or one model account.
+`expcap` turns useful agent work into evidence-backed engineering assets that
+belong to the project, not to one person, one machine, or one model account.
 
 Language: [English](README.md) | [Chinese](README.zh-CN.md)
 
@@ -37,17 +37,22 @@ analysis.
 ## Why
 
 Personal memory helps one agent remember one user. Teams need something
-different: engineering experience that can move with the codebase.
+different: engineering experience that can move with the codebase, stay tied to
+recoverable evidence, and remain governable over time.
 
-`expcap` is **TEAM memory**: **Transferable Engineering Asset Memory**.
+`expcap` is a **fault-tolerant experience governance layer** for coding agents.
 
 It is designed for:
 
 - project-level rules, patterns, context, and checklists;
 - team-shareable assets that can be reviewed and delivered;
-- agent workflows that automatically get context before work and save lessons
+- agent workflows that get context before work and create governed candidates
   after work;
 - local-first development with a path to shared cloud backends.
+
+It is not a memory-consolidation pile. Raw traces remain first-class evidence;
+LLM consolidation creates candidates rather than truth; promoted assets stay
+scoped, reviewable, and feedback-governed.
 
 ## What It Does
 
@@ -60,6 +65,26 @@ It is designed for:
   state index and fallback.
 - Exposes a backend contract for shared object stores, cloud state indexes, and
   hosted vector search.
+
+## Fault-Tolerant Memory Governance
+
+`expcap` is designed to avoid the naive pattern of repeatedly compressing old
+memories into new abstract memories until drift accumulates.
+
+Core rules:
+
+- Raw trace is never replaced by abstraction.
+- Consolidation creates candidates, not truth.
+- Promotion requires evidence, review, and scope.
+- Retrieval returns sourced candidates, not commands.
+- Activated assets must receive feedback, decay, or quarantine.
+- Cross-task contamination should be prevented by default.
+- Abstractions must remain grounded in recoverable evidence.
+
+One-line positioning:
+
+> `expcap` is not a memory-consolidation pile. It is a fault-tolerant
+> experience governance layer for coding agents.
 
 ## Prompt Layering
 
@@ -292,9 +317,16 @@ projects instead of every installed repository.
 - `trace`: raw task evidence.
 - `episode`: reviewed task narrative.
 - `candidate`: reusable lesson proposed from an episode.
-- `asset`: promoted project/team memory.
+- `asset`: promoted project/team experience asset.
 - `activation`: selected assets injected into a future task.
 - `feedback`: whether activation helped.
+
+Promotion ladder:
+
+- `trace -> episode -> candidate -> project asset -> team asset -> organization asset`
+
+Each step upward should require stronger evidence, clearer scope, and stricter
+review.
 
 Activation views include `source_provenance`, `match_evidence`, `risk_flags`,
 and `llm_use_guidance`. Retrieval provides sourced candidates; the coding agent
@@ -328,12 +360,24 @@ when using the local profile). Claude hooks use the rendered Markdown as
 
 Assets carry scope and lifecycle metadata:
 
-- `knowledge_scope`: `project` or `cross-project`.
+- `knowledge_scope`: currently `project` or `cross-project`; future `team` and
+  `organization` scopes should require stricter promotion gates.
 - `knowledge_kind`: `pattern`, `anti_pattern`, `rule`, `context`, `checklist`,
   `past_win`, `preference`, `constraint`, `decision_memory`, `dont_repeat`, or
   `codemap`.
 - `temperature`: `hot`, `warm`, `neutral`, or `cool`.
 - `review_status`: `healthy`, `watch`, `needs_review`, or `unproven`.
+
+Recommended memory/governance levels:
+
+- `personal / local prior`: local preferences, working style, and dont-repeat
+  context that should not silently pollute shared knowledge.
+- `project asset`: the default level for repository-specific rules, decisions,
+  patterns, and pitfalls.
+- `team asset`: cross-project experience with explicit owner, evidence, and
+  review.
+- `organization asset`: stable company-wide knowledge with version, validity
+  window, and deprecation rules.
 
 ## Storage
 
@@ -359,15 +403,28 @@ export EXPCAP_HOME="$HOME/.expcap"
 This keeps runtime data out of the project directory while preserving
 project-owned asset identity.
 
-Knowledge save has four layers:
+Storage responsibilities are intentionally split:
 
-- `milvus`: semantic retrieval index for finding similar experience.
-- `sqlite`: lightweight state index for candidates, feedback, review queues,
-  activation logs, and metrics.
-- `markdown_files`: human-readable knowledge artifacts such as project prompts,
-  injection snapshots, and docs.
-- `logs`: raw execution evidence such as traces, episodes, hook events, and
-  activation views.
+- `Evidence Store`: the recoverable source of truth for raw traces, task input,
+  tool calls, diffs, test results, error logs, activation views, and user
+  feedback. In local mode this is JSON / JSONL / logs under the runtime root;
+  in team mode it should evolve toward object storage.
+- `Curated Markdown Memory`: stable human-readable rules and prompts such as
+  `PROJECT_PROMPT.md`, `AGENTS.md`, `AGENTS.expcap.md`, curated memory docs,
+  and reviewed codemap/docs material.
+- `Governance DB`: lifecycle, state, and relationship management for traces,
+  episodes, candidates, assets, activations, review queues, temperature, and
+  promotion/deprecation history. Today this is SQLite locally; team mode should
+  evolve toward Postgres / Cloud SQL.
+- `Semantic Retrieval Layer`: embeddings plus metadata filters for finding
+  relevant candidates and assets. Today this is Milvus Lite or hosted Milvus.
+
+One-line boundary:
+
+- Milvus is for retrieval, not truth.
+- SQLite is for governance, not semantic understanding.
+- Markdown is for reviewability, not large-scale recall.
+- Evidence files/logs are the recoverable source of truth.
 
 Explicit local profile:
 
@@ -414,6 +471,10 @@ export EXPCAP_MILVUS_COLLECTION=experience_assets
 `EXPCAP_MILVUS_COLLECTION` are optional. Object storage and cloud SQL remain
 backend-contract fields until their adapters are implemented; the product model
 does not change when those adapters are added.
+
+Semantic retrieval items should always stay traceable back to recoverable source
+bodies. Milvus can point at trace summaries, episodes, assets, or codemap
+chunks, but it should never become the only surviving copy of the memory.
 
 ## Status Signals
 
@@ -479,6 +540,34 @@ unavailable, the runtime should degrade to JSON/SQLite so work can continue, but
 `doctor` should surface the degradation clearly because retrieval quality is
 reduced. `doctor` also reports Milvus lock metadata and safe recovery
 recommendations.
+
+## Governance Audit
+
+The current implementation already supports several anti-faulty-memory
+mechanisms:
+
+- Raw trace retention: traces, episodes, activation views, and feedback remain
+  first-class persisted objects.
+- Candidate quarantine by default: task summaries land in `candidate` first and
+  promoted assets still carry `unproven` / `watch` / `needs_review` lifecycle
+  states.
+- Activation provenance: selected assets include `source_provenance`,
+  `match_evidence`, `risk_flags`, and `llm_use_guidance`.
+- Feedback-driven health: activation feedback updates `temperature` and
+  `review_status`.
+- Progressive recall gating: `progressive-recall` is explicitly reserved for
+  new errors, files/modules, phase changes, or topic drift.
+
+The current implementation is easy to extend but not complete yet in these
+areas:
+
+- richer scope tagging such as module, language, framework, task type,
+  applicable conditions, and known counterexamples;
+- explicit quarantine / deprecation / validity-window fields in the governance
+  DB;
+- replay-based validation for important assets;
+- conflict detection and conflict-aware injection suppression;
+- stricter promotion rails for future `team` and `organization` assets.
 
 ## Documentation
 

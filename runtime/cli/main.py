@@ -2542,6 +2542,86 @@ def _probe_state_index_writable(path: Path) -> tuple[bool, str | None, str]:
     return _probe_parent_dir_writable(path.parent)
 
 
+def _path_write_permission_snapshot(path: Path) -> dict[str, Any]:
+    try:
+        stat_result = path.stat()
+    except OSError as error:
+        return {
+            "path": str(path),
+            "stat_available": False,
+            "error": str(error),
+        }
+    mode = stat_result.st_mode & 0o777
+    euid = os.geteuid()
+    egid = os.getegid()
+    groups = set(os.getgroups())
+    owner_match = stat_result.st_uid == euid
+    group_match = stat_result.st_gid == egid or stat_result.st_gid in groups
+    owner_write = bool(mode & 0o200)
+    group_write = bool(mode & 0o020)
+    other_write = bool(mode & 0o002)
+    current_user_write_bit = bool(
+        (owner_match and owner_write)
+        or (group_match and group_write)
+        or other_write
+    )
+    return {
+        "path": str(path),
+        "stat_available": True,
+        "uid": stat_result.st_uid,
+        "gid": stat_result.st_gid,
+        "mode_octal": oct(mode),
+        "current_euid": euid,
+        "current_egid": egid,
+        "owner_match": owner_match,
+        "group_match": group_match,
+        "owner_write": owner_write,
+        "group_write": group_write,
+        "other_write": other_write,
+        "current_user_write_bit": current_user_write_bit,
+    }
+
+
+def _classify_primary_write_block(failed_targets: list[dict[str, Any]]) -> tuple[str, str]:
+    if not failed_targets:
+        return "none", "All primary write probes succeeded."
+    permission_like = all(_is_permission_like_error_message(item.get("error")) for item in failed_targets)
+    if not permission_like:
+        return (
+            "runtime_failure",
+            "At least one primary write probe failed for a reason that does not look like a permission or sandbox denial.",
+        )
+    snapshots = [
+        item.get("permission_snapshot")
+        for item in failed_targets
+        if isinstance(item.get("permission_snapshot"), dict)
+        and item.get("permission_snapshot", {}).get("stat_available")
+    ]
+    write_bit_allows_current_user = [
+        bool(snapshot.get("current_user_write_bit"))
+        for snapshot in snapshots
+    ]
+    if write_bit_allows_current_user and all(write_bit_allows_current_user):
+        return (
+            "environment_or_acl_restriction",
+            "Permission-like write probes failed even though the probed paths look writable by the current user from mode bits; suspect the current agent/runtime sandbox, macOS privacy controls, ACLs, or file flags before changing ownership or chmod.",
+        )
+    if write_bit_allows_current_user and any(write_bit_allows_current_user):
+        return (
+            "mixed_permission_and_environment_restriction",
+            "Some failed targets look writable by mode bits while others do not; inspect per-target details and consider sandbox/ACL restrictions before applying broad permission changes.",
+        )
+    if snapshots and not any(write_bit_allows_current_user):
+        return (
+            "filesystem_permission",
+            "The failed targets do not look writable by the current user from mode bits; inspect owner, group, chmod, ACLs, or file flags for the reported paths.",
+        )
+    return (
+        "permission_or_sandbox",
+        "Permission-like write probes failed, but path mode details were unavailable; verify in a less restricted environment before treating this as broken filesystem permissions.",
+    )
+
+
 def _build_primary_write_health(workspace: Path) -> dict[str, Any]:
     memory_root = memory_root_for_workspace(workspace)
     targets = [
@@ -2554,9 +2634,10 @@ def _build_primary_write_health(workspace: Path) -> dict[str, Any]:
         ("state_index", default_db_path(workspace), _probe_state_index_writable),
     ]
     checked_targets: list[dict[str, Any]] = []
-    failed_targets: list[dict[str, str]] = []
+    failed_targets: list[dict[str, Any]] = []
     for name, target_path, probe in targets:
         writable, error, probe_path = probe(target_path)
+        permission_snapshot = _path_write_permission_snapshot(Path(probe_path))
         checked_targets.append(
             {
                 "target": name,
@@ -2564,6 +2645,7 @@ def _build_primary_write_health(workspace: Path) -> dict[str, Any]:
                 "probe_path": probe_path,
                 "writable": writable,
                 "error": error,
+                "permission_snapshot": permission_snapshot,
             }
         )
         if not writable:
@@ -2573,11 +2655,13 @@ def _build_primary_write_health(workspace: Path) -> dict[str, Any]:
                     "path": str(target_path),
                     "probe_path": probe_path,
                     "error": str(error or "unknown error"),
+                    "permission_snapshot": permission_snapshot,
                 }
             )
     permission_induced = bool(failed_targets) and all(
         _is_permission_like_error_message(item.get("error")) for item in failed_targets
     )
+    write_block_class, diagnostic_hint = _classify_primary_write_block(failed_targets)
     if not failed_targets:
         status = "primary_writable"
     elif len(failed_targets) == len(checked_targets):
@@ -2589,6 +2673,8 @@ def _build_primary_write_health(workspace: Path) -> dict[str, Any]:
         "all_writable": not failed_targets,
         "failed_target_count": len(failed_targets),
         "permission_induced": permission_induced,
+        "write_block_class": write_block_class,
+        "diagnostic_hint": diagnostic_hint,
         "checked_targets": checked_targets,
         "failed_targets": failed_targets,
     }
@@ -6315,6 +6401,42 @@ def _build_runtime_degradation_summary(
     }
 
 
+def _primary_write_recommendation(
+    *,
+    primary_write_health: dict[str, Any],
+    fallback_only: bool,
+) -> str:
+    write_block_class = str(primary_write_health.get("write_block_class") or "")
+    diagnostic_hint = str(primary_write_health.get("diagnostic_hint") or "")
+    if write_block_class == "environment_or_acl_restriction":
+        return (
+            "Primary write probes failed even though the probed paths look writable by the current user. "
+            "This often points to the current agent/runtime sandbox, macOS privacy controls, ACLs, or file flags; "
+            "re-run in a less restricted environment before changing chmod/chown on ~/.expcap."
+        )
+    if write_block_class == "mixed_permission_and_environment_restriction":
+        return (
+            "Primary write probes have mixed permission signals. Inspect per-target owner/mode details and verify outside the current agent/runtime sandbox before applying broad permission repairs."
+        )
+    if write_block_class == "filesystem_permission":
+        return (
+            "Primary write probes point to filesystem permissions: inspect owner, group, chmod, ACLs, or file flags for the failed targets before relying on save/log closure."
+        )
+    if primary_write_health.get("permission_induced"):
+        scope = "all primary write targets" if fallback_only else "some primary write targets"
+        detail = f" Detail: {diagnostic_hint}" if diagnostic_hint else ""
+        return (
+            f"Permission-like write probes blocked {scope}. "
+            "Verify from a normal shell or a less restricted agent session before treating this as a real ~/.expcap permission problem."
+            f"{detail}"
+        )
+    return (
+        "Primary write probes failed across the storage tree; inspect path ownership, directory creation, and SQLite file permissions before relying on save/log closure."
+        if fallback_only
+        else "Inspect the failed targets and their parent directories; partial primary write degradation can hide behind otherwise healthy read-side metrics."
+    )
+
+
 def _build_doctor_payload(
     *,
     workspace: Path,
@@ -6422,17 +6544,15 @@ def _build_doctor_payload(
             "Primary write path is unavailable; runtime can only persist through fallback paths for "
             f"{failed_target_names}."
         )
-        primary_write_recommendation = (
-            "Primary write probes look permission- or sandbox-blocked; treat fallback persistence as degraded success and restore writable access to ~/.expcap before trusting save/log closure."
-            if primary_write_health.get("permission_induced")
-            else "Primary write probes failed across the storage tree; inspect path ownership, directory creation, and SQLite file permissions before relying on save/log closure."
+        primary_write_recommendation = _primary_write_recommendation(
+            primary_write_health=primary_write_health,
+            fallback_only=True,
         )
     else:
         primary_write_summary = f"Primary write path is partially degraded; failed targets: {failed_target_names}."
-        primary_write_recommendation = (
-            "Some primary write targets look permission- or sandbox-blocked; verify per-target path permissions before relying on partial save/log closure."
-            if primary_write_health.get("permission_induced")
-            else "Inspect the failed targets and their parent directories; partial primary write degradation can hide behind otherwise healthy read-side metrics."
+        primary_write_recommendation = _primary_write_recommendation(
+            primary_write_health=primary_write_health,
+            fallback_only=False,
         )
     checks.append(
         _diagnostic_check(
@@ -7242,6 +7362,8 @@ def _render_backend_runtime_panel(payload: dict[str, Any]) -> str:
       <div class="metric-line"><span>SQLite available</span><strong>{_safe_text(sqlite_backend.get("available"))}</strong></div>
       <div class="metric-line"><span>Primary write health</span><strong>{_safe_text(primary_write_health.get("status") or "unknown")}</strong></div>
       <div class="metric-line"><span>Primary write probe failures</span><strong>{_safe_text(primary_write_health.get("failed_target_count", 0))}</strong></div>
+      <div class="metric-line"><span>Primary write block class</span><strong>{_safe_text(primary_write_health.get("write_block_class") or "none")}</strong></div>
+      <div class="metric-line"><span>Primary write diagnostic hint</span><strong>{_safe_text(primary_write_health.get("diagnostic_hint") or "n/a")}</strong></div>
       <div class="metric-line"><span>Primary memory root</span><strong><code>{_safe_text(primary_root)}</code></strong></div>
       <div class="metric-line"><span>Fallback memory root present</span><strong>{fallback_root_present}</strong></div>
       <div class="metric-line"><span>Fallback memory root</span><strong><code>{_safe_text(fallback_root)}</code></strong></div>

@@ -3756,6 +3756,10 @@ class CliFlowTests(unittest.TestCase):
 
     def test_build_primary_write_health_reports_fallback_only_when_all_probes_fail(self) -> None:
         workspace = Path("/tmp/demo-workspace")
+        writable_snapshot = {
+            "stat_available": True,
+            "current_user_write_bit": True,
+        }
         with patch.object(
             cli_main,
             "_probe_parent_dir_writable",
@@ -3764,12 +3768,44 @@ class CliFlowTests(unittest.TestCase):
             cli_main,
             "_probe_state_index_writable",
             return_value=(False, "attempt to write a readonly database", "/tmp/index.sqlite3"),
+        ), patch.object(
+            cli_main,
+            "_path_write_permission_snapshot",
+            return_value=writable_snapshot,
         ):
             health = cli_main._build_primary_write_health(workspace)
 
         self.assertEqual(health["status"], "fallback_only")
         self.assertTrue(health["permission_induced"])
+        self.assertEqual(health["write_block_class"], "environment_or_acl_restriction")
+        self.assertIn("agent/runtime sandbox", health["diagnostic_hint"])
         self.assertEqual(health["failed_target_count"], 7)
+
+    def test_build_primary_write_health_classifies_filesystem_permission_when_mode_blocks_user(self) -> None:
+        workspace = Path("/tmp/demo-workspace")
+        read_only_snapshot = {
+            "stat_available": True,
+            "current_user_write_bit": False,
+        }
+        with patch.object(
+            cli_main,
+            "_probe_parent_dir_writable",
+            return_value=(False, "permission denied", "/tmp"),
+        ), patch.object(
+            cli_main,
+            "_probe_state_index_writable",
+            return_value=(False, "permission denied", "/tmp/index.sqlite3"),
+        ), patch.object(
+            cli_main,
+            "_path_write_permission_snapshot",
+            return_value=read_only_snapshot,
+        ):
+            health = cli_main._build_primary_write_health(workspace)
+
+        self.assertEqual(health["status"], "fallback_only")
+        self.assertTrue(health["permission_induced"])
+        self.assertEqual(health["write_block_class"], "filesystem_permission")
+        self.assertIn("owner, group, chmod", health["diagnostic_hint"])
 
     def test_cli_dashboard_falls_back_when_default_json_sidecar_is_unwritable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4242,6 +4278,8 @@ class CliFlowTests(unittest.TestCase):
                     "all_writable": False,
                     "failed_target_count": 7,
                     "permission_induced": True,
+                    "write_block_class": "environment_or_acl_restriction",
+                    "diagnostic_hint": "Permission-like write probes failed even though the probed paths look writable by the current user from mode bits.",
                     "checked_targets": [],
                     "failed_targets": [
                         {"target": "views", "error": "operation not permitted"},
@@ -4257,7 +4295,8 @@ class CliFlowTests(unittest.TestCase):
             write_check = next(item for item in doctor["checks"] if item["name"] == "primary_write_path")
             self.assertEqual(write_check["status"], "warn")
             self.assertIn("fallback paths", write_check["summary"])
-            self.assertIn("restore writable access", write_check["recommendation"])
+            self.assertIn("agent/runtime sandbox", write_check["recommendation"])
+            self.assertIn("before changing chmod/chown", write_check["recommendation"])
 
     def test_cli_doctor_describes_permission_induced_milvus_probe_degradation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

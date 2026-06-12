@@ -1082,13 +1082,24 @@ def _build_knowledge_save_layers(
     }
 
 
-def _update_activation_view_file(workspace: Path, activation: dict[str, Any]) -> None:
+def _update_activation_view_file(workspace: Path, activation: dict[str, Any]) -> dict[str, str] | None:
     activation_name = f"{activation['activation_id']}.json"
     for memory_root in memory_roots_for_workspace(workspace):
         activation_view_path = memory_root / "views" / activation_name
         if activation_view_path.exists():
-            save_json(activation_view_path, activation)
-            return
+            try:
+                save_json(activation_view_path, activation)
+                return None
+            except OSError as error:
+                fallback_path = _fallback_memory_output_path(workspace, activation_view_path)
+                save_json(fallback_path, activation)
+                return _fallback_warning(
+                    reason="activation_view_update_unwritable",
+                    requested_path=activation_view_path,
+                    fallback_path=fallback_path,
+                    error=error,
+                )
+    return None
 
 
 def _auto_resolve_stale_activation_feedback(
@@ -3135,7 +3146,9 @@ def _apply_activation_feedback(
                     break
     if not updated_activation:
         return None, write_warnings
-    _update_activation_view_file(workspace, updated_activation)
+    activation_view_write_warning = _update_activation_view_file(workspace, updated_activation)
+    if activation_view_write_warning:
+        write_warnings.append(activation_view_write_warning)
     linked_asset_ids = _linked_asset_ids_from_activation(updated_activation)
     feedback_stats = {}
     for candidate_db_path in _workspace_db_paths(workspace):

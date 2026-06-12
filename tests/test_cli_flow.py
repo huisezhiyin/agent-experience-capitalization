@@ -2511,6 +2511,58 @@ class CliFlowTests(unittest.TestCase):
             self.assertEqual(json.loads(fallback_path.read_text(encoding="utf-8"))["activation_id"], "act_review-fallback")
             self.assertEqual(len(list_activation_logs(default_db_path(workspace), workspace=str(workspace))), 1)
 
+    def test_apply_activation_feedback_falls_back_when_activation_view_update_is_unwritable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"EXPCAP_STORAGE_PROFILE": "user-cache", "EXPCAP_HOME": str((Path(tmpdir) / "expcap-home").resolve())},
+        ):
+            workspace = (Path(tmpdir) / "workspace").resolve()
+            workspace.mkdir(parents=True, exist_ok=True)
+            db_path = default_db_path(workspace)
+            ensure_db(db_path)
+            activation = {
+                "activation_id": "act_feedback-view-fallback",
+                "task_query": "review fallback handling",
+                "workspace": str(workspace),
+                "selected_assets": [],
+                "selected_asset_ids": [],
+                "created_at": "2026-04-27T00:00:00+00:00",
+            }
+            activation_path = cli_main.default_activation_view_path(workspace, activation)
+            activation_path.parent.mkdir(parents=True, exist_ok=True)
+            activation_path.write_text(json.dumps(activation, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            log_activation(db_path, activation)
+
+            original_save_json = cli_main.save_json
+
+            def flaky_save_json(path: Path, payload: dict[str, object]) -> None:
+                if Path(path) == activation_path:
+                    raise PermissionError("permission denied for activation update")
+                original_save_json(path, payload)
+
+            with patch.object(cli_main, "save_json", side_effect=flaky_save_json):
+                result, warnings = cli_main._apply_activation_feedback(
+                    workspace=workspace,
+                    db_path=db_path,
+                    activation_id="act_feedback-view-fallback",
+                    feedback={
+                        "help_signal": "supported_strong",
+                        "feedback_summary": "target asset replay was useful",
+                        "feedback_at": "2026-04-27T00:01:00+00:00",
+                    },
+                )
+
+            self.assertEqual(result["activation_id"], "act_feedback-view-fallback")
+            self.assertEqual(warnings[0]["reason"], "activation_view_update_unwritable")
+            fallback_path = (
+                fallback_memory_root_for_workspace(workspace)
+                / "views"
+                / "act_feedback-view-fallback.json"
+            )
+            self.assertTrue(fallback_path.exists())
+            fallback_payload = json.loads(fallback_path.read_text(encoding="utf-8"))
+            self.assertEqual(fallback_payload["feedback"]["help_signal"], "supported_strong")
+
     def test_cli_auto_start_warns_when_activation_log_is_unwritable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = (Path(tmpdir) / "workspace").resolve()

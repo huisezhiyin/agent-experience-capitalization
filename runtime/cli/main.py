@@ -126,6 +126,7 @@ from runtime.storage.sqlite_store import (
 
 ALL_CANDIDATE_STATUSES = ("new", "needs_review", "approved", "rejected", "promoted")
 DEFAULT_REVIEW_QUEUE_STATUSES = ("needs_review", "approved", "new")
+ACTIONABLE_GOVERNANCE_ACTIONS = {"replay", "replay_or_quarantine", "review_or_quarantine"}
 FOLLOWUP_PATTERN_PREFIXES = (
     "继续推进",
     "继续压降",
@@ -4708,12 +4709,12 @@ def _filter_governance_queue(queue: dict[str, Any], args: argparse.Namespace) ->
         "pending_validation_count": sum(
             1
             for item in items
-            if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+            if item.get("suggested_action") in ACTIONABLE_GOVERNANCE_ACTIONS
         ),
         "visible_pending_validation_count": sum(
             1
             for item in items
-            if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+            if item.get("suggested_action") in ACTIONABLE_GOVERNANCE_ACTIONS
         ),
     }
 
@@ -4722,8 +4723,12 @@ def _pending_governance_validation_count(items: list[dict[str, Any]]) -> int:
     return sum(
         1
         for item in items
-        if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+        if item.get("suggested_action") in ACTIONABLE_GOVERNANCE_ACTIONS
     )
+
+
+def _actionable_governance_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in items if item.get("suggested_action") in ACTIONABLE_GOVERNANCE_ACTIONS]
 
 
 def _limit_governance_queue(queue: dict[str, Any], *, limit: int | None) -> dict[str, Any]:
@@ -4840,6 +4845,7 @@ def _filtered_governance_summary(queue: dict[str, Any]) -> dict[str, Any]:
         if item.get("conflicts_with"):
             conflict_asset_count += 1
     items = list(queue.get("items", []))
+    actionable_items = _actionable_governance_items(items)
     return {
         "asset_count": len(items),
         "review_status_counts": review_status_counts,
@@ -4848,7 +4854,7 @@ def _filtered_governance_summary(queue: dict[str, Any]) -> dict[str, Any]:
         "deprecated_asset_count": deprecated_asset_count,
         "conflict_asset_count": conflict_asset_count,
         "pending_validation_count": int(queue.get("pending_validation_count", 0) or 0),
-        "top_validation_items": items[: min(5, len(items))],
+        "top_validation_items": (actionable_items or items)[: min(5, len(actionable_items or items))],
     }
 
 
@@ -6615,13 +6621,10 @@ def _build_doctor_payload(
     governance_deprecated_assets = int(governance_summary.get("deprecated_asset_count", 0) or 0)
     governance_quarantine_counts = governance_summary.get("quarantine_status_counts") or {}
     quarantined_assets = int(governance_quarantine_counts.get("quarantined", 0) or 0)
+    top_governance_items = [item for item in governance_summary.get("top_validation_items", []) if isinstance(item, dict)]
     top_governance_item = next(
-        (
-            item
-            for item in governance_summary.get("top_validation_items", [])
-            if isinstance(item, dict)
-        ),
-        {},
+        (item for item in top_governance_items if item.get("suggested_action") in ACTIONABLE_GOVERNANCE_ACTIONS),
+        top_governance_items[0] if top_governance_items else {},
     )
     governance_headline = (
         governance_views.get("status", {}).get("headline")
@@ -7878,7 +7881,7 @@ def _handle_review_maintenance(args: argparse.Namespace) -> int:
         replay_candidates = [
             item
             for item in governance_queue.get("items", [])
-            if item.get("suggested_action") in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+            if item.get("suggested_action") in ACTIONABLE_GOVERNANCE_ACTIONS
         ]
         scan_limit = max(prove_limit * PROVE_NEXT_SCAN_MULTIPLIER, prove_limit)
         replay_payload = _run_asset_replay_attempts(

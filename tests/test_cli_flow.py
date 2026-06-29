@@ -5687,6 +5687,96 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("pattern_conflicted", governance_check["recommendation"])
         self.assertEqual(doctor["governance"]["summary"]["conflict_asset_count"], 1)
 
+    def test_build_doctor_payload_recommends_actionable_governance_item(self) -> None:
+        status_payload = {
+            "counts": {"traces": 0, "episodes": 0, "candidates": 0, "assets": 2, "activation_logs": 0},
+            "retrieval_backends": {
+                "sqlite": {
+                    "available": True,
+                    "source_mode": "primary_sqlite",
+                    "asset_rows": 2,
+                    "candidate_rows": 0,
+                    "activation_log_rows": 0,
+                },
+                "milvus": {
+                    "local": {"status": "ready", "mode": "local", "degraded_reason": None, "runtime_probe": {}},
+                },
+            },
+            "milvus_retrieval_effectiveness": {
+                "selected_from_milvus": 0,
+                "selected_total": 0,
+                "activations_with_milvus_selected": 0,
+                "activation_count": 0,
+                "activation_selected_ratio": 0.0,
+                "avg_selected_vector_score": 0.0,
+            },
+            "activation_feedback_summary": {
+                "supported_strong": 0,
+                "supported_weak": 0,
+                "pending": 0,
+                "missing": 0,
+            },
+            "unresolved_activations": [],
+            "candidate_review_queue": {"candidate_count": 0},
+            "unproven_validation_queue": {"asset_count": 0, "top_items": []},
+            "asset_effectiveness_summary": {"review_status": {"healthy": 1, "watch": 0, "needs_review": 0, "unproven": 1}},
+            "asset_review_backlog": {
+                "healthy_count": 1,
+                "total_assets": 2,
+                "unproven_count": 1,
+                "unproven_ratio": 0.5,
+            },
+            "governance_summary": {
+                "asset_count": 2,
+                "pending_validation_count": 1,
+                "conflict_asset_count": 0,
+                "deprecated_asset_count": 1,
+                "review_status_counts": {"needs_review": 1, "unproven": 1},
+                "temperature_counts": {"cool": 1, "neutral": 1},
+                "quarantine_status_counts": {"deprecated": 1, "active": 1},
+                "top_validation_items": [
+                    {"asset_id": "pattern_deprecated", "suggested_action": "ignore"},
+                    {"asset_id": "pattern_actionable", "suggested_action": "replay"},
+                ],
+            },
+            "governance_views": {
+                "status": {
+                    "headline": "assets=2 | pending_validation=1 | conflicts=0 | deprecated=1 | quarantine=active:1,deprecated:1"
+                }
+            },
+            "hook_integration": {
+                "integration_mode": cli_main.DEFAULT_INTEGRATION_MODE,
+                "recent_events": [],
+                "last_event": None,
+                "codex": {"files_present": False},
+                "claude": {"files_present": False},
+            },
+        }
+        clean_lock = {
+            "lock_path": "/tmp/local.lock",
+            "lock_exists": False,
+            "locked": False,
+            "lock_error": None,
+            "metadata_raw": "",
+            "metadata": {},
+            "pid_exists": None,
+            "age_seconds": None,
+            "stale_hint": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            cli_main, "_build_status_payload", return_value=status_payload
+        ), patch.object(cli_main, "milvus_lock_summary", side_effect=[clean_lock, clean_lock]):
+            doctor = cli_main._build_doctor_payload(
+                workspace=(Path(tmpdir) / "workspace").resolve(),
+                limit=3,
+                deep_retrieval_check=False,
+            )
+
+        governance_check = next(item for item in doctor["checks"] if item["name"] == "governance_backlog")
+        self.assertIn("pattern_actionable", governance_check["recommendation"])
+        self.assertNotIn("pattern_deprecated", governance_check["recommendation"])
+
     def test_build_doctor_payload_warns_when_milvus_probe_requires_fallback_path(self) -> None:
         status_payload = {
             "counts": {

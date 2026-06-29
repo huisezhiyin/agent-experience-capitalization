@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 from typing import Iterator
 
+ACTIONABLE_VALIDATION_ACTIONS = {"replay", "replay_or_quarantine", "review_or_quarantine"}
+
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -989,6 +991,7 @@ def build_asset_validation_queue(
 
     queue_items.sort(
         key=lambda item: (
+            item["suggested_action"] in ACTIONABLE_VALIDATION_ACTIONS,
             float(item["validation_priority"]),
             int(item["historical_help"].get("activation_count", 0) or 0),
         ),
@@ -997,7 +1000,7 @@ def build_asset_validation_queue(
     total_pending_validation_count = sum(
         1
         for item in queue_items
-        if item["suggested_action"] in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+        if item["suggested_action"] in ACTIONABLE_VALIDATION_ACTIONS
     )
     visible_items = queue_items
     if limit is not None:
@@ -1010,7 +1013,7 @@ def build_asset_validation_queue(
         "visible_pending_validation_count": sum(
             1
             for item in visible_items
-            if item["suggested_action"] in {"replay", "replay_or_quarantine", "review_or_quarantine"}
+            if item["suggested_action"] in ACTIONABLE_VALIDATION_ACTIONS
         ),
         "pending_validation_count": total_pending_validation_count,
     }

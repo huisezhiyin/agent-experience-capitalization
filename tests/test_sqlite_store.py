@@ -441,6 +441,54 @@ class SqliteGovernanceLedgerTests(unittest.TestCase):
         self.assertEqual(queue["items"][0]["asset_id"], "pattern_unproven_001")
         self.assertIn(queue["items"][1]["suggested_action"], {"replay_or_quarantine", "review_or_quarantine"})
 
+    def test_build_asset_validation_queue_ranks_actionable_before_ignored_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "state.sqlite3"
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_ignored_001",
+                    "workspace": "/tmp/demo",
+                    "asset_type": "pattern",
+                    "knowledge_kind": "pattern",
+                    "knowledge_scope": "project",
+                    "title": "已隔离低价值经验",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "status": "active",
+                    "confidence": 0.9,
+                    "review_status": "needs_review",
+                    "quarantine_status": "quarantined",
+                    "created_at": "2026-05-18T10:00:00+00:00",
+                    "updated_at": "2026-05-18T10:00:00+00:00",
+                },
+            )
+            upsert_asset(
+                db_path,
+                {
+                    "asset_id": "pattern_actionable_001",
+                    "workspace": "/tmp/demo",
+                    "asset_type": "pattern",
+                    "knowledge_kind": "pattern",
+                    "knowledge_scope": "project",
+                    "title": "待验证经验",
+                    "scope": {"level": "workspace", "value": "general-coding-task"},
+                    "status": "active",
+                    "confidence": 0.7,
+                    "review_status": "unproven",
+                    "quarantine_status": "active",
+                    "created_at": "2026-05-18T10:01:00+00:00",
+                    "updated_at": "2026-05-18T10:01:00+00:00",
+                },
+            )
+
+            queue = build_asset_validation_queue(db_path, workspace="/tmp/demo", limit=2)
+
+        self.assertEqual(queue["pending_validation_count"], 1)
+        self.assertEqual(queue["items"][0]["asset_id"], "pattern_actionable_001")
+        self.assertEqual(queue["items"][0]["suggested_action"], "replay")
+        self.assertEqual(queue["items"][1]["asset_id"], "pattern_ignored_001")
+        self.assertEqual(queue["items"][1]["suggested_action"], "ignore")
+
     def test_build_governance_summary_reports_counts_and_top_validation_items(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "state.sqlite3"
